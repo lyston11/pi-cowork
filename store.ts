@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -27,6 +27,17 @@ export interface HumanTaskSnapshot {
   ids: number[];
   eventSeq: number;
   actor?: string;
+}
+
+export interface ResumeEvent {
+  seq: number;
+  taskId: number;
+  kind: "created" | "complete" | "reopen" | "close";
+}
+
+export interface ResumeBatch {
+  throughSeq: number;
+  events: ResumeEvent[];
 }
 
 export class HandoffStore {
@@ -97,10 +108,129 @@ export class HandoffStore {
         ${immutable("handoff_tasks")}
         ${immutable("handoff_task_events")}
       `);
+      this.initializeResume();
     } catch (error) {
       this.db.close();
       throw error;
     }
+  }
+
+  private initializeResume(): void {
+    this.transaction(() => {
+      const exists = this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='handoff_resume_events'").get();
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS handoff_resume_events (
+          seq INTEGER PRIMARY KEY AUTOINCREMENT,
+          recipient TEXT NOT NULL REFERENCES handoff_sides(id),
+          task_id INTEGER NOT NULL REFERENCES handoff_tasks(id),
+          kind TEXT NOT NULL,
+          source TEXT NOT NULL UNIQUE
+        );
+        CREATE INDEX IF NOT EXISTS handoff_resume_recipient ON handoff_resume_events(recipient,seq);
+        CREATE TABLE IF NOT EXISTS handoff_resume_state (
+          side_id TEXT PRIMARY KEY REFERENCES handoff_sides(id),
+          ack_seq INTEGER NOT NULL DEFAULT 0,
+          enabled INTEGER NOT NULL DEFAULT 1,
+          reason TEXT,
+          consumer TEXT,
+          lease_until INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TRIGGER IF NOT EXISTS handoff_resume_created AFTER INSERT ON handoff_tasks
+          BEGIN INSERT INTO handoff_resume_events(recipient,task_id,kind,source)
+            VALUES(NEW.assignee,NEW.id,'created','task:'||NEW.id); END;
+        CREATE TRIGGER IF NOT EXISTS handoff_resume_changed AFTER INSERT ON handoff_task_events
+          WHEN NEW.kind IN ('complete','reopen','close')
+          BEGIN INSERT INTO handoff_resume_events(recipient,task_id,kind,source)
+            SELECT CASE NEW.kind WHEN 'complete' THEN creator ELSE assignee END,
+              NEW.task_id,NEW.kind,'event:'||NEW.seq FROM handoff_tasks WHERE id=NEW.task_id; END;
+        ${immutable("handoff_resume_events")}
+      `);
+      // Bootstrap old clients' records once. Triggers also cover writes by Pi
+      // processes still running an earlier extension version.
+      if (!exists) this.db.exec(`
+        INSERT OR IGNORE INTO handoff_resume_events(recipient,task_id,kind,source)
+          SELECT assignee,id,'created','task:'||id FROM handoff_tasks;
+        INSERT OR IGNORE INTO handoff_resume_events(recipient,task_id,kind,source)
+          SELECT CASE e.kind WHEN 'complete' THEN t.creator ELSE t.assignee END,
+            t.id,e.kind,'event:'||e.seq FROM handoff_task_events e JOIN handoff_tasks t ON t.id=e.task_id
+            WHERE e.kind IN ('complete','reopen','close') ORDER BY e.seq;
+      `);
+    });
+  }
+
+  acquireResume(actor: string, sessionId: string, consumer: string, now = Date.now()): boolean {
+    return this.transaction(() => {
+      if (!this.db.prepare("SELECT 1 FROM handoff_sides WHERE id=? AND session_id=?").get(actor, sessionId)) return false;
+      this.db.prepare("INSERT OR IGNORE INTO handoff_resume_state(side_id) VALUES(?)").run(actor);
+      return this.db.prepare(`UPDATE handoff_resume_state SET consumer=?,lease_until=? WHERE side_id=? AND enabled=1
+        AND (consumer IS NULL OR consumer=? OR lease_until<=?)`).run(consumer, now + 15000, actor, consumer, now).changes === 1;
+    });
+  }
+
+  pendingResume(actor: string, consumer: string): ResumeBatch | null {
+    const state = this.db.prepare("SELECT ack_seq FROM handoff_resume_state WHERE side_id=? AND consumer=? AND enabled=1").get(actor, consumer);
+    if (!state) return null;
+    const rows = this.db.prepare(`SELECT r.seq,r.task_id,r.kind,r.source,
+      (SELECT kind FROM handoff_task_events WHERE task_id=r.task_id AND kind IN ('complete','reopen','close') ORDER BY seq DESC LIMIT 1) AS current_kind,
+      (SELECT seq FROM handoff_task_events WHERE task_id=r.task_id AND kind IN ('complete','reopen','close') ORDER BY seq DESC LIMIT 1) AS current_seq
+      FROM handoff_resume_events r WHERE recipient=? AND seq>? ORDER BY seq LIMIT 100`).all(actor, Number(state.ack_seq));
+    if (!rows.length) return null;
+    let hasWork: boolean | undefined;
+    const events = new Map<number, ResumeEvent>();
+    for (const row of rows) {
+      const kind = row.kind as ResumeEvent["kind"];
+      let relevant = kind === "complete" ? row.current_kind === "complete"
+        : kind === "close" ? row.current_kind === "close" : row.current_kind === null || row.current_kind === "reopen";
+      if (String(row.source).startsWith("task:") && row.current_seq !== null) relevant = false;
+      if (String(row.source).startsWith("event:") && row.source !== `event:${row.current_seq}`) relevant = false;
+      if (relevant && kind === "close") {
+        // Acceptance can unblock other work, but never wake solely to admire a
+        // closed task when this side has nothing left to execute or review.
+        hasWork ??= !!this.db.prepare(`SELECT 1 FROM handoff_tasks t WHERE
+          (assignee=? AND COALESCE((SELECT kind FROM handoff_task_events WHERE task_id=t.id AND kind IN ('complete','close','reopen') ORDER BY seq DESC LIMIT 1),'reopen')='reopen')
+          OR (creator=? AND (SELECT kind FROM handoff_task_events WHERE task_id=t.id AND kind IN ('complete','close','reopen') ORDER BY seq DESC LIMIT 1)='complete') LIMIT 1`).get(actor, actor);
+        relevant = hasWork;
+      }
+      if (relevant) events.set(Number(row.task_id), { seq: Number(row.seq), taskId: Number(row.task_id), kind });
+    }
+    return { throughSeq: Number(rows.at(-1)!.seq), events: [...events.values()] };
+  }
+
+  acknowledgeResume(actor: string, consumer: string, throughSeq: number): void {
+    integer(throughSeq, "resume cursor", 0);
+    const max = Number(this.db.prepare("SELECT COALESCE(MAX(seq),0) AS seq FROM handoff_resume_events WHERE recipient=?").get(actor)!.seq);
+    if (throughSeq > max) throw new Error("Invalid resume cursor");
+    this.db.prepare("UPDATE handoff_resume_state SET ack_seq=MAX(ack_seq,?) WHERE side_id=? AND consumer=?")
+      .run(throughSeq, actor, consumer);
+  }
+
+  releaseResume(actor: string, consumer: string): void {
+    this.db.prepare("UPDATE handoff_resume_state SET consumer=NULL,lease_until=0 WHERE side_id=? AND consumer=?").run(actor, consumer);
+  }
+
+  setResumeEnabled(actor: string, enabled: boolean, reason: string | null = null): void {
+    this.transaction(() => {
+      const previous = this.db.prepare("SELECT enabled FROM handoff_resume_state WHERE side_id=?").get(actor);
+      this.db.prepare(`INSERT INTO handoff_resume_state(side_id,enabled,reason) VALUES(?,?,?)
+        ON CONFLICT(side_id) DO UPDATE SET enabled=excluded.enabled,reason=excluded.reason`).run(actor, Number(enabled), reason);
+      if (enabled && previous?.enabled === 0) {
+        // Explicit user recovery should also retry delivered-but-failed work.
+        // Repeated 'on' while enabled creates no new events or model loop.
+        const source = `retry:${randomUUID()}:`;
+        this.db.prepare(`INSERT INTO handoff_resume_events(recipient,task_id,kind,source)
+          SELECT ?,t.id,CASE WHEN t.assignee=? THEN 'created' ELSE 'complete' END,?||t.id FROM handoff_tasks t
+          WHERE (t.assignee=? AND COALESCE((SELECT kind FROM handoff_task_events WHERE task_id=t.id AND kind IN ('complete','close','reopen') ORDER BY seq DESC LIMIT 1),'reopen')='reopen')
+            OR (t.creator=? AND (SELECT kind FROM handoff_task_events WHERE task_id=t.id AND kind IN ('complete','close','reopen') ORDER BY seq DESC LIMIT 1)='complete')`)
+          .run(actor, actor, source, actor, actor);
+      }
+    });
+  }
+
+  resumeStatus(actor: string): Record<string, unknown> {
+    const state = this.db.prepare("SELECT enabled,ack_seq,reason FROM handoff_resume_state WHERE side_id=?").get(actor);
+    const ackSeq = Number(state?.ack_seq ?? 0);
+    return { enabled: state ? !!state.enabled : true, ackSeq, reason: state?.reason ?? null,
+      pendingEvents: Number(this.db.prepare("SELECT COUNT(*) AS total FROM handoff_resume_events WHERE recipient=? AND seq>?").get(actor, ackSeq)!.total) };
   }
 
   close(): void {
@@ -347,6 +477,7 @@ export class HandoffStore {
     const visible = this.db.prepare("SELECT COUNT(*) AS total FROM handoff_tasks WHERE creator=? OR assignee=?").get(actor, actor)!;
     return {
       extensionVersion: HANDOFF_EXTENSION_VERSION, dbPath: this.dbPath, visibleTasks: Number(visible.total),
+      autoResume: this.resumeStatus(actor),
       integrity: String(Object.values(this.db.prepare("PRAGMA integrity_check").get()!)[0]),
       takeovers: this.db.prepare("SELECT * FROM handoff_side_transfers WHERE side_id=? ORDER BY seq").all(actor),
     };

@@ -5,7 +5,7 @@ import { join } from "node:path";
 
 const source = import.meta.dirname;
 const destination = join(homedir(), ".pi", "agent", "extensions", "pi-handoff");
-const files = ["index.ts", "channel.ts", "store.ts", "types.ts", "ui.ts", "instructions.ts", "README.md", "package.json"];
+const files = ["index.ts", "resume.ts", "channel.ts", "store.ts", "types.ts", "ui.ts", "instructions.ts", "README.md", "package.json"];
 const dependencySource = join(source, "node_modules", "typebox");
 const dependencyDestination = join(destination, "node_modules", "typebox");
 const checkOnly = process.argv.includes("--check");
@@ -39,5 +39,5 @@ console.log(JSON.stringify({
   ok: true,
   destination,
   installed: [...files, "node_modules/typebox"],
-  reload: "Run /reload in each Pi to use directed persistent handoff tasks; existing records are preserved"
+  reload: "Run /reload in each Pi to enable durable handoff event resume; existing records are preserved"
 }, null, 2));

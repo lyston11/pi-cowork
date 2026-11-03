@@ -9,6 +9,7 @@ import { taskLines } from "./ui.ts";
 import { HANDOFF_RUNTIME_RULES, installHandoffRules } from "./instructions.ts";
 import type { HandoffTask, Side } from "./types.ts";
 import { resolveChannel } from "./channel.ts";
+import { EventResume } from "./resume.ts";
 export { resolveChannel } from "./channel.ts";
 
 function runGit(cwd: string, args: string[]): string {
@@ -25,6 +26,7 @@ export default function piHandoff(pi: ExtensionAPI): void {
   const cwd = resolve(process.cwd());
   const channel = resolveChannel(cwd);
   let store: HandoffStore | undefined;
+  let resume: EventResume | undefined;
   const board = () => store ??= new HandoffStore(channel.rootDir);
 
   const identity = (ctx: ExtensionContext): Side => {
@@ -47,9 +49,22 @@ export default function piHandoff(pi: ExtensionAPI): void {
     catch { throw new Error("Commit is not available in this checkout. Fetch or share the commit before recording completion or review."); }
   };
 
-  pi.on("session_start", (_event, ctx) => { identity(ctx); });
-  pi.on("session_switch", (_event, ctx) => { identity(ctx); });
-  pi.on("session_shutdown", () => { store?.close(); store = undefined; });
+  const startResume = (ctx: ExtensionContext, self = identity(ctx)) => {
+    if (resume?.self.id === self.id && resume.self.sessionId === self.sessionId) return;
+    resume?.stop();
+    resume = undefined;
+    if (ctx.mode === "tui" || ctx.mode === "rpc") {
+      resume = new EventResume(pi, board(), self, ctx);
+      resume.start();
+    }
+  };
+  pi.on("session_start", (_event, ctx) => { startResume(ctx); });
+  pi.on("session_shutdown", () => { resume?.stop(); resume = undefined; store?.close(); store = undefined; });
+  pi.on("agent_start", () => { resume?.runStarted(); });
+  pi.on("message_end", (event) => { resume?.observeMessage(event.message); });
+  pi.on("agent_settled", (event) => { resume?.settled(event.aborted); });
+  pi.on("ui_prompt_start", () => { resume?.uiWaiting(true); });
+  pi.on("ui_prompt_end", () => { resume?.uiWaiting(false); });
   pi.on("before_agent_start", (event) => {
     event.systemPromptOptions.sections.pi_handoff = HANDOFF_RUNTIME_RULES;
   });
@@ -99,13 +114,25 @@ export default function piHandoff(pi: ExtensionAPI): void {
     }),
     async execute(_id, input, _signal, _update, ctx) {
       const self = board().takeover(identity(ctx), input.from, input.expectedSessionId, input.reason);
+      startResume(ctx, self);
       return toolResult({ self, ...board().status(self.id), channel });
     },
   });
 
   pi.registerTool({
+    name: "handoff_auto", label: "Control handoff event resume",
+    description: "Read automatic event-resume status, or enable/pause it when the user asks. Live TUI/RPC sessions resume on new assignments, returned work, incoming completions and relevant acceptance events, within existing authorization. Esc/abort or a model error pauses automatic runs; enabled=true restores them. Does not launch a Pi process or grant task authorization.",
+    parameters: Type.Object({ enabled: Type.Optional(Type.Boolean()) }),
+    async execute(_id, input, _signal, _update, ctx) {
+      const self = identity(ctx);
+      if (input.enabled !== undefined) board().setResumeEnabled(self.id, input.enabled, input.enabled ? null : "用户暂停自动续跑");
+      return toolResult({ self, autoResume: board().resumeStatus(self.id) });
+    },
+  });
+
+  pi.registerTool({
     name: "handoff_create", label: "Assign a handoff task",
-    description: "Create a checklist task for one side from handoff_sides. Only this creator and that assignee may list or read it. Tasks persist independently of Git and process lifetime. No notification is sent.",
+    description: "Create a checklist task for one side from handoff_sides. Only this creator and that assignee may list or read it. Tasks persist independently of Git and process lifetime. A durable event resumes the assignee's live Pi within existing authorization.",
     parameters: Type.Object({
       to: Type.String({ minLength: 1, maxLength: 256 }), subject: Type.String({ minLength: 1, maxLength: 160 }),
       body: Type.String({ minLength: 1, maxLength: 16000 }),
@@ -182,7 +209,7 @@ export default function piHandoff(pi: ExtensionAPI): void {
   });
 
   pi.registerCommand("handoff", {
-    description: "Open the human project task panel. /handoff [init|status|name <name>|read <id>|takeover <side-id>]",
+    description: "Open the human project task panel. /handoff [init|status|auto [on|off]|name <name>|read <id>|takeover <side-id>]",
     handler: async (args, ctx) => {
       const self = identity(ctx);
       const command = args.trim();
@@ -196,11 +223,19 @@ export default function piHandoff(pi: ExtensionAPI): void {
       if (command === "status") {
         ctx.ui.notify(JSON.stringify({ ...board().status(self.id), self, channel }, null, 2), "info"); return;
       }
+      if (command === "auto" || command.startsWith("auto ")) {
+        const arg = command.slice(4).trim();
+        if (arg && arg !== "on" && arg !== "off") throw new Error("Usage: /handoff auto [on|off]");
+        if (arg) board().setResumeEnabled(self.id, arg === "on", arg === "on" ? null : "用户暂停自动续跑");
+        ctx.ui.notify(JSON.stringify(board().resumeStatus(self.id), null, 2), "info");
+        return;
+      }
       if (command.startsWith("takeover ")) {
         const targetId = command.slice(9).trim();
         const target = board().sides().find((side) => side.id === targetId);
         if (!target) throw new Error("Target side not found; use an exact id from handoff_sides");
         const inherited = board().takeover(self, target.id, target.sessionId, "User invoked /handoff takeover");
+        startResume(ctx, inherited);
         ctx.ui.notify(`已接管 ${inherited.name} (${inherited.id})。旧任务与历史已保留，旧会话不能再操作该侧。`, "info");
         return;
       }
@@ -213,7 +248,7 @@ export default function piHandoff(pi: ExtensionAPI): void {
         const task = board().read(Number(command.slice(5)), self.id);
         ctx.ui.notify(JSON.stringify({ warning, task }, null, 2), "info"); return;
       }
-      if (command && command !== "list") throw new Error("Usage: /handoff [init|status|name <name>|read <id>|takeover <side-id>]");
+      if (command && command !== "list") throw new Error("Usage: /handoff [init|status|auto [on|off]|name <name>|read <id>|takeover <side-id>]");
       if (ctx.mode !== "tui") {
         ctx.ui.notify(JSON.stringify({ warning, ...board().list(self.id) }, null, 2), "info"); return;
       }

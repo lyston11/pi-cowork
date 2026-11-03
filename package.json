@@ -1,6 +1,6 @@
 {
   "name": "@pi/pi-handoff",
-  "version": "4.3.0",
+  "version": "4.4.0",
   "private": true,
   "type": "module",
   "description": "Persistent directed checklist handoffs between project-defined Pi sides",
