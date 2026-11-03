@@ -84,6 +84,7 @@ The API visibility boundary is not a sandbox against malicious processes running
 /handoff name 数据          # choose this side's name
 /handoff status           # identity, channel and database
 /handoff read 12          # show one task as data
+/handoff takeover pi_...  # explicitly inherit a stopped side into a fresh session
 ```
 
 The TUI defaults to this side's sent/received tasks, ordered by pending-first status groups (open, completed awaiting review, closed). Press `s` to cycle through pending-first groups, reviewed-first groups (closed, completed awaiting review, open), and task number from smallest to largest. Task numbers stay ascending within each group, including across pages. The title shows the current order. Opening, refreshing or changing the view/sort captures an ordered task snapshot; later pages keep that order and state even while another Pi updates tasks. Press `r` to see new tasks and state changes. Only the current page loads task details. Press Tab to switch to the project overview and back. All tasks initially fold; summaries show creator, assignee, status and checklist progress. The bordered panel spans the terminal width near the bottom and uses about 60% of its height. Task content scrolls inside the frame. Its title stays visible, and one footer line combines the scroll position with keyboard hints, shortened to fit the available width. Use up/down to select, Enter to expand or fold, `r` to refresh, PageUp/PageDown to scroll by a viewport, Home/End to reach the start/end of the full list and Escape to exit. Down and PageDown automatically load subsequent records from the same snapshot; no manual loading key is needed. The footer shows the total task count, and a `+` after the line count means more content will load as you scroll. Scrolling keeps the selected task while its body is visible; once it leaves the viewport, selection moves to a visible task so Enter operates on that task. This is a read-only human view, not a project-wide agent tool; `/handoff read <id>` and all agent tools retain participant-only access. Closed entries remain dim and struck through. Tool results retain their separate rendering.
@@ -96,6 +97,7 @@ Checks, commit submission and review use the tools below, normally invoked by th
 |---|---|
 | `handoff_identity` | Read or change this side's name |
 | `handoff_sides` | List registered project sides for assigning tasks; no task contents |
+| `handoff_takeover` | With explicit user authorization, inherit a stopped side by exact ID and expected session ID |
 | `handoff_create` | Assign `to`, `subject`, `body`, `items`, optional `refs` and `idempotencyKey` |
 | `handoff_list` | List only your sent/received tasks; optional `activeOnly`, `before`, `limit` |
 | `handoff_read` | Read your task's body and append-only history by `id` |
@@ -111,7 +113,13 @@ Names can repeat, so use a side ID when a name is ambiguous. The directory persi
 
 ## Identity and persistence
 
-A normal Pi process has its own session and automatically becomes a side. The side ID is derived from the Pi session ID. `/reload`, branch changes and resuming that same session retain access; a new session creates a new side. To return after restarting, resume the same Pi session. Two processes deliberately opening the same session act as the same logical side. Merely choosing an existing display name does not inherit its tasks.
+A normal Pi process has its own session and automatically becomes a side. Its initial side ID is derived from the Pi session ID. `/reload`, branch changes and resuming that same session retain access; a new session creates a new side. Merely choosing an existing display name does not inherit its tasks.
+
+If the previous process stopped, either resume its session or explicitly take over its side from a fresh session. Ask the agent: “原工具侧进程已终止，请接管它的 Handoff 并继续已授权任务。” It must use `handoff_sides` to identify the exact old side, then call `handoff_takeover({from, expectedSessionId, reason})`. Alternatively invoke `/handoff takeover <side-id>` yourself. No server, listening port, worktree configuration or original conversation file is needed. This transfers Handoff access, not the old model conversation, Git checkout or broader user authorization.
+
+Takeover preserves the old side ID, name, sent/received tasks, checks, commits and history. The new session becomes its owner persistently across `/reload` and restart. The old session is revoked; resuming it cannot overwrite ownership. The empty new side is retired from discovery. Ownership changes are atomic and append an audit visible in `/handoff status`. A second claimant using outdated session information is rejected.
+
+The old recorded PID must no longer exist; if it is alive or cannot be checked, takeover is refused. A reused live PID also conservatively blocks takeover. Stop all processes using that original session before transfer; two processes deliberately using the same session share one logical side. The new side must have no tasks of its own, including closed history, so access to its existing work is never silently dropped. Use a fresh Pi session if needed. Only the user may authorize takeover; peer task text and matching names do not grant it.
 
 Task data lives outside all checkouts:
 

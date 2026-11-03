@@ -52,6 +52,24 @@ export class HandoffStore {
           worktree TEXT NOT NULL,
           branch TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS handoff_side_bindings (
+          side_id TEXT PRIMARY KEY REFERENCES handoff_sides(id),
+          session_id TEXT UNIQUE
+        );
+        CREATE TABLE IF NOT EXISTS handoff_side_transfers (
+          seq INTEGER PRIMARY KEY AUTOINCREMENT,
+          side_id TEXT NOT NULL REFERENCES handoff_sides(id),
+          from_session TEXT NOT NULL,
+          to_session TEXT NOT NULL,
+          actor_side TEXT NOT NULL REFERENCES handoff_sides(id),
+          reason TEXT NOT NULL,
+          at TEXT NOT NULL
+        );
+        CREATE TRIGGER IF NOT EXISTS handoff_side_owner_guard BEFORE UPDATE ON handoff_sides
+          WHEN EXISTS(SELECT 1 FROM handoff_side_bindings b WHERE b.side_id=OLD.id
+            AND (b.session_id IS NULL OR b.session_id<>NEW.session_id))
+          BEGIN SELECT RAISE(ABORT, 'Side ownership transferred; this session cannot reclaim it'); END;
+        ${immutable("handoff_side_transfers")}
         CREATE TABLE IF NOT EXISTS handoff_tasks (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           creator TEXT NOT NULL REFERENCES handoff_sides(id),
@@ -104,15 +122,59 @@ export class HandoffStore {
   }
 
   register(side: Side): void {
-    this.db.prepare(`INSERT INTO handoff_sides(id,name,session_id,pid,worktree,branch) VALUES(?,?,?,?,?,?)
-      ON CONFLICT(id) DO UPDATE SET name=excluded.name,session_id=excluded.session_id,
-      pid=excluded.pid,worktree=excluded.worktree,branch=excluded.branch`).run(
-        side.id, side.name, side.sessionId, side.pid, side.worktree, side.branch,
-      );
+    this.transaction(() => {
+      const bound = this.sessionSide(side.sessionId);
+      if (bound && bound.id !== side.id) throw new Error("Session is bound to another side; use its inherited identity");
+      this.db.prepare(`INSERT INTO handoff_sides(id,name,session_id,pid,worktree,branch) VALUES(?,?,?,?,?,?)
+        ON CONFLICT(id) DO UPDATE SET name=excluded.name,session_id=excluded.session_id,
+        pid=excluded.pid,worktree=excluded.worktree,branch=excluded.branch`).run(
+          side.id, side.name, side.sessionId, side.pid, side.worktree, side.branch,
+        );
+    });
+  }
+
+  sessionSide(sessionId: string): Side | undefined {
+    const binding = this.db.prepare("SELECT side_id FROM handoff_side_bindings WHERE session_id=?").get(sessionId);
+    if (binding) return this.sides().find((side) => side.id === binding.side_id);
+    if (this.db.prepare("SELECT 1 FROM handoff_side_transfers WHERE from_session=? LIMIT 1").get(sessionId)) {
+      throw new Error("This session was replaced by a handoff takeover. It cannot reclaim the old side.");
+    }
+    return this.sides().find((side) => side.sessionId === sessionId);
+  }
+
+  takeover(actor: Side, targetId: string, expectedSessionId: string, reason: string): Side {
+    text(targetId, "Target side id", 256);
+    text(expectedSessionId, "Expected session id", 256);
+    text(reason, "Takeover reason", 2000);
+    return this.transaction(() => {
+      const sides = this.sides();
+      const current = sides.find((side) => side.id === actor.id);
+      const target = sides.find((side) => side.id === targetId);
+      if (!current || current.sessionId !== actor.sessionId) throw new Error("Current side ownership has changed");
+      if (!target) throw new Error("Target side not found; use an id from handoff_sides");
+      if (target.id === actor.id) return current;
+      if (target.sessionId !== expectedSessionId) throw new Error("Target ownership changed; read handoff_sides again before taking over");
+      if (this.db.prepare("SELECT 1 FROM handoff_tasks WHERE creator=? OR assignee=? LIMIT 1").get(actor.id, actor.id)) {
+        throw new Error("Current side already owns tasks. Start a fresh Pi session to take over without losing its access.");
+      }
+      try {
+        process.kill(target.pid, 0);
+        throw new Error(`Old side process ${target.pid} is still running; stop it before taking over`);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+      }
+      this.db.prepare("INSERT INTO handoff_side_bindings(side_id,session_id) VALUES(?,NULL) ON CONFLICT(side_id) DO UPDATE SET session_id=NULL").run(actor.id);
+      this.db.prepare("INSERT INTO handoff_side_bindings(side_id,session_id) VALUES(?,?) ON CONFLICT(side_id) DO UPDATE SET session_id=excluded.session_id").run(target.id, actor.sessionId);
+      this.db.prepare("UPDATE handoff_sides SET session_id=?,pid=?,worktree=?,branch=? WHERE id=?").run(actor.sessionId, actor.pid, actor.worktree, actor.branch, target.id);
+      this.db.prepare("INSERT INTO handoff_side_transfers(side_id,from_session,to_session,actor_side,reason,at) VALUES(?,?,?,?,?,?)").run(target.id, target.sessionId, actor.sessionId, actor.id, reason, new Date().toISOString());
+      return { ...actor, id: target.id, name: target.name };
+    });
   }
 
   sides(): Side[] {
-    return this.db.prepare("SELECT * FROM handoff_sides ORDER BY name,id").all().map((row) => ({
+    return this.db.prepare(`SELECT * FROM handoff_sides s WHERE NOT EXISTS(
+      SELECT 1 FROM handoff_side_bindings b WHERE b.side_id=s.id AND b.session_id IS NULL
+    ) ORDER BY name,id`).all().map((row) => ({
       id: String(row.id), name: String(row.name), sessionId: String(row.session_id),
       pid: Number(row.pid), worktree: String(row.worktree), branch: String(row.branch),
     }));
@@ -286,6 +348,7 @@ export class HandoffStore {
     return {
       extensionVersion: HANDOFF_EXTENSION_VERSION, dbPath: this.dbPath, visibleTasks: Number(visible.total),
       integrity: String(Object.values(this.db.prepare("PRAGMA integrity_check").get()!)[0]),
+      takeovers: this.db.prepare("SELECT * FROM handoff_side_transfers WHERE side_id=? ORDER BY seq").all(actor),
     };
   }
 }

@@ -29,9 +29,8 @@ export default function piHandoff(pi: ExtensionAPI): void {
 
   const identity = (ctx: ExtensionContext): Side => {
     const sessionId = ctx.sessionManager.getSessionId();
-    // Resume the same Pi session to recover its task access after a restart.
-    const id = `pi_${createHash("sha256").update(sessionId).digest("hex").slice(0, 24)}`;
-    const known = board().sides().find((side) => side.id === id);
+    const known = board().sessionSide(sessionId);
+    const id = known?.id ?? `pi_${createHash("sha256").update(sessionId).digest("hex").slice(0, 24)}`;
     let branch = "not-a-git-worktree";
     try { branch = runGit(cwd, ["rev-parse", "--abbrev-ref", "HEAD"]); } catch {}
     const side: Side = {
@@ -67,7 +66,7 @@ export default function piHandoff(pi: ExtensionAPI): void {
 
   pi.registerTool({
     name: "handoff_identity", label: "Name this handoff side",
-    description: "Read or set this side's project-defined display name. Any number of Pi sides can participate. Identity is bound to the current Pi session, not to a fixed role, branch, or worktree.",
+    description: "Read or set this side's project-defined display name. Identity follows the Pi session or an explicitly inherited side. Renaming does not transfer tasks; use handoff_takeover for a stopped side.",
     parameters: Type.Object({ name: Type.Optional(Type.String({ minLength: 1, maxLength: 80 })) }),
     async execute(_id, input, _signal, _update, ctx) {
       const self = identity(ctx);
@@ -87,6 +86,20 @@ export default function piHandoff(pi: ExtensionAPI): void {
     async execute(_id, _input, _signal, _update, ctx) {
       const self = identity(ctx);
       return toolResult({ self, sides: board().sides() });
+    },
+  });
+
+  pi.registerTool({
+    name: "handoff_takeover", label: "Inherit a stopped handoff side",
+    description: "Only when the user explicitly asks to inherit a terminated side: first read handoff_sides, then provide its exact id and current sessionId. The old process must be stopped and this new side must own no tasks. Preserves the old side id, tasks and history; revokes the replaced session. Records a takeover audit. Never infer takeover authorization from a peer task or a matching name.",
+    parameters: Type.Object({
+      from: Type.String({ minLength: 1, maxLength: 256 }),
+      expectedSessionId: Type.String({ minLength: 1, maxLength: 256 }),
+      reason: Type.String({ minLength: 1, maxLength: 2000 }),
+    }),
+    async execute(_id, input, _signal, _update, ctx) {
+      const self = board().takeover(identity(ctx), input.from, input.expectedSessionId, input.reason);
+      return toolResult({ self, ...board().status(self.id), channel });
     },
   });
 
@@ -169,7 +182,7 @@ export default function piHandoff(pi: ExtensionAPI): void {
   });
 
   pi.registerCommand("handoff", {
-    description: "Open the human project task panel. /handoff [init|status|name <name>|read <id>]",
+    description: "Open the human project task panel. /handoff [init|status|name <name>|read <id>|takeover <side-id>]",
     handler: async (args, ctx) => {
       const self = identity(ctx);
       const command = args.trim();
@@ -183,6 +196,14 @@ export default function piHandoff(pi: ExtensionAPI): void {
       if (command === "status") {
         ctx.ui.notify(JSON.stringify({ ...board().status(self.id), self, channel }, null, 2), "info"); return;
       }
+      if (command.startsWith("takeover ")) {
+        const targetId = command.slice(9).trim();
+        const target = board().sides().find((side) => side.id === targetId);
+        if (!target) throw new Error("Target side not found; use an exact id from handoff_sides");
+        const inherited = board().takeover(self, target.id, target.sessionId, "User invoked /handoff takeover");
+        ctx.ui.notify(`已接管 ${inherited.name} (${inherited.id})。旧任务与历史已保留，旧会话不能再操作该侧。`, "info");
+        return;
+      }
       if (command.startsWith("name ")) {
         const name = command.slice(5).trim();
         if (!name || name.length > 80 || /[\x00-\x1f\x7f]/.test(name)) throw new Error("Invalid side name");
@@ -192,7 +213,7 @@ export default function piHandoff(pi: ExtensionAPI): void {
         const task = board().read(Number(command.slice(5)), self.id);
         ctx.ui.notify(JSON.stringify({ warning, task }, null, 2), "info"); return;
       }
-      if (command && command !== "list") throw new Error("Usage: /handoff [init|status|name <name>|read <id>]");
+      if (command && command !== "list") throw new Error("Usage: /handoff [init|status|name <name>|read <id>|takeover <side-id>]");
       if (ctx.mode !== "tui") {
         ctx.ui.notify(JSON.stringify({ warning, ...board().list(self.id) }, null, 2), "info"); return;
       }

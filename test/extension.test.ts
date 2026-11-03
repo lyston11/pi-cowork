@@ -6,6 +6,7 @@ import { execFileSync } from "node:child_process";
 import test from "node:test";
 import piHandoff, { resolveChannel } from "../index.ts";
 import { taskLines } from "../ui.ts";
+import { HandoffStore } from "../store.ts";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { HANDOFF_RULES, HANDOFF_RUNTIME_RULES } from "../instructions.ts";
 
@@ -136,7 +137,7 @@ test("tool boundary binds identity to session, never accepts an actor from argum
         await execute("one", "handoff_close", { id: 2, commit, note: "reviewed" });
         terminal.rows = 24;
         const visibleIds = () => [...render().matchAll(/#([0-9]+)/g)].map((match) => Number(match[1]));
-        panel.handleInput("s");
+        panel.handleInput("r");
         assert.match(render(), /待处理优先/);
         assert.match(panel.render(80).at(-2), /s排序/);
         assert.deepEqual(visibleIds().slice(0, 3), [1, 4, 5]);
@@ -146,6 +147,8 @@ test("tool boundary binds identity to session, never accepts an actor from argum
         panel.handleInput("s");
         assert.match(render(), /编号升序/);
         assert.deepEqual(visibleIds().slice(0, 3), [1, 2, 3]);
+        panel.handleInput("s");
+        assert.match(render(), /待处理优先/);
       },
     } });
     assert.deepEqual((await execute("three", "handoff_list", {})).details.tasks, []);
@@ -175,6 +178,45 @@ test("tool boundary binds identity to session, never accepts an actor from argum
     assert.equal(readFileSync(join(root, "AGENTS.md"), "utf8"), installed);
   } finally {
     handlers.get("session_shutdown")?.(); process.chdir(previousCwd);
+    if (previousState === undefined) delete process.env.PI_HANDOFF_STATE_DIR; else process.env.PI_HANDOFF_STATE_DIR = previousState;
+    rmSync(root, { recursive: true, force: true }); rmSync(state, { recursive: true, force: true });
+  }
+});
+
+test("tool and command takeover both bind later calls to the inherited side and revoke its old session", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-takeover-extension-"));
+  const state = mkdtempSync(join(tmpdir(), "pi-takeover-state-"));
+  const previousCwd = process.cwd(), previousState = process.env.PI_HANDOFF_STATE_DIR;
+  const tools = new Map<string, any>(), commands = new Map<string, any>(), handlers = new Map<string, Function>();
+  let direct: HandoffStore | undefined;
+  try {
+    initRepo(root); process.chdir(root); process.env.PI_HANDOFF_STATE_DIR = state;
+    piHandoff({ registerTool: (tool: any) => tools.set(tool.name, tool), registerCommand: (name: string, command: any) => commands.set(name, command), on: (name: string, handler: Function) => handlers.set(name, handler) } as any);
+    const context = (session: string) => ({ sessionManager: { getSessionId: () => session, getSessionName: () => session }, ui: { notify() {} } });
+    const execute = (session: string, name: string, input: unknown) => tools.get(name).execute("call", input, undefined, undefined, context(session));
+    const lead = (await execute("lead", "handoff_identity", {})).details.self;
+    const old = (await execute("old", "handoff_identity", { name: "tools" })).details.self;
+    const task = (await execute("lead", "handoff_create", { to: old.id, subject: "continue", body: "private", items: ["done"] })).details.task;
+    direct = new HandoffStore(resolveChannel(root, state).rootDir);
+    direct.register({ ...old, pid: 2147483647 });
+    const inherited = (await execute("replacement", "handoff_takeover", { from: old.id, expectedSessionId: old.sessionId, reason: "User explicitly requested takeover" })).details.self;
+    assert.equal(inherited.id, old.id);
+    assert.equal(inherited.name, old.name);
+    assert.equal((await execute("replacement", "handoff_read", { id: task.id })).details.task.id, task.id);
+    await execute("replacement", "handoff_check", { id: task.id, item: 1, checked: true });
+    await assert.rejects(execute("old", "handoff_list", {}), /replaced/);
+    await assert.rejects(execute("unrelated", "handoff_read", { id: task.id }), /not found or not visible/);
+    await handlers.get("session_shutdown")!();
+    assert.equal((await execute("replacement", "handoff_identity", {})).details.self.id, old.id);
+    const commandTarget = (await execute("command-old", "handoff_identity", { name: "review" })).details.self;
+    direct.register({ ...commandTarget, pid: 2147483647 });
+    await commands.get("handoff").handler(`takeover ${commandTarget.id}`, context("command-new"));
+    assert.equal((await execute("command-new", "handoff_identity", {})).details.self.id, commandTarget.id);
+    await assert.rejects(execute("command-old", "handoff_identity", {}), /replaced/);
+    assert.equal((await execute("command-new", "handoff_status", {})).details.takeovers.length, 1);
+    assert.equal(lead.sessionId, "lead");
+  } finally {
+    direct?.close(); handlers.get("session_shutdown")?.(); process.chdir(previousCwd);
     if (previousState === undefined) delete process.env.PI_HANDOFF_STATE_DIR; else process.env.PI_HANDOFF_STATE_DIR = previousState;
     rmSync(root, { recursive: true, force: true }); rmSync(state, { recursive: true, force: true });
   }
