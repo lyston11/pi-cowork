@@ -1,0 +1,194 @@
+import assert from "node:assert/strict";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { execFileSync } from "node:child_process";
+import test from "node:test";
+import piHandoff, { resolveChannel } from "../index.ts";
+import { taskLines } from "../ui.ts";
+import { visibleWidth } from "@earendil-works/pi-tui";
+import { HANDOFF_RULES, HANDOFF_RUNTIME_RULES } from "../instructions.ts";
+
+function initRepo(root: string) {
+  execFileSync("git", ["init", "-b", "main"], { cwd: root, stdio: "ignore" });
+  writeFileSync(join(root, "README.md"), "fixture\n");
+  execFileSync("git", ["add", "README.md"], { cwd: root, stdio: "ignore" });
+  execFileSync("git", ["-c", "user.name=Pi Test", "-c", "user.email=pi@example.invalid", "commit", "-m", "fixture"], { cwd: root, stdio: "ignore" });
+}
+
+test("tool boundary binds identity to session, never accepts an actor from arguments, and checks real commits", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-task-extension-"));
+  const state = mkdtempSync(join(tmpdir(), "pi-task-state-"));
+  const previousCwd = process.cwd(), previousState = process.env.PI_HANDOFF_STATE_DIR;
+  const handlers = new Map<string, Function>();
+  try {
+    initRepo(root); process.chdir(root); process.env.PI_HANDOFF_STATE_DIR = state;
+    const tools = new Map<string, any>();
+    const commands = new Map<string, any>();
+    piHandoff({ registerTool: (tool: any) => tools.set(tool.name, tool), registerCommand: (name: string, command: any) => commands.set(name, command), on: (name: string, handler: Function) => handlers.set(name, handler) } as any);
+    assert.equal(handlers.has("tool_call"), false);
+    const context = (session: string) => ({ sessionManager: { getSessionId: () => session, getSessionName: () => `side ${session}` }, ui: { notify() {} } });
+    const execute = (session: string, tool: string, args: unknown) => tools.get(tool).execute("call", args, undefined, undefined, context(session));
+    const a = (await execute("one", "handoff_identity", { name: "project lead" })).details.self;
+    const b = (await execute("two", "handoff_identity", { name: "data" })).details.self;
+    await execute("three", "handoff_identity", { name: "frontend" });
+    const created = await execute("one", "handoff_create", { to: b.id, subject: "secret", body: "PRIVATE-TEXT", items: ["done"] });
+    const id = created.details.task.id;
+    const ownList = (await execute("three", "handoff_list", {})).details;
+    assert.equal(ownList.tasks.length, 0);
+    assert.equal(ownList.self.sessionId, "three");
+    await assert.rejects(execute("three", "handoff_read", { id, actor: a.id }), /not found or not visible/);
+    const uiTheme = { fg: (_color: string, value: string) => value, strikethrough: (value: string) => value };
+    await commands.get("handoff").handler("", { ...context("three"), mode: "tui", ui: {
+      custom: async (factory: Function, options: any) => {
+        assert.equal(options.overlay, true);
+        assert.equal(options.overlayOptions.width, "100%");
+        assert.equal(options.overlayOptions.anchor, "bottom-center");
+        const terminal = { rows: 24 };
+        const panel = factory({ terminal, requestRender() {} }, uiTheme, {}, () => {});
+        const render = () => panel.render(200).join("\n");
+        assert.match(render(), /本侧/);
+        assert.match(render(), /暂无与你相关的任务/);
+        panel.handleInput("\t");
+        assert.match(render(), /全项目/);
+        assert.match(render(), /project lead → data/);
+        assert.match(render(), /▸/);
+        assert.doesNotMatch(render(), /PRIVATE-TEXT/);
+        panel.handleInput("\r");
+        assert.match(render(), /PRIVATE-TEXT/);
+        panel.handleInput("\t");
+        assert.match(render(), /本侧/);
+        assert.doesNotMatch(render(), /secret|PRIVATE-TEXT/);
+        panel.handleInput("\t");
+        assert.match(render(), /全项目/);
+        assert.doesNotMatch(render(), /PRIVATE-TEXT/);
+        for (let i = 0; i < 32; i++) await execute("one", "handoff_create", { to: b.id, subject: `任务 ${i}`, body: Array.from({ length: 40 }, (_, line) => `DETAIL-${line}`).join("\n"), items: ["最后一项"] });
+        panel.handleInput("r");
+        const frame = panel.render(80);
+        assert.equal(frame.length, Math.floor(terminal.rows * 0.6));
+        assert(frame.every((line: string) => visibleWidth(line) === 80));
+        assert.match(frame[0], /╭─+╮/);
+        assert.match(frame.at(-1), /╰─+╯/);
+        assert.match(frame.at(-2), /Esc退出/);
+        assert.match(frame.at(-2), /行 /);
+        assert.match(frame.at(-3), /├─+┤/);
+        const wide = panel.render(220);
+        assert(wide.at(-2).includes("Home/End首尾"));
+        assert(wide.at(-2).includes("r刷新"));
+        assert(!wide.at(-2).includes("n加载"));
+        assert.match(wide.at(-2), /33项/);
+        assert(wide.at(-2).includes("Tab本侧/全项目"));
+        assert.doesNotMatch(frame.join("\n"), /任务 31/);
+        panel.handleInput("\x1b[6~");
+        const paged = render();
+        const selectedAfterPage = Number(paged.match(/> ▸ #([0-9]+)/)?.[1]);
+        assert(selectedAfterPage > 1, "page down should select a visible task");
+        panel.handleInput("\r");
+        assert(render().includes(`> ▾ #${selectedAfterPage} `));
+        panel.handleInput("\x1b[6~");
+        assert.match(render(), /> .*DETAIL-/);
+        panel.handleInput("\r");
+        assert(render().includes(`> ▸ #${selectedAfterPage} `), "body scrolling retains the same task");
+        for (const key of ["\x1b[5~", "\x1b[F", "\x1b[H"]) {
+          panel.handleInput(key);
+          assert.match(render(), /> ▸ #[0-9]+/, "scrolling keeps a visible selection");
+        }
+        panel.handleInput("r");
+        render();
+        panel.handleInput("\x1b[6~");
+        panel.handleInput("\r");
+        assert.doesNotMatch(render(), /PRIVATE-TEXT/, "rapid PageDown then Enter must not open hidden task one");
+        panel.handleInput("r");
+        render();
+        for (let i = 0; i < 32; i++) { panel.handleInput("\x1b[B"); render(); }
+        assert.match(render(), /> ▸ #33 .*任务 31/, "down arrows automatically cross the page boundary");
+        panel.handleInput("\t"); panel.handleInput("\t");
+        panel.handleInput("r");
+        render();
+        for (let i = 0; i < 5; i++) { panel.handleInput("\x1b[6~"); render(); }
+        assert.match(render(), /任务 31/, "PageDown automatically continues through later pages");
+        panel.handleInput("r");
+        panel.handleInput("\x1b[F");
+        assert.match(render(), /任务 31/);
+        for (let i = 0; i < 32; i++) panel.handleInput("\x1b[B");
+        render();
+        panel.handleInput("\r");
+        render();
+        panel.handleInput("\x1b[6~");
+        assert.match(render(), /DETAIL-/);
+        panel.handleInput("\x1b[F");
+        assert.match(render(), /DETAIL-39/);
+        assert.match(render(), /最后一项/);
+        panel.handleInput("\x1b[H");
+        assert.match(render(), /secret/);
+        terminal.rows = 12;
+        const small = panel.render(50);
+        assert.equal(small.length, 7);
+        assert(small.every((line: string) => visibleWidth(line) === 50));
+        assert.match(small.at(-1), /╰─+╯/);
+        assert.match(small.at(-2), /Esc退出/);
+        assert.match(small.at(-3), /├─+┤/);
+        const commit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" }).trim();
+        for (const taskId of [2, 3]) {
+          await execute("two", "handoff_check", { id: taskId, item: 1, checked: true });
+          await execute("two", "handoff_complete", { id: taskId, commit, summary: "done" });
+        }
+        await execute("one", "handoff_close", { id: 2, commit, note: "reviewed" });
+        terminal.rows = 24;
+        const visibleIds = () => [...render().matchAll(/#([0-9]+)/g)].map((match) => Number(match[1]));
+        panel.handleInput("s");
+        assert.match(render(), /待处理优先/);
+        assert.match(panel.render(80).at(-2), /s排序/);
+        assert.deepEqual(visibleIds().slice(0, 3), [1, 4, 5]);
+        panel.handleInput("s");
+        assert.match(render(), /已验收优先/);
+        assert.deepEqual(visibleIds().slice(0, 3), [2, 3, 1]);
+        panel.handleInput("s");
+        assert.match(render(), /编号升序/);
+        assert.deepEqual(visibleIds().slice(0, 3), [1, 2, 3]);
+      },
+    } });
+    assert.deepEqual((await execute("three", "handoff_list", {})).details.tasks, []);
+    await assert.rejects(execute("three", "handoff_read", { id }), /not found or not visible/);
+    await execute("two", "handoff_check", { id, item: 1, checked: true });
+    await assert.rejects(execute("two", "handoff_complete", { id, commit: "f".repeat(40), summary: "fake" }), /not available/);
+    const commit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" }).trim();
+    const completed = (await execute("two", "handoff_complete", { id, commit, summary: "done" })).details.task;
+    const theme = { fg: (_color: string, value: string) => value, strikethrough: (value: string) => `\x1b[9m${value}\x1b[29m` };
+    assert.equal(taskLines(completed, false, theme as any, 80).some((line) => line.includes("PRIVATE-TEXT")), false);
+    const closed = (await execute("one", "handoff_close", { id, commit, note: "reviewed" })).details.task;
+    assert.match(taskLines(closed, false, theme as any, 80).join("\n"), /\x1b\[9m/);
+    const component = tools.get("handoff_list").renderResult({ details: { tasks: [closed] } }, { expanded: false }, theme);
+    assert.equal(component.render(30).length > 0, true);
+    assert.doesNotThrow(() => component.invalidate());
+    await handlers.get("session_shutdown")!();
+    assert.equal((await execute("one", "handoff_identity", {})).details.self.id, a.id);
+    assert.equal((await execute("one", "handoff_read", { id })).details.task.state, "closed");
+    const event = { systemPromptOptions: { sections: {} } };
+    handlers.get("before_agent_start")!(event);
+    assert.doesNotMatch(JSON.stringify(event), /PRIVATE-TEXT|project lead/);
+    assert.equal((event.systemPromptOptions.sections as any).pi_handoff, HANDOFF_RUNTIME_RULES);
+    await commands.get("handoff").handler("init", context("one"));
+    const installed = readFileSync(join(root, "AGENTS.md"), "utf8");
+    assert(installed.includes(HANDOFF_RULES));
+    await commands.get("handoff").handler("init", context("one"));
+    assert.equal(readFileSync(join(root, "AGENTS.md"), "utf8"), installed);
+  } finally {
+    handlers.get("session_shutdown")?.(); process.chdir(previousCwd);
+    if (previousState === undefined) delete process.env.PI_HANDOFF_STATE_DIR; else process.env.PI_HANDOFF_STATE_DIR = previousState;
+    rmSync(root, { recursive: true, force: true }); rmSync(state, { recursive: true, force: true });
+  }
+});
+
+test("main, another branch and linked worktree resolve the same Git-independent storage", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-task-channel-")), linked = `${root}-linked`, state = `${root}-state`;
+  try {
+    initRepo(root);
+    const first = resolveChannel(root, state);
+    execFileSync("git", ["worktree", "add", "-b", "task/linked", linked], { cwd: root, stdio: "ignore" });
+    assert.equal(resolveChannel(linked, state).rootDir, first.rootDir);
+    execFileSync("git", ["switch", "-c", "task/other"], { cwd: root, stdio: "ignore" });
+    assert.equal(resolveChannel(root, state).rootDir, first.rootDir);
+    assert.equal(execFileSync("git", ["status", "--porcelain"], { cwd: root, encoding: "utf8" }), "");
+  } finally { rmSync(linked, { recursive: true, force: true }); rmSync(root, { recursive: true, force: true }); rmSync(state, { recursive: true, force: true }); }
+});

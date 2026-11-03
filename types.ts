@@ -1,0 +1,46 @@
+export const HANDOFF_EXTENSION_VERSION = "4.2.1";
+
+export interface Side {
+  id: string;
+  name: string;
+  sessionId: string;
+  pid: number;
+  worktree: string;
+  branch: string;
+}
+
+export type TaskState = "open" | "completed" | "closed";
+export interface TaskEvent {
+  seq: number;
+  actor: string;
+  kind: "check" | "complete" | "close" | "reopen";
+  data: Record<string, unknown>;
+  at: string;
+}
+
+export interface HandoffTask {
+  id: number;
+  creator: Side;
+  assignee: Side;
+  subject: string;
+  body: string;
+  refs: string[];
+  items: { text: string; checked: boolean }[];
+  state: TaskState;
+  commit: string | null;
+  summary: string | null;
+  reviewNote: string | null;
+  createdAt: string;
+  events: TaskEvent[];
+}
+
+export type TaskSummary = Omit<HandoffTask, "body" | "events">;
+
+export interface CreateInput {
+  to: string;
+  subject: string;
+  body: string;
+  items: string[];
+  refs?: string[];
+  idempotencyKey?: string;
+}
