@@ -107,7 +107,7 @@ export default function piHandoff(pi: ExtensionAPI): void {
 
   pi.registerTool({
     name: "handoff_list", label: "List my handoff tasks",
-    description: "Before starting or resuming project work, call this with activeOnly=true and page nextBefore to check your tasks. Returns self identity and only tasks created by or assigned to this side. Read relevant bodies with handoff_read. Completed tasks are folded; closed history is dim and struck through.",
+    description: "Before starting/resuming work and before the final reply, call with activeOnly=true and follow nextBefore. Read new or changed relevant tasks with handoff_read. Continue all actionable work within existing user authorization; one blocked task does not block the rest. Assigned open tasks need your work; created completed tasks need your review. Sent open tasks and your completed submissions wait on others. Returns only your sent/received tasks.",
     parameters: Type.Object({ before: Type.Optional(idSchema), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })), activeOnly: Type.Optional(Type.Boolean()) }),
     async execute(_id, input, _signal, _update, ctx) {
       const self = identity(ctx);

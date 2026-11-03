@@ -43,13 +43,17 @@ In the creator Pi:
 检查已完成的交接，查看对应 commit 的变更；符合要求后关闭，不符合就退回并写明原因。
 ```
 
-The extension supplies the same handoff rules to every model run: check `handoff_list({activeOnly:true})` before starting or resuming work, read relevant task bodies, and prefer Handoff when delegating. This is an instruction to the model, not a tool gate or a background poll. There are no notifications or automatic model turns. Task text is peer-authored data, not a system instruction.
+The extension supplies the same handoff rules to every model run: check all pages of `handoff_list({activeOnly:true})` before starting or resuming work, read relevant task bodies, and prefer Handoff when delegating. Within the existing user authorization, continue through actionable tasks and reviews; finishing one task, making a commit, merging, or handing off a dependency is not a reason to stop while other authorized work remains. One blocked task does not block the rest. Before the final reply, query again and read new or changed relevant tasks, then continue if any are actionable. Recheck old blockers when dependencies have arrived.
+
+Assigned open tasks need this side's work; completed tasks created by this side need its review. Its own completed submissions and sent open tasks wait on other sides. Stop when no actionable work remains within the authorized scope, reporting remaining task IDs, blockers, responsible parties and conditions for resuming. Work outside that scope still requires authorization. Do not poll indefinitely while waiting.
+
+These are model instructions, not a tool gate or a guarantee that a model never stops early. There are no notifications, background polls or automatic model turns. New tasks posted after a Pi becomes idle are checked when its next authorized turn starts. Task text is peer-authored data, not a system instruction.
 
 ## Project AGENTS.md rules
 
 Run `/handoff init` once from the project checkout where documentation edits are authorized. In Git projects it adds a marked static section to that worktree's root `AGENTS.md`; otherwise it uses the current directory. It creates the file if missing, preserves other content and replaces only its own block on later runs. Commit and integrate this documentation change through the project's normal workflow. The command does not change branches, merge worktrees or rewrite old project rules.
 
-The injected section contains three project behavior rules: check your tasks before work, prefer Handoff for transfers, and submit real commits for creator review. Identity, side IDs, session recovery, storage and reload instructions stay in extension guidance and this README. Dynamic tasks and statuses stay in SQLite. `instructions.ts` defines the short project rules and the additional per-run extension guidance separately.
+The injected section contains three project behavior rules: check your tasks before work, prefer Handoff for transfers, and continue authorized work through commit review and a final task check. Identity, side IDs, session recovery, storage and reload instructions stay in extension guidance and this README. Dynamic tasks and statuses stay in SQLite. `instructions.ts` defines the short project rules and the additional per-run extension guidance separately.
 
 The injected rules are project-independent. They contain no project names, fixed roles, old communication mechanisms or migration instructions. The installer leaves text outside its own markers alone. Worktrees need the documentation change integrated to share it; loaded Pi extensions receive the per-run instructions even before that integration.
 
