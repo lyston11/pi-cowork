@@ -217,8 +217,8 @@ export default function piHandoff(pi: ExtensionAPI): void {
         };
         const expanded = new Map<number, boolean>();
         let projectView = false;
-        const sorts = ["id", "pending", "reviewed"] as const;
-        const sortLabels = ["编号升序", "待处理优先", "已验收优先"];
+        const sorts = ["pending", "reviewed", "id"] as const;
+        const sortLabels = ["待处理优先", "已验收优先", "编号升序"];
         let sortIndex = 0;
         let followSelection = true;
         const load = (more = false) => {
