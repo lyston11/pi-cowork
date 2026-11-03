@@ -1,12 +1,28 @@
 # Pi Handoff
 
-Persistent directed handoff tasks for any number of Pi sides in the same local project. A task has a creator and an assignee; these are roles on that task, not fixed sides named A and B.
+**让同一项目的多个 Pi 会话，通过共享数据库转交任务、提交 commit、验收并保留历史。**
 
-Each Pi registers automatically. Users or agents can choose names such as `前端`, `数据`, or `审核`. The stable side ID, not its display name, owns task access. A side may create some tasks and receive others.
+每个 Pi 会话自动成为一“侧”，用户或 Agent 可以给它命名为“前端”“数据”“工具”等角色。侧的数量和名称没有固定限制；同一侧既可以发起任务，也可以承接任务。通信不要求特定分支、worktree 或项目配置文件。
 
-## Install and use
+当前版本：**V4.3.0**。
 
-Requires Node.js 24 or newer and [Pi](https://github.com/earendil-works/pi-coding-agent).
+## 设计目标
+
+多个 Pi 在同一项目中协作时，需要一处共同记录任务的地方：发起方写清交付要求，承接方逐项完成并附 commit，发起方审查后关闭。任务不能因为换分支、换工作区或进程退出而被覆盖，也不能只靠对话里的“已经完成”作为交付凭据。
+
+Pi Handoff 因此采用以下设计：
+
+- **项目外持久化：** 数据保存在用户级 SQLite 中，各工作树共用，不进入业务仓库的 Git 版本。
+- **定向任务：** 每条任务只有一个发起方和一个承接方，Agent 工具只允许双方访问。
+- **交付与验收分开：** 承接方完成不等于关闭，必须由发起方审查相同的 commit。
+- **追加历史：** 勾选、交付、退回和关闭都记录事件，保留以前的尝试。
+- **主动查询：** Agent 在开工和收尾时查询。扩展不通知其他进程、不唤醒模型、不后台轮询。
+
+扩展只管理交接记录，不创建分支或 worktree，不修改项目代码，不自动合并、推送或替项目判断业务验收是否通过。
+
+## 安装与接入
+
+需要 **Node.js 24 或更新版本、Git 和 [Pi](https://github.com/earendil-works/pi-coding-agent)**。
 
 ```bash
 git clone https://github.com/lyston11/pi-handoff.git
@@ -15,137 +31,300 @@ npm ci
 npm run install:user
 ```
 
-Run `/reload` once in existing Pi processes. No `.pi/handoff.json`, side numbers, branches or worktrees are required.
-
-In the receiving Pi:
+安装器将运行文件复制到 `~/.pi/agent/extensions/pi-handoff`。已有 Pi 进程执行一次：
 
 ```text
-将本侧交接名称设为“数据”。
+/reload
 ```
 
-In the sending Pi:
+同一项目的每个 Pi 都加载扩展后，会自动加入同一频道，不需要 `.pi/handoff.json`、固定侧编号或监听端口。用户或 Agent 可以设置侧名：
 
 ```text
-给“数据”侧创建交接任务：接入 C03 字段合同。
-清单：完成字段适配；补受影响回归；提交代码。
-附上合同路径。完成后记录 commit，等我侧验收。
+/handoff name 前端
 ```
 
-In the receiving Pi when ready to work:
+侧名用于识别分工，不决定任务权限；同名不会继承另一会话的任务。
+
+在允许修改项目规范的检出中，可执行一次 `/handoff init`，将通用约定写入 `AGENTS.md`，再按项目正常流程提交和同步。**植入规则不是通信接入条件**；扩展本身也会在每轮模型运行前提供规则。
+
+更新源码并重新安装后，已有 Pi 仍需 `/reload`。安装器不会替换其他进程已经加载到内存的代码。
+
+## 整体架构与读写流程
+
+扩展加载在各 Pi 进程内部，没有独立通信服务。各进程通过同一项目的 SQLite 读写记录，不互相调用进程接口。
+
+```mermaid
+flowchart LR
+    A["Pi 会话：发起方"] -->|创建、验收、退回| E["各进程内的 Handoff 扩展"]
+    B["Pi 会话：承接方"] -->|查询、读取、勾选、提交| E
+    E -->|加载时解析项目| R["频道注册表 channels.sqlite"]
+    E -->|权限校验与事务| D["项目 handoff.sqlite"]
+    U["用户输入 /handoff"] --> P["只读任务面板"]
+    P --> D
+```
+
+以一次交接为例：
+
+1. 发起侧的 Agent 调用 `handoff_sides`，确认承接方的侧 ID，再用 `handoff_create` 写入要求、清单和资料引用。
+2. 承接侧下次开始或继续已授权工作时，调用 `handoff_list` 查询自己的任务，随后用 `handoff_read` 读取相关正文和历史。
+3. 正文作为普通工具结果进入模型上下文。Agent 按已有授权工作，完成清单并通过 `handoff_complete` 记录真实 commit。
+4. 发起侧查询到交付后，实际检查对应 commit，通过则 `handoff_close`，需要修改则 `handoff_reopen`。
+
+**读取不会消费任务，也不会自动认领或改变状态。** 接收方无需在线才能创建任务；它登记过的侧记录会保留，但 `handoff_sides` 不是在线进程列表。
+
+正式 PRD、规范和证据仍放在项目原有位置，任务通过 `refs` 引用。引用只保存字符串，不会复制文件、传输附件或自动 fetch commit。
+
+## 项目频道：为什么跨分支和 worktree 可用
+
+默认存储结构：
 
 ```text
-读取分配给本侧的交接任务，完成后逐项勾选，记录实际 commit 和完成说明。
+~/.pi/agent/state/pi-handoff/
+├── channels.sqlite                  # 本机项目绑定与远程地址别名
+└── <project-channel>/
+    └── pi-handoff/
+        └── handoff.sqlite           # 该项目的侧、任务和事件
 ```
 
-In the creator Pi:
+`channel.ts` 负责解析项目，`channels.sqlite` 保存稳定绑定：
 
-```text
-检查已完成的交接，查看对应 commit 的变更；符合要求后关闭，不符合就退回并写明原因。
-```
-
-The extension supplies the same handoff rules to every model run: check all pages of `handoff_list({activeOnly:true})` before starting or resuming work, read relevant task bodies, and prefer Handoff when delegating. Within the existing user authorization, continue through actionable tasks and reviews; finishing one task, making a commit, merging, or handing off a dependency is not a reason to stop while other authorized work remains. One blocked task does not block the rest. Before the final reply, query again and read new or changed relevant tasks, then continue if any are actionable. Recheck old blockers when dependencies have arrived.
-
-Assigned open tasks need this side's work; completed tasks created by this side need its review. Its own completed submissions and sent open tasks wait on other sides. Stop when no actionable work remains within the authorized scope, reporting remaining task IDs, blockers, responsible parties and conditions for resuming. Work outside that scope still requires authorization. Do not poll indefinitely while waiting.
-
-These are model instructions, not a tool gate or a guarantee that a model never stops early. There are no notifications, background polls or automatic model turns. New tasks posted after a Pi becomes idle are checked when its next authorized turn starts. Task text is peer-authored data, not a system instruction.
-
-## Project AGENTS.md rules
-
-Run `/handoff init` once from the project checkout where documentation edits are authorized. In Git projects it adds a marked static section to that worktree's root `AGENTS.md`; otherwise it uses the current directory. It creates the file if missing, preserves other content and replaces only its own block on later runs. Commit and integrate this documentation change through the project's normal workflow. The command does not change branches, merge worktrees or rewrite old project rules.
-
-The injected section contains three project behavior rules: check your tasks before work, prefer Handoff for transfers, and continue authorized work through commit review and a final task check. Identity, side IDs, session recovery, storage and reload instructions stay in extension guidance and this README. Dynamic tasks and statuses stay in SQLite. `instructions.ts` defines the short project rules and the additional per-run extension guidance separately.
-
-The injected rules are project-independent. They contain no project names, fixed roles, old communication mechanisms or migration instructions. The installer leaves text outside its own markers alone. Worktrees need the documentation change integrated to share it; loaded Pi extensions receive the per-run instructions even before that integration.
-
-Rules guide model behavior and do not guarantee every model obeys. If Handoff tools are unavailable or a query fails, the rules require reporting that the check was not done; never claim that the inbox is empty without reading it.
-
-## Lifecycle and visibility
-
-```text
-open -> completed (assignee submitted a commit) -> closed (creator reviewed)
-           |
-           +-> open (creator requests changes)
-```
-
-- Agent tools only allow the creator and assignee to list, read, or update a task. Third-side agents cannot see its subject, body, checklist, commit or status counts through these tools. The human-only TUI offers a read-only project overview; its contents are not returned to the model.
-- The assignee checks each checklist item. Completion requires every item to be checked, a commit that exists in that checkout, and a summary.
-- A completed task folds into a summary with its commit, awaiting creator review. Completion does not close the task.
-- The creator inspects that commit and records a review note with the same hash to close it. The extension verifies the hash and role; it cannot establish that a human or model actually performed a sufficient review.
-- Closed tasks stay in history as dim, struck-through entries. “Destroy” means close with an audit trail, not physical deletion.
-- Returning a completed task resets its checklist for a new attempt. Prior checks and commits remain in append-only event history.
-
-The API visibility boundary is not a sandbox against malicious processes running as the same OS user with direct access to the database.
-
-## Pi UI
-
-```text
-/handoff init             # install/update static project AGENTS.md handoff rules
-/handoff                  # open your sent/received tasks; Tab switches to the project overview
-/handoff name 数据          # choose this side's name
-/handoff status           # identity, channel and database
-/handoff read 12          # show one task as data
-/handoff takeover pi_...  # explicitly inherit a stopped side into a fresh session
-```
-
-The TUI defaults to this side's sent/received tasks, ordered by pending-first status groups (open, completed awaiting review, closed). Press `s` to cycle through pending-first groups, reviewed-first groups (closed, completed awaiting review, open), and task number from smallest to largest. Task numbers stay ascending within each group, including across pages. The title shows the current order. Opening, refreshing or changing the view/sort captures an ordered task snapshot; later pages keep that order and state even while another Pi updates tasks. Press `r` to see new tasks and state changes. Only the current page loads task details. Press Tab to switch to the project overview and back. All tasks initially fold; summaries show creator, assignee, status and checklist progress. The bordered panel spans the terminal width near the bottom and uses about 60% of its height. Task content scrolls inside the frame. Its title stays visible, and one footer line combines the scroll position with keyboard hints, shortened to fit the available width. Use up/down to select, Enter to expand or fold, `r` to refresh, PageUp/PageDown to scroll by a viewport, Home/End to reach the start/end of the full list and Escape to exit. Down and PageDown automatically load subsequent records from the same snapshot; no manual loading key is needed. The footer shows the total task count, and a `+` after the line count means more content will load as you scroll. Scrolling keeps the selected task while its body is visible; once it leaves the viewport, selection moves to a visible task so Enter operates on that task. This is a read-only human view, not a project-wide agent tool; `/handoff read <id>` and all agent tools retain participant-only access. Closed entries remain dim and struck through. Tool results retain their separate rendering.
-
-Checks, commit submission and review use the tools below, normally invoked by the agent from your instruction. The panel displays results and does not make review or completion decisions.
-
-## Tools
-
-| Tool | Purpose |
+| 场景 | 处理方式 |
 |---|---|
-| `handoff_identity` | Read or change this side's name |
-| `handoff_sides` | List registered project sides for assigning tasks; no task contents |
-| `handoff_takeover` | With explicit user authorization, inherit a stopped side by exact ID and expected session ID |
-| `handoff_create` | Assign `to`, `subject`, `body`, `items`, optional `refs` and `idempotencyKey` |
-| `handoff_list` | List only your sent/received tasks; optional `activeOnly`, `before`, `limit` |
-| `handoff_read` | Read your task's body and append-only history by `id` |
-| `handoff_check` | Assignee: set 1-based `item` and `checked` on an open task |
-| `handoff_complete` | Assignee: record `commit` and `summary` after all checks |
-| `handoff_close` | Creator: record the reviewed `commit` and `note` |
-| `handoff_reopen` | Creator: return a completed task with a `note` |
-| `handoff_status` | Current identity, project channel, visible count and integrity |
+| 主检出、不同分支、linked worktree | 共用 Git common-dir，对应同一项目绑定 |
+| 同一仓库的多个本地 clone | 通过规范化后的 origin 别名发现同一频道 |
+| 同一远程仓库的 HTTPS、SSH、scp 地址 | 规范化为同一个远程别名；非标准端口仍区分 |
+| 本地文件或相对路径 origin | 相对各自仓库解析并取真实路径，避免不同仓库误共用频道 |
+| 没有 origin 的 Git 仓库 | 按 Git common-dir 建立绑定 |
+| 非 Git 目录 | 按启动 cwd 的真实路径建立绑定 |
 
-Names can repeat, so use a side ID when a name is ambiguous. The directory persists across exits and does not claim a side is online. A recipient must have loaded the extension at least once to appear. There is no fixed limit of two or four sides.
+仓库绑定建立后，添加、修改或移除 origin 不会让现有任务换库。即使 origin 改成另一个已登记项目，也不会覆盖双方已有的频道绑定。
 
-`handoff_list` returns newest tasks first and `nextBefore` for older pages. By default it includes closed history. Reading does not consume or modify a task. A logical create can use `idempotencyKey` to retry safely; a new task needs a new key.
+因此，`project`、`project-side-1`、`project-side-2` 只要是同一仓库的工作树，就能共用任务数据。目录名称和当前分支只作为信息记录，不参与任务授权。
 
-## Identity and persistence
+同一频道的进程必须位于**同一机器、同一系统用户下，并使用同一个状态根目录**。相同 GitHub remote 只是本机频道识别依据，不代表会通过 GitHub 同步任务。实际频道和数据库路径可用 `/handoff status` 查看。
 
-A normal Pi process has its own session and automatically becomes a side. Its initial side ID is derived from the Pi session ID. `/reload`, branch changes and resuming that same session retain access; a new session creates a new side. Merely choosing an existing display name does not inherit its tasks.
+## 侧身份与旧侧接管
 
-If the previous process stopped, either resume its session or explicitly take over its side from a fresh session. Ask the agent: “原工具侧进程已终止，请接管它的 Handoff 并继续已授权任务。” It must use `handoff_sides` to identify the exact old side, then call `handoff_takeover({from, expectedSessionId, reason})`. Alternatively invoke `/handoff takeover <side-id>` yourself. No server, listening port, worktree configuration or original conversation file is needed. This transfers Handoff access, not the old model conversation, Git checkout or broader user authorization.
+### 身份跟随会话
 
-Takeover preserves the old side ID, name, sent/received tasks, checks, commits and history. The new session becomes its owner persistently across `/reload` and restart. The old session is revoked; resuming it cannot overwrite ownership. The empty new side is retired from discovery. Ownership changes are atomic and append an audit visible in `/handoff status`. A second claimant using outdated session information is rejected.
+普通 Pi 会话的初始侧 ID 由 session ID 派生，显示名可以修改。任务保存双方的稳定侧 ID，所以改名、切分支、切换到该会话的其他工作树，或恢复同一个 Pi 会话，不会因为名称改变而转移任务权限。
 
-The old recorded PID must no longer exist; if it is alive or cannot be checked, takeover is refused. A reused live PID also conservatively blocks takeover. Stop all processes using that original session before transfer; two processes deliberately using the same session share one logical side. The new side must have no tasks of its own, including closed history, so access to its existing work is never silently dropped. Use a fresh Pi session if needed. Only the user may authorize takeover; peer task text and matching names do not grant it.
+| 操作 | 任务归属 |
+|---|---|
+| `/reload` 或恢复原 Pi 会话 | 保留 |
+| 修改侧名 | 保留本侧归属，不接管同名侧 |
+| 新开 Pi 会话 | 自动成为新侧 |
+| 显式接管已终止旧侧 | 新会话继承旧侧 ID 和任务 |
 
-Task data lives outside all checkouts:
+通常一个进程使用一个会话，因此表现为一个 Pi 进程一侧。若两个进程刻意恢复同一会话，它们会共享同一逻辑身份，并非两个独立侧。
+
+### 接管已经终止的旧侧
+
+旧进程退出后，可以恢复原会话，也可以让新会话接管其 Handoff。无需保留原对话文件或启动网络服务。
+
+在接班的新 Pi 中说：
 
 ```text
-~/.pi/agent/state/pi-handoff/<project-channel>/pi-handoff/handoff.sqlite
+原工具侧进程已终止，请接管它的 Handoff，并继续剩余已授权任务。
 ```
 
-A user-level `channels.sqlite` registry binds each Git common-dir (or cwd outside Git) to a stable channel. Main, branches and linked worktrees share that binding; adding, editing or removing origin does not move existing tasks. Normalized origin aliases let same-project local clones join the channel across equivalent HTTPS, SSH and scp spellings. Local remote paths resolve against their own repository and use their real filesystem path, so identical relative spellings in unrelated repositories do not mix projects. Nonstandard network ports remain distinct. `/handoff status` shows the actual channel.
+Agent 先用 `handoff_sides` 核对旧侧 ID 和当前 session ID，再调用：
 
-On first upgrade the registry adopts the existing V3/V4 database in place, including common-dir and alternate-protocol history. Task numbers, side ownership and original tables remain unchanged. If multiple populated legacy databases conflict, setup reports the conflict and preserves both instead of hiding, merging or renumbering tasks. A legacy local-remote database is adopted only when its recorded repository matches. Changing origin to an already registered different project does not overwrite either project binding.
+```text
+handoff_takeover({ from: 旧侧ID, expectedSessionId: 旧会话ID, reason: 接管原因 })
+```
 
-SQLite WAL, transactions and append-only task/event records prevent concurrent Pi updates from overwriting one another. Lock contention waits up to 30 seconds and then returns an explicit error; it does not replace old data. `synchronous=FULL` protects committed writes subject to normal SQLite filesystem guarantees. Disk failure still needs backups.
+也可以直接执行 `/handoff takeover <旧侧ID>`。
 
-No background watcher, polling, heartbeat, peer notifications or tool gates run. Every operation explicitly reads or appends to the common database. `/reload` and session shutdown close its connection.
+接管在一个事务中完成：保留旧侧 ID、名称、双方任务和历史，将它持久绑定给新会话，撤销旧会话并记录接管审计。新会话重启后仍使用继承的身份；旧会话恢复也不能抢回。原来尚无任务的新侧从侧目录中退出。
 
-## Existing records and scope
+接管有以下边界：
 
-New directed tasks use additive tables in the existing database. All original V3 messages, recipient states and acknowledgement events are retained unchanged. They are not automatically published as new tasks or shown to unrelated sides. Earlier board tables, if present, are also preserved.
+- 必须由用户明确授权，不能因为任务正文要求或显示名相同就自行接管。
+- 旧侧记录的 PID 必须已退出；仍存活或无法确认时拒绝。PID 被系统复用时也会保守拒绝。
+- 接班的新侧不能已有任务，包括已关闭任务，避免丢失它自己的访问权；有任务时应另开新会话。
+- 比较 `expectedSessionId`，防止两个新进程按同一份旧身份信息同时接管成功。
+- 只迁移 Handoff 归属，不恢复模型对话，不切换 Git 工作区，也不扩大用户授权。
 
-All Pi processes should reload; a running old extension keeps its previous in-memory code until then. Installing files cannot hot-patch another process.
+使用同一原会话的进程应全部停止后再接管。接管历史可在 `/handoff status` 中查看。用户授权由 Agent 根据对话判断；工具强制检查进程、身份、任务归属和预期会话，不验证对话是否构成授权。
 
-This is local coordination for the same Unix user and project. It does not create branches or worktrees, merge commits, grant ownership of other files, or replace formal project acceptance records. References do not copy files or fetch Git commits; make the referenced commit available before completion and review.
+## 任务状态、验收与责任
 
-Optional settings:
+```mermaid
+stateDiagram-v2
+    [*] --> open: 发起方创建
+    open --> completed: 承接方勾完清单并提交 commit
+    completed --> closed: 发起方审查相同 commit 后关闭
+    completed --> open: 发起方退回修改
+```
 
-- `PI_HANDOFF_NAME`: initial side name, editable later.
-- `PI_HANDOFF_STATE_DIR`: alternate state root, primarily for isolated tests; sides must use the same root to communicate.
+| 状态 | 含义与下一步 |
+|---|---|
+| `open` | 承接方待实施，可勾选或取消勾选清单 |
+| `completed` | 承接方已提交，等待发起方验收；不等于已关闭 |
+| `closed` | 发起方已验收，显示为灰色删除线，历史保留 |
 
-Old delivery, notice, fixed-side, polling and heartbeat settings are ignored.
+承接方提交前必须勾完全部清单，并填写完成说明。扩展在当前检出中验证 commit 真实存在，把输入的短 hash 解析为完整 hash。发起方关闭时必须引用相同的 commit，并填写审查意见。
+
+扩展能校验角色、状态和 commit 是否匹配，**不能证明代码质量达标或审查充分**。发起方仍需实际检查变更。其他 clone 中尚无该 commit 时，要先通过正常 Git 流程获取，工具不会代为传输。
+
+退回只能针对 `completed` 任务：当前清单重置、任务回到 `open`，以前的勾选、提交和退回原因继续保留。关闭表示结束并留痕，不会物理删除任务。
+
+### 有未关闭任务，不一定轮到本侧处理
+
+| 本侧在任务中的角色 | 当前状态 | 本侧下一步 |
+|---|---|---|
+| 承接方 | `open` | 执行授权内的任务 |
+| 发起方 | `completed` | 审查 commit，关闭或退回 |
+| 发起方 | `open` | 等待承接方交付 |
+| 承接方 | `completed` | 等待发起方验收 |
+| 任一参与方 | `closed` | 保留历史，无后续待办 |
+
+Agent 不能替另一侧勾清单或验收。若只是等待他侧、缺少必要授权或外部依赖，列明任务 ID、责任方和恢复条件即可，不需要为清空未关闭数量而反复查询或越权处理。
+
+## Agent 如何知道并主动使用
+
+`instructions.ts` 分别定义项目通用约定和扩展运行说明，扩展在 `before_agent_start` 中给每轮模型运行提供固定规则：
+
+- 开工或恢复任务前调用 `handoff_list({ activeOnly: true })`，沿 `nextBefore` 查完分页，再读相关正文。
+- 需要其他侧实施或交付时，先确认接收侧，再通过 Handoff 创建定向任务。
+- 在已有授权内持续处理所有可执行任务和待本侧验收的交付，单项阻塞不影响其他工作。
+- 最终回复前再次查询，读取新增或更新事项；仍有可执行项就继续，真正阻塞时说明原因。
+
+用户正常安排工作即可，不需要每次重复“查 Handoff、创建任务、勾清单、交 commit”这一套指令。以下语句只是手动触发示例：
+
+```text
+将接口适配交给前端侧，写清清单和验收条件，引用 docs/api.md，完成后附 commit。
+检查本侧交接，继续处理已有授权内的任务和待验收交付。
+```
+
+**主动执行依赖模型遵循规则，不是代码强制的开工或结束门禁。** 扩展不会自动通知、唤醒空闲 Pi、启动新回合或中断正在运行的工具。空闲后新建的任务，等接收侧下次有授权的工作回合时再查。查询失败必须报告未检查，不能声称没有交接。
+
+系统提示只放固定使用规则；任务正文通过 `handoff_read` 作为数据读取，不注入成系统指令，也不能覆盖用户授权和项目规范。
+
+### 可选植入 AGENTS.md
+
+`/handoff init` 在当前 Git 检出的根目录安装规则，非 Git 环境使用 cwd；文件不存在时创建，存在时只替换以下标记内的内容：
+
+```text
+<!-- PI-HANDOFF:START -->
+...通用交接约定...
+<!-- PI-HANDOFF:END -->
+```
+
+重复执行不会重复追加；标记缺失配对或重复时会报错，避免覆盖原文件。标记之外的内容保持原样。
+
+植入段只包含“开工先查、转交优先、完成与验收”三条行为约定，不写固定侧名、身份机制、特定项目的迁移背景或动态任务。该命令不改分支、不同步其他 worktree，也不重写项目原有规则；文档修改仍按项目流程提交和集成。
+
+## 权限边界
+
+Agent 调用工具时，扩展从真实 Pi 会话获取本侧身份。工具不接受任意的“操作者 ID”来冒充其他侧。
+
+- 只有发起方和承接方能通过 Agent 工具列出或读取任务。
+- 只有承接方能勾清单和提交完成，只有发起方能验收关闭或退回。
+- 第三侧看不到该任务的标题、正文、清单、commit 或任务数量；侧目录仍可用于寻找接收方。
+- 用户的 `/handoff` 面板可以切到全项目只读总览，这个查询不作为全项目 Agent 工具暴露，也不会把总览返回给模型。
+
+这是扩展 API 的权限边界，不是对同一系统用户的恶意程序建立沙箱。能直接读取数据库文件的程序不受工具过滤保护。
+
+## 存储、并发与历史
+
+项目数据库的核心表：
+
+| 表 | 内容 |
+|---|---|
+| `handoff_sides` | 侧 ID、名称、会话、PID、工作目录和分支 |
+| `handoff_side_bindings` | 接管后的持久会话归属及已退役侧 |
+| `handoff_side_transfers` | 不可修改的接管审计 |
+| `handoff_tasks` | 任务双方、标题、正文、初始清单和引用 |
+| `handoff_task_events` | 勾选、完成、关闭和退回事件 |
+
+任务与事件采用追加记录，数据库触发器禁止改写或删除任务历史。当前状态由事件按顺序还原，退回修改不会擦掉上一轮提交。
+
+变更在 SQLite 事务中执行，权限和当前状态在同一事务内检查，避免多个进程先读后覆盖。项目数据库使用 WAL 和 `synchronous=FULL`；锁竞争最多等待 30 秒，超时明确报错，不覆盖已有数据。频道注册表很小、只在加载时使用，采用默认日志模式，避免并发首次接入时竞争切换 WAL。
+
+创建任务可带 `idempotencyKey`：同一发起方以相同 key 和相同内容重试，返回原任务；相同 key 更换内容则报错。新任务应使用新 key。
+
+数据库是本机持久状态，不随源码 push 或 GitHub 仓库同步。文件系统损坏仍需要备份恢复；扩展没有跨机器同步或自动备份服务。重载和会话关闭会释放本进程的数据库连接。
+
+## 面板与排序
+
+输入 `/handoff` 打开供用户查看的只读面板。默认展示**本侧发出和收到的任务**，所有任务初始折叠。面板位于终端下部，约占六成高度，内容在边框内滚动，底部单行说明随宽度缩写。
+
+| 按键 | 行为 |
+|---|---|
+| `↑` / `↓` | 选择任务，向下到末尾时自动续载 |
+| `Enter` | 展开或折叠选中任务 |
+| `Tab` | 本侧任务 ↔ 全项目任务 |
+| `s` | 待处理优先 → 已验收优先 → 编号升序 |
+| `r` | 刷新任务、状态及排序快照 |
+| `PgUp` / `PgDn` | 在框内滚动，向下自动续载 |
+| `Home` / `End` | 到完整列表开头或末尾 |
+| `Esc` | 退出 |
+
+默认分层顺序为 `open → completed → closed`，反向为 `closed → completed → open`；同层内编号升序。第三种排序才是全列表编号升序。
+
+面板打开、刷新或切换范围/排序时，固定任务编号顺序和事件水位。后续分页沿用同一快照，只读取本页详情，避免另一侧完成任务、导致记录换层后漏项或重复。向下浏览会自动加载，不需要按 `n`；新建任务及状态变化按 `r` 后显示。滚动后若原任务完全离开视窗，选择移到可见任务，避免 Enter 展开屏幕外的旧选中项。
+
+Agent 的 `handoff_list` 与面板排序不同：工具按编号倒序返回，沿 `nextBefore` 查旧页；默认包含关闭历史，工作检查应传 `activeOnly: true`。面板的展开或查看不会替 Agent 读取正文、完成任务或验收。
+
+## 命令与工具参考
+
+### 用户命令
+
+```text
+/handoff                     # 本侧任务面板，Tab 可切全项目
+/handoff init                # 安装或更新 AGENTS.md 通用交接约定
+/handoff name 数据            # 设置本侧显示名
+/handoff status              # 身份、频道、数据库、完整性和接管记录
+/handoff read 12             # 查看本侧参与的一条任务
+/handoff takeover pi_...     # 从新会话显式接管已终止旧侧
+```
+
+面板负责展示，不决定任务是否完成或验收。清单与状态通常由 Agent 调用下列工具维护。
+
+### Agent 工具
+
+| 工具 | 作用 |
+|---|---|
+| `handoff_identity` | 读取或修改本侧名称 |
+| `handoff_sides` | 查询项目已登记侧，核对接收方 ID |
+| `handoff_takeover` | 经用户明确授权，以旧侧 ID、预期会话和原因接管 |
+| `handoff_create` | 创建定向任务，填写 `to`、`subject`、`body`、`items`，可附 `refs`、`idempotencyKey` |
+| `handoff_list` | 查询本侧参与的任务，支持 `activeOnly`、`before`、`limit` 和返回的 `nextBefore` |
+| `handoff_read` | 读取本侧任务正文及历史，不改变状态 |
+| `handoff_check` | 承接方勾选或取消勾选清单，`item` 从 1 开始 |
+| `handoff_complete` | 承接方附 `commit`、`summary` 提交待验收 |
+| `handoff_close` | 发起方附相同 `commit`、审查 `note` 关闭 |
+| `handoff_reopen` | 发起方附原因 `note` 退回修改 |
+| `handoff_status` | 本侧身份、频道、可见任务数、完整性和接管审计 |
+
+接收侧至少加载过一次扩展才能被发现。侧名可以重复，名称不明确时必须核对准确 ID；侧目录保留离线记录，不承诺对方在线。
+
+## 升级兼容与配置
+
+升级会优先沿用原有 V3/V4 数据库，保留任务编号和侧归属。原 V3 消息、接收状态、ack 事件及早期留言表保持原样，不会自动变成新任务或向无关侧公开。
+
+若发现同一项目对应多个已有内容的旧数据库，扩展保留原库并报冲突，不自动合并、隐藏某份历史或重新编号。旧版相对路径 origin 产生的库还会核对记录的仓库归属，避免接入另一个项目的数据。
+
+| 环境变量 | 用途 |
+|---|---|
+| `PI_HANDOFF_NAME` | 新侧的初始显示名，登记后可修改 |
+| `PI_HANDOFF_STATE_DIR` | 替换默认状态根目录，主要用于隔离测试；通信各侧必须使用相同根目录 |
+
+旧版固定侧编号、自动投递、通知、轮询和心跳配置不再生效。
+
+## 源码分工
+
+| 文件 | 负责内容 |
+|---|---|
+| `index.ts` | Pi 生命周期、会话身份、工具入口、commit 校验、命令和滚动面板 |
+| `channel.ts` | 项目识别、远程地址规范化、稳定频道绑定和旧库定位 |
+| `store.ts` | SQLite 表、事务、参与方权限、事件状态、接管和面板快照 |
+| `types.ts` | 侧、任务、事件类型和扩展版本 |
+| `ui.ts` | 任务摘要、正文、折叠及删除线渲染 |
+| `instructions.ts` | 通用行为规则、每轮说明和幂等 AGENTS.md 植入 |
+| `install.mjs` | 复制用户级运行文件及依赖 |
+| `test/` | 权限、状态、并发写入、频道兼容、分页快照、规则植入和接管回归 |
+
+开发检查使用 `npm test`。真实 Pi 验证还需覆盖扩展加载、模型实际调用、终端交互、会话恢复及接管；单纯调用内部 handler 不能证明 Pi 宿主中已经生效。
