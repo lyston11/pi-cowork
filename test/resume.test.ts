@@ -141,8 +141,10 @@ test("idle dispatch batches events without task text; busy/UI/editor states defe
     assert.deepEqual(d.sent[0].options, { triggerTurn: true, deliverAs: "followUp" });
     d.resume.tick(); assert.equal(d.sent.length, 1);
     const delivered = d.sent[0];
-    // Simulate a crash after the custom message persisted, before our observer
-    // acknowledged it. A new extension instance recovers from the transcript.
+    // Simulate a crash after the custom message persisted and both tasks were
+    // completed, before our observer acknowledged the cursor. Recovery must not
+    // replay delivered work that is now waiting for the creator.
+    f.complete(1); f.complete(2);
     d.resume.stop();
     const restored = dispatcher(f, [{ type: "custom_message", customType: delivered.customType, details: delivered.details }]);
     try {
@@ -188,6 +190,94 @@ test("abort and model failure persistently pause event runs without discarding p
     f.store.setResumeEnabled(f.b.id, true);
     d.resume.tick(); assert.equal(d.sent.length, 2);
   } finally { d.resume.stop(); f.cleanup(); }
+});
+
+test("checkpoints persist once per task revision and only target this side's work", () => {
+  const f = fixture();
+  try {
+    const task = f.create();
+    assert(f.store.acquireResume(f.b.id, f.b.sessionId, "b"));
+    let batch = f.store.pendingResume(f.b.id, "b")!;
+    f.store.acknowledgeResume(f.b.id, "b", batch.throughSeq);
+    assert.deepEqual(f.store.reconcileResume(f.b.id, "b"), { queued: [task.id], stalled: [] });
+    batch = f.store.pendingResume(f.b.id, "b")!;
+    assert.deepEqual(batch.events.map(e => [e.taskId, e.kind]), [[task.id, "checkpoint"]]);
+    f.store.acknowledgeResume(f.b.id, "b", batch.throughSeq);
+    f.peer.check(task.id, f.b.id, 1, false); // A no-op is not a new revision.
+    assert.deepEqual(f.peer.reconcileResume(f.b.id, "b"), { queued: [], stalled: [task.id] });
+    f.peer.check(task.id, f.b.id, 1, true);
+    assert.deepEqual(f.store.reconcileResume(f.b.id, "b"), { queued: [task.id], stalled: [] });
+    f.complete(task.id);
+    assert.deepEqual(f.store.pendingResume(f.b.id, "b")!.events, [], "completed work supersedes its checkpoint");
+    assert.deepEqual(f.store.reconcileResume(f.b.id, "b"), { queued: [], stalled: [] });
+    assert(f.store.acquireResume(f.a.id, f.a.sessionId, "a"));
+    assert.deepEqual(f.store.reconcileResume(f.a.id, "a"), { queued: [task.id], stalled: [] }, "creator still needs to review");
+    assert(f.store.acquireResume(f.c.id, f.c.sessionId, "c"));
+    assert.deepEqual(f.store.reconcileResume(f.c.id, "c"), { queued: [], stalled: [] });
+    f.store.setResumeEnabled(f.a.id, false);
+    assert.deepEqual(f.store.reconcileResume(f.a.id, "a"), { queued: [], stalled: [] }, "pause blocks reconciliation");
+    assert.deepEqual(f.store.reconcileResume(f.b.id, "wrong-consumer"), { queued: [], stalled: [] });
+  } finally { f.cleanup(); }
+});
+
+test("checkpoints leave recorded blockers alone and recheck changed dependencies", () => {
+  const f = fixture();
+  try {
+    const task = f.create();
+    const dependency = f.create(f.b.id, f.a.id);
+    assert(f.store.acquireResume(f.b.id, f.b.sessionId, "b"));
+    f.store.block(task.id, f.b.id, "Need the real input", "a", [dependency.id]);
+    assert.deepEqual(f.store.reconcileResume(f.b.id, "b"), { queued: [], stalled: [] });
+    f.complete(dependency.id, f.a.id);
+    assert(f.store.reconcileResume(f.b.id, "b").queued.includes(task.id));
+    f.store.block(task.id, f.b.id, "Delivered input still lacks approval", "user", []);
+    assert(!f.store.pendingResume(f.b.id, "b")!.events.some(e => e.taskId === task.id));
+    assert(!f.store.reconcileResume(f.b.id, "b").stalled.includes(task.id));
+  } finally { f.cleanup(); }
+});
+
+test("startup and settled checkpoints resume once, warn without looping, and survive reload", () => {
+  const f = fixture();
+  const task = f.create();
+  assert(f.store.acquireResume(f.b.id, f.b.sessionId, "previous"));
+  f.store.acknowledgeResume(f.b.id, "previous", f.store.pendingResume(f.b.id, "previous")!.throughSeq);
+  f.store.releaseResume(f.b.id, "previous");
+  const entries: unknown[] = [];
+  const d = dispatcher(f, entries);
+  try {
+    d.resume.tick();
+    assert.equal(d.sent.length, 1, "reload discovers unclosed work even when old events were consumed");
+    assert.match(d.sent[0].content, /#1 checkpoint/);
+    d.persist(d.sent[0]); d.resume.tick();
+    d.resume.runStarted(); d.resume.settled(false);
+    assert.equal(d.sent.length, 1, "the unchanged task cannot loop");
+    assert.match(d.notices.at(-1)!, /仍未收口.*#1/);
+    d.resume.stop();
+    const restored = dispatcher(f, entries);
+    try {
+      restored.resume.tick(); assert.equal(restored.sent.length, 0, "checkpoint deduplication is durable");
+      f.peer.check(task.id, f.b.id, 1, true);
+      restored.resume.runStarted(); restored.resume.settled(false);
+      assert.equal(restored.sent.length, 1, "real progress permits a new completion checkpoint");
+      restored.persist(restored.sent[0]); restored.resume.tick();
+      f.peer.block(task.id, f.b.id, "Need explicit approval", "user", []);
+      restored.resume.runStarted(); restored.resume.settled(false);
+      assert.equal(restored.sent.length, 1, "a genuine recorded blocker stops cleanly");
+    } finally { restored.resume.stop(); }
+  } finally { d.resume.stop(); f.cleanup(); }
+});
+
+test("settled checks all active pages and never retries sent work", () => {
+  const f = fixture();
+  try {
+    for (let i = 0; i < 102; i++) f.create();
+    f.create(f.b.id, f.a.id); // This side waits for the assignee.
+    assert(f.store.acquireResume(f.b.id, f.b.sessionId, "b"));
+    const result = f.store.reconcileResume(f.b.id, "b");
+    assert.equal(result.queued.length, 102);
+    assert.equal(new Set(result.queued).size, 102);
+    assert.deepEqual(result.stalled, []);
+  } finally { f.cleanup(); }
 });
 
 test("storage failure stops the scheduler locally without repeated timer errors", () => {

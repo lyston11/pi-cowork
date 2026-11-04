@@ -8,12 +8,12 @@ const plain = (value: string) => value.replace(/[\x00-\x1f\x7f]/g, " ");
 export function taskLines(task: HandoffTask | TaskSummary, expanded: boolean, theme: Theme, width: number): string[] {
   const checked = task.items.filter((item) => item.checked).length;
   const status = task.state === "open"
-    ? task.block ? task.block.needsReview ? "[!] 依赖更新待复核" : "[⏸] 被阻塞" : "[ ] 待执行"
+    ? task.block ? task.block.needsReview ? "[!] 依赖更新待复核" : "[⏸] 被阻塞" : "[ ] 待核对/处理"
     : task.state === "completed" ? "[✓] 待发起方验收" : "[✓] 已验收关闭";
   const fold = expanded ? "▾" : "▸";
   const responsible = task.state === "completed" ? `${plain(task.creator.name)}验收`
     : task.block && !task.block.needsReview ? `${plain(task.block.waitingFor)}提供条件`
-    : `${plain(task.assignee.name)}${task.block ? "复核依赖" : "执行"}`;
+    : `${plain(task.assignee.name)}${task.block ? "复核依赖" : "核对并处理"}`;
   const heading = `${fold} #${task.id} ${status} ${plain(task.creator.name)} → ${plain(task.assignee.name)} · ${plain(task.subject)} · ${checked}/${task.items.length}${task.state === "closed" ? "" : ` · 下一步：${responsible}`}`;
   const lines = [heading];
   if (task.block) {

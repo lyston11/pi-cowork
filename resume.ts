@@ -5,8 +5,8 @@ import type { Side } from "./types.ts";
 
 const messageType = "pi-handoff-resume";
 
-// One consumer per side. Polling only transports durable events; it never calls a
-// model unless a peer changed a task relevant to this side.
+// One consumer per side. Peer events and bounded task checkpoints are durable;
+// unchanged unfinished work cannot schedule an endless model loop.
 export class EventResume {
   private readonly consumer = randomUUID();
   private timer: ReturnType<typeof setInterval> | undefined;
@@ -16,6 +16,7 @@ export class EventResume {
   private waitingForUi = 0;
   private failure: string | undefined;
   private stopped = false;
+  private reconcile = true;
 
   private readonly pi: ExtensionAPI;
   private readonly store: HandoffStore;
@@ -71,6 +72,7 @@ export class EventResume {
       this.pause(aborted ? "用户中止了运行" : `模型运行失败：${this.failure}`);
       return;
     }
+    this.reconcile = true;
     this.tick();
   }
 
@@ -116,16 +118,26 @@ export class EventResume {
       }
       if (!this.ctx.isIdle() || this.ctx.hasPendingMessages() || this.waitingForUi > 0) return;
       if (this.ctx.mode === "tui" && this.ctx.ui.getEditorText().trim()) return;
-      const batch = this.store.pendingResume(this.self.id, this.consumer);
+      let batch = this.store.pendingResume(this.self.id, this.consumer);
+      if (!batch && this.reconcile) {
+        this.reconcile = false;
+        const remaining = this.store.reconcileResume(this.self.id, this.consumer);
+        if (remaining.stalled.length) {
+          const ids = remaining.stalled.map((id) => `#${id}`).join("、");
+          this.ctx.ui.notify(`Handoff 仍未收口：${ids}。本轮未完成、未登记阻塞或待复核；同一版本已自动核对过，不再重复唤起。请核对任务和授权后继续，或明确登记阻塞。`, "warning");
+        }
+        batch = this.store.pendingResume(this.self.id, this.consumer);
+      }
       if (!batch) return;
       if (!batch.events.length) {
         this.store.acknowledgeResume(this.self.id, this.consumer, batch.throughSeq);
         return;
       }
+      this.reconcile = false;
       this.pending = { throughSeq: batch.throughSeq, at: Date.now() };
       this.pi.sendMessage({
         customType: messageType,
-        content: `Handoff 有新的本侧事件：${batch.events.map((event) => `#${event.taskId} ${event.kind}`).join("、")}。\n这是扩展的续跑信号，不是新的用户授权。先用 handoff_list(activeOnly=true) 读完分页，并用 handoff_read 核对更新和依赖；在用户已有授权内继续可执行事项和待验收交付。重新核对之前的阻塞，不能沿用过期结论。block.needsReview=true 时先验证依赖及授权，再用 handoff_unblock 解除或 handoff_block 更新阻塞，不能自动当作已具备条件。若仍阻塞、需要人工批准或不在授权范围，具体说明并结束，等待新的事件；不要轮询模型或自行发消息制造续跑。`,
+        content: `Handoff 本侧需要核对：${batch.events.map((event) => `#${event.taskId} ${event.kind}`).join("、")}。\n这是扩展的续跑信号，不是新的用户授权。checkpoint 表示启动或收尾时发现尚未收口的本侧事项：必须重新读取，即使 state、commit、items 没有变化；未登记阻塞不代表可执行条件已经满足。先用 handoff_list(activeOnly=true) 读完分页，并用 handoff_read 核对更新和依赖；在用户已有授权内继续可执行事项和待验收交付。重新核对之前的阻塞，不能沿用过期结论。block.needsReview=true 时先验证依赖及授权，再用 handoff_unblock 解除或 handoff_block 更新阻塞，不能自动当作已具备条件。若仍阻塞、需要人工批准或不在授权范围，对本侧承接的 open 任务用 handoff_block 记录原因、等待对象和恢复条件，不能只在回复中声称阻塞；待本侧验收却缺批准时明确说明。然后结束等待新的事件；不要轮询模型或自行发消息制造续跑。`,
         display: true,
         details: { sideId: this.self.id, dbPath: this.store.dbPath, consumer: this.consumer, throughSeq: batch.throughSeq },
       }, { triggerTurn: true, deliverAs: "followUp" });

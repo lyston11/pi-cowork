@@ -32,7 +32,7 @@ export interface HumanTaskSnapshot {
 export interface ResumeEvent {
   seq: number;
   taskId: number;
-  kind: "created" | "complete" | "reopen" | "close" | "dependency";
+  kind: "created" | "complete" | "reopen" | "close" | "dependency" | "checkpoint";
 }
 
 export interface ResumeBatch {
@@ -189,6 +189,32 @@ export class HandoffStore {
     });
   }
 
+  reconcileResume(actor: string, consumer: string): { queued: number[]; stalled: number[] } {
+    return this.transaction(() => {
+      const queued: number[] = [], stalled: number[] = [];
+      if (!this.db.prepare("SELECT 1 FROM handoff_resume_state WHERE side_id=? AND consumer=? AND enabled=1").get(actor, consumer)) return { queued, stalled };
+      let before: number | undefined;
+      do {
+        const page = this.list(actor, { activeOnly: true, limit: 100, before });
+        for (const task of page.tasks) {
+          const needsWork = task.assignee.id === actor && task.state === "open" && (!task.block || task.block.needsReview)
+            || task.creator.id === actor && task.state === "completed";
+          if (!needsWork) continue;
+          const ids = [task.id, ...(task.block?.dependencies ?? [])];
+          const version = Number(this.db.prepare(
+            "SELECT COALESCE(MAX(seq),0) AS seq FROM handoff_task_events WHERE task_id IN (" + ids.map(() => "?").join(",") + ")",
+          ).get(...ids)!.seq);
+          const source = "checkpoint:" + actor + ":" + task.id + ":" + version;
+          const added = this.db.prepare("INSERT OR IGNORE INTO handoff_resume_events(recipient,task_id,kind,source) VALUES(?,?,'checkpoint',?)")
+            .run(actor, task.id, source).changes;
+          (added ? queued : stalled).push(task.id);
+        }
+        before = page.nextBefore ?? undefined;
+      } while (before !== undefined);
+      return { queued, stalled };
+    });
+  }
+
   pendingResume(actor: string, consumer: string): ResumeBatch | null {
     const state = this.db.prepare("SELECT ack_seq FROM handoff_resume_state WHERE side_id=? AND consumer=? AND enabled=1").get(actor, consumer);
     if (!state) return null;
@@ -219,6 +245,11 @@ export class HandoffStore {
           WHERE d.task_id=? AND ? LIKE 'dependency:%:'||d.block_seq
             AND d.block_seq=(SELECT seq FROM handoff_task_events WHERE task_id=d.task_id
               AND kind IN ('block','unblock','complete','close','reopen') ORDER BY seq DESC LIMIT 1)`).get(row.task_id, row.source);
+      }
+      if (kind === "checkpoint") {
+        const task = this.read(Number(row.task_id), actor);
+        relevant = task.assignee.id === actor && task.state === "open" && (!task.block || task.block.needsReview)
+          || task.creator.id === actor && task.state === "completed";
       }
       if (relevant && (kind === "created" || kind === "reopen")) {
         const task = this.read(Number(row.task_id), actor);
