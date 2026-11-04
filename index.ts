@@ -293,7 +293,8 @@ export default function piHandoff(pi: ExtensionAPI): void {
           }
           selectedLine = ranges[selected]?.start ?? 0;
         };
-        const expanded = new Map<number, boolean>();
+        let detailTask: HandoffTask | undefined;
+        let detailScroll = 0;
         let projectView = false;
         const sorts = ["pending", "reviewed", "id"] as const;
         const sortLabels = ["待处理优先", "已验收优先", "编号升序"];
@@ -307,7 +308,7 @@ export default function piHandoff(pi: ExtensionAPI): void {
           if (more && ranges.length) {
             let start = ranges.at(-1)!.end;
             for (const task of page.tasks) {
-              const end = start + taskLines(task, expanded.get(task.id) ?? false, theme, entryWidth).length;
+              const end = start + taskLines(task, false, theme, entryWidth).length;
               ranges.push({ start, end }); start = end;
             }
           }
@@ -318,7 +319,7 @@ export default function piHandoff(pi: ExtensionAPI): void {
         return {
           render(width: number): string[] {
             const frameHeight = Math.max(1, Math.min(tui.terminal.rows - 2, Math.floor(tui.terminal.rows * 0.6)));
-            if (width < 12 || frameHeight < 7) return [truncateToWidth("窗口过小，请放大终端；Esc 退出", width)];
+            if (width < 12 || frameHeight < 7) return [truncateToWidth(detailTask ? "窗口过小，请放大终端；Enter/Esc 返回" : "窗口过小，请放大终端；Esc 退出", width)];
             const innerWidth = width - 4;
             entryWidth = Math.max(1, innerWidth - 2);
             viewportHeight = frameHeight - 6;
@@ -327,35 +328,49 @@ export default function piHandoff(pi: ExtensionAPI): void {
               return theme.fg("border", "│ ") + content + " ".repeat(innerWidth - visibleWidth(content)) + theme.fg("border", " │");
             };
             const rule = (left: string, right: string) => theme.fg("border", left + "─".repeat(width - 2) + right);
-            let lineCount = 0;
-            const entries = tasks.map((task) => {
-              const lines = taskLines(task, expanded.get(task.id) ?? false, theme, entryWidth);
-              const start = lineCount;
-              lineCount += lines.length;
-              return { lines, start, end: lineCount };
-            });
-            selectedLine = entries[selected]?.start ?? 0;
-            if (followSelection) {
-              if (selectedLine < scroll) scroll = selectedLine;
-              if (selectedLine >= scroll + viewportHeight) scroll = selectedLine - viewportHeight + 1;
-              followSelection = false;
+            let lines: string[];
+            if (detailTask) {
+              lines = taskLines(detailTask, true, theme, innerWidth);
+              detailScroll = Math.min(detailScroll, Math.max(0, lines.length - viewportHeight));
+            } else {
+              let lineCount = 0;
+              const entries = tasks.map((task) => {
+                const lines = taskLines(task, false, theme, entryWidth);
+                const start = lineCount;
+                lineCount += lines.length;
+                return { lines, start, end: lineCount };
+              });
+              selectedLine = entries[selected]?.start ?? 0;
+              if (followSelection) {
+                if (selectedLine < scroll) scroll = selectedLine;
+                if (selectedLine >= scroll + viewportHeight) scroll = selectedLine - viewportHeight + 1;
+                followSelection = false;
+              }
+              ranges = entries;
+              selectVisible();
+              lines = entries.flatMap((entry, index) => entry.lines.map((line, n) =>
+                `${index === selected && (n === 0 || entry.start + n === scroll) ? "> " : "  "}${line}`));
+              if (!lines.length) lines.push(projectView ? "本项目暂无交接任务" : "暂无与你相关的任务");
             }
-            ranges = entries;
-            selectVisible();
-            const lines = entries.flatMap((entry, index) => entry.lines.map((line, n) =>
-              `${index === selected && (n === 0 || entry.start + n === scroll) ? "> " : "  "}${line}`));
-            if (!lines.length) lines.push(projectView ? "本项目暂无交接任务" : "暂无与你相关的任务");
-            const visible = lines.slice(scroll, scroll + viewportHeight);
-            const position = `行 ${scroll + 1}–${scroll + visible.length}/${lines.length}${nextAfter !== null ? "+" : ""} · ${snapshot?.ids.length ?? tasks.length}项`;
-            const footer = [
-              "Esc退出 s排序 ↑↓选任务 Enter展开/折叠 Tab本侧/全项目 PgUp/PgDn滚动 Home/End首尾 r刷新",
-              "Esc退出 s排序 ↑↓选择 Enter折叠 Tab切换 PgUp/PgDn滚动",
+            const offset = detailTask ? detailScroll : scroll;
+            const visible = lines.slice(offset, offset + viewportHeight);
+            const position = `行 ${offset + 1}–${offset + visible.length}/${lines.length}${!detailTask && nextAfter !== null ? "+" : ""}${detailTask ? "" : ` · ${snapshot?.ids.length ?? tasks.length}项`}`;
+            const keys = detailTask ? [
+              "Enter/Esc返回 ↑↓滚动 PgUp/PgDn翻页 Home/End首尾",
+              "Enter/Esc返回 ↑↓滚动",
+              "Enter/Esc返回",
+            ] : [
+              "Esc退出 s排序 ↑↓选任务 Enter详情 Tab本侧/全项目 PgUp/PgDn滚动 Home/End首尾 r刷新",
+              "Esc退出 s排序 ↑↓选择 Enter详情 Tab切换 PgUp/PgDn滚动",
               "Esc退出 s排序 ↑↓ Enter Tab PgUp/PgDn",
-              "Esc退出 s排序 Enter展开",
-            ].map((keys) => `${position} │ ${keys}`).find((text) => visibleWidth(text) <= innerWidth) ?? "Esc退出";
+              "Esc退出 s排序 Enter详情",
+            ];
+            const footer = keys.map((keys) => `${position} │ ${keys}`).find((text) => visibleWidth(text) <= innerWidth) ?? (detailTask ? "Esc返回" : "Esc退出");
+            const title = detailTask ? `任务详情 · #${detailTask.id} · ${detailTask.subject}`
+              : `交接任务 · ${projectView ? "全项目" : "本侧"} · ${sortLabels[sortIndex]} · ${self.name}`;
             return [
               rule("╭", "╮"),
-              row(theme.fg("accent", `交接任务 · ${projectView ? "全项目" : "本侧"} · ${sortLabels[sortIndex]} · ${self.name.replace(/[\x00-\x1f\x7f]/g, " ")}`)),
+              row(theme.fg("accent", title.replace(/[\x00-\x1f\x7f]/g, " "))),
               rule("├", "┤"),
               ...Array.from({ length: viewportHeight }, (_, index) => row(visible[index] ?? "")),
               rule("├", "┤"),
@@ -364,17 +379,27 @@ export default function piHandoff(pi: ExtensionAPI): void {
             ];
           },
           handleInput(data: string): void {
+            if (detailTask) {
+              if (matchesKey(data, Key.enter) || matchesKey(data, Key.escape)) { detailTask = undefined; detailScroll = 0; followSelection = true; }
+              else if (matchesKey(data, Key.up)) detailScroll = Math.max(0, detailScroll - 1);
+              else if (matchesKey(data, Key.down)) detailScroll++;
+              else if (matchesKey(data, Key.pageUp)) detailScroll = Math.max(0, detailScroll - viewportHeight);
+              else if (matchesKey(data, Key.pageDown)) detailScroll += viewportHeight;
+              else if (matchesKey(data, Key.home)) detailScroll = 0;
+              else if (matchesKey(data, Key.end)) detailScroll = Number.MAX_SAFE_INTEGER;
+              else return;
+              tui.requestRender();
+              return;
+            }
             if (matchesKey(data, Key.escape)) { done(); return; }
-            if (matchesKey(data, Key.tab)) { projectView = !projectView; expanded.clear(); load(); }
+            if (matchesKey(data, Key.tab)) { projectView = !projectView; load(); }
             else if (matchesKey(data, Key.up)) { selected = Math.max(0, selected - 1); followSelection = true; }
             else if (matchesKey(data, Key.down)) {
               if (nextAfter !== null && selected + 1 >= tasks.length) load(true);
               selected = Math.min(Math.max(0, tasks.length - 1), selected + 1); followSelection = true;
             }
             else if (matchesKey(data, Key.enter) && tasks[selected]) {
-              const task = tasks[selected]; expanded.set(task.id, !(expanded.get(task.id) ?? false));
-              if (expanded.get(task.id)) scroll = selectedLine;
-              followSelection = true;
+              detailTask = tasks[selected]; detailScroll = 0;
             } else if (data === "s") { sortIndex = (sortIndex + 1) % sorts.length; load(); }
             else if (data === "r") load();
             else if (matchesKey(data, Key.pageDown)) {

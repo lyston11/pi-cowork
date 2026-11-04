@@ -51,7 +51,8 @@ test("tool boundary binds identity to session, never accepts an actor from argum
         assert.equal(options.overlayOptions.width, "100%");
         assert.equal(options.overlayOptions.anchor, "bottom-center");
         const terminal = { rows: 24 };
-        const panel = factory({ terminal, requestRender() {} }, uiTheme, {}, () => {});
+        let exited = false;
+        const panel = factory({ terminal, requestRender() {} }, uiTheme, {}, () => { exited = true; });
         const render = () => panel.render(200).join("\n");
         assert.match(render(), /本侧/);
         assert.match(render(), /暂无与你相关的任务/);
@@ -61,7 +62,14 @@ test("tool boundary binds identity to session, never accepts an actor from argum
         assert.match(render(), /▸/);
         assert.doesNotMatch(render(), /PRIVATE-TEXT/);
         panel.handleInput("\r");
+        assert.match(render(), /任务详情 · #1/);
         assert.match(render(), /PRIVATE-TEXT/);
+        assert.doesNotMatch(render(), /s排序|Tab本侧/);
+        panel.handleInput("\t");
+        assert.match(render(), /PRIVATE-TEXT/, "scope switching is inactive inside task details");
+        panel.handleInput("\r");
+        assert.match(render(), /全项目/);
+        assert.doesNotMatch(render(), /PRIVATE-TEXT/);
         panel.handleInput("\t");
         assert.match(render(), /本侧/);
         assert.doesNotMatch(render(), /secret|PRIVATE-TEXT/);
@@ -90,11 +98,17 @@ test("tool boundary binds identity to session, never accepts an actor from argum
         const selectedAfterPage = Number(paged.match(/> ▸ #([0-9]+)/)?.[1]);
         assert(selectedAfterPage > 1, "page down should select a visible task");
         panel.handleInput("\r");
-        assert(render().includes(`> ▾ #${selectedAfterPage} `));
+        const detail = render();
+        assert(detail.includes(`任务详情 · #${selectedAfterPage} `));
+        assert.deepEqual([...new Set([...detail.matchAll(/#([0-9]+)/g)].map(match => Number(match[1])))], [selectedAfterPage], "the whole viewport belongs to the selected task");
+        panel.handleInput("\x1b[B");
+        assert.notEqual(render(), detail, "down scrolls task details by one line");
+        panel.handleInput("\x1b[A");
+        assert.equal(render(), detail, "up returns to the same detail position");
         panel.handleInput("\x1b[6~");
-        assert.match(render(), /> .*DETAIL-/);
+        assert.match(render(), /DETAIL-/);
         panel.handleInput("\r");
-        assert(render().includes(`> ▸ #${selectedAfterPage} `), "body scrolling retains the same task");
+        assert(render().includes(`> ▸ #${selectedAfterPage} `), "return retains the same selected task");
         for (const key of ["\x1b[5~", "\x1b[F", "\x1b[H"]) {
           panel.handleInput(key);
           assert.match(render(), /> ▸ #[0-9]+/, "scrolling keeps a visible selection");
@@ -104,6 +118,7 @@ test("tool boundary binds identity to session, never accepts an actor from argum
         panel.handleInput("\x1b[6~");
         panel.handleInput("\r");
         assert.doesNotMatch(render(), /PRIVATE-TEXT/, "rapid PageDown then Enter must not open hidden task one");
+        panel.handleInput("\r");
         panel.handleInput("r");
         render();
         for (let i = 0; i < 32; i++) { panel.handleInput("\x1b[B"); render(); }
@@ -126,14 +141,21 @@ test("tool boundary binds identity to session, never accepts an actor from argum
         assert.match(render(), /DETAIL-39/);
         assert.match(render(), /最后一项/);
         panel.handleInput("\x1b[H");
-        assert.match(render(), /secret/);
+        assert.match(render(), /任务详情 · #33/);
+        assert.match(render(), /DETAIL-0/);
         terminal.rows = 12;
         const small = panel.render(50);
         assert.equal(small.length, 7);
         assert(small.every((line: string) => visibleWidth(line) === 50));
         assert.match(small.at(-1), /╰─+╯/);
-        assert.match(small.at(-2), /Esc退出/);
+        assert.match(small.at(-2), /Enter\/Esc返回/);
         assert.match(small.at(-3), /├─+┤/);
+        panel.handleInput("\x1b");
+        assert.equal(exited, false, "Esc returns from details instead of closing the panel");
+        assert.match(render(), /交接任务/);
+        assert.match(render(), /> ▸ #33 /);
+        panel.handleInput("\x1b[H");
+        assert.match(render(), /secret/);
         const commit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" }).trim();
         for (const taskId of [2, 3]) {
           await execute("two", "handoff_check", { id: taskId, item: 1, checked: true });
@@ -154,6 +176,12 @@ test("tool boundary binds identity to session, never accepts an actor from argum
         assert.deepEqual(visibleIds().slice(0, 3), [1, 2, 3]);
         panel.handleInput("s");
         assert.match(render(), /待处理优先/);
+        panel.handleInput("\r");
+        render();
+        panel.handleInput("\x1b");
+        assert.equal(exited, false);
+        panel.handleInput("\x1b");
+        assert.equal(exited, true, "Esc in the list exits the panel");
       },
     } });
     assert.deepEqual((await execute("three", "handoff_list", {})).details.tasks, []);
