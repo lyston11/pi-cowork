@@ -69,7 +69,7 @@ function legacyDatabase(stateBase: string, id: string, commonDir?: string): { id
   } finally { db.close(); }
 }
 
-export function resolveChannel(cwd: string, stateBase = process.env.PI_HANDOFF_STATE_DIR || join(homedir(), ".pi", "agent", "state", "pi-handoff")): ChannelInfo {
+export function resolveChannel(cwd: string, stateBase = process.env.PI_COWORK_STATE_DIR || join(homedir(), ".pi", "agent", "state", "pi-handoff")): ChannelInfo {
   const directory = realPath(cwd);
   let repoRoot: string | undefined;
   let commonDir: string | undefined;

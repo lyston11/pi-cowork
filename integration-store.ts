@@ -38,6 +38,8 @@ export function initializeIntegration(db: DatabaseSync): void {
       BEGIN INSERT INTO handoff_resume_events(recipient,task_id,kind,source)
         SELECT creator,NEW.task_id,'integration','integration:'||NEW.seq FROM handoff_tasks WHERE id=NEW.task_id; END;
   `);
+  const jobColumns = db.prepare('PRAGMA table_info(handoff_integrations)').all();
+  for (const name of ['target_key','delivery_id','policy_revision','approved_json']) if (!jobColumns.some(c => c.name === name)) db.exec(`ALTER TABLE handoff_integrations ADD COLUMN ${name} TEXT`);
 }
 
 function startKey(pid: number): string {
@@ -69,12 +71,16 @@ export class IntegrationQueue {
       state: row.state as TaskIntegration["state"], commit: String(row.commit_hash), repo: String(row.repo),
       remoteFingerprint: String(row.remote_fingerprint), reviewedBase: String(row.reviewed_base),
       checks: JSON.parse(String(row.checks_json)), attempts: Number(row.attempts),
+      ...(row.target_key ? { targetKey: String(row.target_key) } : {}),
+      ...(row.delivery_id ? { deliveryId: String(row.delivery_id) } : {}),
+      ...(row.policy_revision ? { policyRevision: String(row.policy_revision) } : {}),
+      ...(row.approved_json ? { approvedCommits: JSON.parse(String(row.approved_json)) } : {}),
       note: String(row.note), ...(row.main_commit ? { mainCommit: String(row.main_commit) } : {}) };
   }
   private event(job: IntegrationJob): void {
-    const { jobId, state, commit, mainCommit, note } = job;
+    const { jobId, state, commit, mainCommit, note, deliveryId } = job;
     this.db.prepare("INSERT INTO handoff_task_events(task_id,actor,kind,data_json,at) VALUES(?,?,'integration',?,?)")
-      .run(job.taskId, job.creator, JSON.stringify({ jobId, state, commit, mainCommit, note, ...(state === "pushed" ? { checks: job.checks } : {}) }), new Date().toISOString());
+      .run(job.taskId, job.creator, JSON.stringify({ jobId, state, commit, mainCommit, note, deliveryId, ...(state === "pushed" ? { checks: job.checks } : {}) }), new Date().toISOString());
   }
   read(id: string): IntegrationJob {
     const row = this.db.prepare("SELECT * FROM handoff_integrations WHERE id=?").get(id);
@@ -82,7 +88,7 @@ export class IntegrationQueue {
     return this.job(row);
   }
   enqueue(input: { taskId: number; actor: string; commit: string; repo: string; remoteFingerprint: string;
-    reviewedBase: string; checks: IntegrationCheck[]; note: string; retry?: boolean }): IntegrationJob {
+    reviewedBase: string; checks: IntegrationCheck[]; note: string; retry?: boolean; targetKey?: string; deliveryId?: string; approvedCommits?: string[]; policyRevision?: string }): IntegrationJob {
     if (!/^[a-f0-9]{40}([a-f0-9]{24})?$/.test(input.commit) || !/^[a-f0-9]{40}([a-f0-9]{24})?$/.test(input.reviewedBase)) throw new Error("Full commit hashes required");
     if (!input.note.trim() || input.note.length > 4000) throw new Error("Record the actual review result (1-4000 characters)");
     if (!Array.isArray(input.checks) || !input.checks.length || input.checks.length > 10) throw new Error("Provide 1-10 integration check commands");
@@ -93,6 +99,14 @@ export class IntegrationQueue {
     return this.transaction(() => {
       const task = this.store.read(input.taskId, input.actor);
       if (task.creator.id !== input.actor || task.state !== "completed" || task.commit !== input.commit) throw new Error("Only the creator can queue the reviewed, completed commit");
+      if (input.deliveryId || task.deliveryId) {
+        if (input.deliveryId !== task.deliveryId) throw new Error('Approval must reference the exact completed delivery snapshot');
+        const d = this.db.prepare('SELECT d.*,w.repo,w.target_key FROM handoff_deliveries d JOIN handoff_workspaces w ON w.id=d.workspace_id WHERE d.id=?').get(input.deliveryId!);
+        if (!d || d.target_key !== input.targetKey || d.tip !== input.commit || d.base !== input.reviewedBase || JSON.stringify(input.approvedCommits) !== d.commits_json) throw new Error('Review the entire immutable delivery range before integration');
+      }
+      const policy = input.targetKey ? this.db.prepare('SELECT * FROM handoff_integration_targets WHERE target_key=?').get(input.targetKey) : null;
+      if (policy && (input.policyRevision !== policy.revision || JSON.stringify(input.checks) !== policy.checks_json)) throw new Error('Integration must use current project checks without weakening them');
+      if (input.deliveryId && !policy) throw new Error('Configure and review project integration policy first');
       const previous = this.db.prepare("SELECT * FROM handoff_integrations WHERE task_id=? AND commit_hash=?").get(task.id, input.commit);
       if (previous && (previous.state === "queued" || previous.state === "running" || previous.state === "pushed" && !input.retry)) return this.job(previous);
       if (previous && !input.retry) throw new Error("Integration is blocked; read the reason, resolve it, and explicitly retry");
@@ -102,18 +116,22 @@ export class IntegrationQueue {
         repo=excluded.repo,remote_fingerprint=excluded.remote_fingerprint,reviewed_base=excluded.reviewed_base,
         checks_json=excluded.checks_json,state='queued',note=excluded.note,main_commit=NULL,attempts=0,owner=NULL`)
         .run(id, task.id, input.actor, input.commit, input.repo, input.remoteFingerprint, input.reviewedBase, JSON.stringify(input.checks), input.note);
+      this.db.prepare('UPDATE handoff_integrations SET target_key=?,delivery_id=?,policy_revision=?,approved_json=? WHERE id=?')
+        .run(input.targetKey ?? null, input.deliveryId ?? null, input.policyRevision ?? null, input.approvedCommits ? JSON.stringify(input.approvedCommits) : null, id);
       const job = this.read(id); this.event(job); return job;
     });
   }
-  claim(repo: string): IntegrationJob | null {
-    if (!this.db.prepare("SELECT 1 FROM handoff_integrations WHERE repo=? AND state IN ('queued','running') LIMIT 1").get(repo)) return null;
+  claim(repo: string, targetKey = repo): IntegrationJob | null {
+    if (!this.db.prepare("SELECT 1 FROM handoff_integrations WHERE (repo=? OR target_key=?) AND state IN ('queued','running') LIMIT 1").get(repo, targetKey)) return null;
     return this.transaction(() => {
-      const lock = this.db.prepare("SELECT * FROM handoff_integration_locks WHERE repo=?").get(repo);
-      if (lock && lock.owner !== this.owner && alive(Number(lock.pid), String(lock.start_key))) return null;
-      this.db.prepare("INSERT INTO handoff_integration_locks VALUES(?,?,?,?) ON CONFLICT(repo) DO UPDATE SET owner=excluded.owner,pid=excluded.pid,start_key=excluded.start_key")
-        .run(repo, this.owner, process.pid, startKey(process.pid));
-      const row = this.db.prepare("SELECT * FROM handoff_integrations WHERE repo=? AND state IN ('queued','running') ORDER BY rowid LIMIT 1").get(repo);
+      const row = this.db.prepare("SELECT * FROM handoff_integrations WHERE (repo=? OR target_key=?) AND state IN ('queued','running') ORDER BY rowid LIMIT 1").get(repo, targetKey);
       if (!row) return null;
+      const keys = new Set([String(row.repo), String(row.target_key || targetKey)]);
+      for (const key of keys) {
+        const lock = this.db.prepare('SELECT * FROM handoff_integration_locks WHERE repo=?').get(key);
+        if (lock && lock.owner !== this.owner && alive(Number(lock.pid), String(lock.start_key))) return null;
+      }
+      for (const key of keys) this.db.prepare('INSERT INTO handoff_integration_locks VALUES(?,?,?,?) ON CONFLICT(repo) DO UPDATE SET owner=excluded.owner,pid=excluded.pid,start_key=excluded.start_key').run(key, this.owner, process.pid, startKey(process.pid));
       this.db.prepare("UPDATE handoff_integrations SET state='running',owner=?,attempts=attempts+1 WHERE id=?").run(this.owner, row.id);
       const job = this.read(String(row.id)); this.event(job); return job;
     });
@@ -127,6 +145,6 @@ export class IntegrationQueue {
     });
   }
   release(repo: string): void {
-    this.db.prepare("DELETE FROM handoff_integration_locks WHERE repo=? AND owner=?").run(repo, this.owner);
+    this.db.prepare("DELETE FROM handoff_integration_locks WHERE owner=?").run(this.owner);
   }
 }

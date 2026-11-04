@@ -13,16 +13,16 @@ test("AGENTS installation creates or appends static rules exactly once and prese
     assert.equal(first.changed, true);
     const installed = readFileSync(path, "utf8");
     assert(installed.includes(HANDOFF_RULES));
-    assert.doesNotMatch(installed, new RegExp("handoff_identity|侧 ID|恢复原 Pi 会话|SQLite|/reload|Markdown|Trellis|resume-diag|旧通信"));
+    assert.doesNotMatch(installed, new RegExp("cowork_identity|侧 ID|恢复原 Pi 会话|SQLite|/reload|Markdown|Trellis|resume-diag|旧通信"));
     assert(HANDOFF_RUNTIME_RULES.includes(HANDOFF_RULES));
-    assert(HANDOFF_RUNTIME_RULES.includes("handoff_identity"));
+    assert(HANDOFF_RUNTIME_RULES.includes("cowork_identity"));
     assert.equal(installHandoffRules(root).changed, false);
     const original = "# Project\n\nExisting branch and authorization rules.\n";
     writeFileSync(path, original);
     installHandoffRules(root);
     const after = readFileSync(path, "utf8");
     assert(after.startsWith(original));
-    assert.equal(after.split("<!-- PI-HANDOFF:START -->").length - 1, 1);
+    assert.equal(after.split("<!-- PI-COWORK:START -->").length - 1, 1);
     assert.equal(installHandoffRules(root).changed, false);
     writeFileSync(path, "");
     assert.equal(installHandoffRules(root).changed, true);
@@ -32,8 +32,9 @@ test("AGENTS installation creates or appends static rules exactly once and prese
 test("managed block upgrades leave surrounding bytes and line endings alone", () => {
   const original = "# Before\r\n<!-- PI-HANDOFF:START -->\r\nold rules\r\n<!-- PI-HANDOFF:END -->\r\n# After\r\n";
   const updated = withHandoffRules(original);
-  assert(updated.startsWith("# Before\r\n<!-- PI-HANDOFF:START -->\r\n"));
-  assert(updated.endsWith("<!-- PI-HANDOFF:END -->\r\n# After\r\n"));
+  assert(updated.startsWith("# Before\r\n<!-- PI-COWORK:START -->\r\n"));
+  assert(updated.endsWith("<!-- PI-COWORK:END -->\r\n# After\r\n"));
+  assert.doesNotMatch(updated, /PI-HANDOFF|handoff_list/);
   assert.equal(updated.replace(/\r\n/g, "").includes("\n"), false);
   assert.equal(withHandoffRules(updated), updated);
 });
@@ -42,7 +43,7 @@ test("malformed managed blocks fail without overwriting AGENTS", () => {
   const root = mkdtempSync(join(tmpdir(), "pi-handoff-markers-"));
   try {
     const path = join(root, "AGENTS.md");
-    for (const invalid of ["before\n<!-- PI-HANDOFF:START -->\ncontent", "<!-- PI-HANDOFF:END -->\n<!-- PI-HANDOFF:START -->", withHandoffRules("") + withHandoffRules("")]) {
+    for (const invalid of ["before\n<!-- PI-HANDOFF:START -->\ncontent", "<!-- PI-HANDOFF:END -->\n<!-- PI-HANDOFF:START -->", withHandoffRules("") + withHandoffRules(""), "<!-- PI-HANDOFF:START -->\nlegacy\n<!-- PI-HANDOFF:END -->\n" + withHandoffRules("")]) {
       writeFileSync(path, invalid);
       assert.throws(() => installHandoffRules(root), /Malformed or duplicate/);
       assert.equal(readFileSync(path, "utf8"), invalid);

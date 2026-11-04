@@ -1,4 +1,4 @@
-export const HANDOFF_EXTENSION_VERSION = "4.6.0";
+export const HANDOFF_EXTENSION_VERSION = "4.7.0";
 
 export interface Side {
   id: string;
@@ -7,6 +7,7 @@ export interface Side {
   pid: number;
   worktree: string;
   branch: string;
+  removedAt?: string;
 }
 
 export type TaskState = "open" | "completed" | "closed";
@@ -35,6 +36,8 @@ export interface HandoffTask {
   items: { text: string; checked: boolean }[];
   state: TaskState;
   block: TaskBlock | null;
+  deliveryId?: string;
+  delivery?: { id: string; workspaceId: string; base: string; tip: string; tree: string; commits: string[]; files: string[]; digest: string };
   commit: string | null;
   summary: string | null;
   reviewNote: string | null;
@@ -62,6 +65,10 @@ export interface IntegrationCheck {
 }
 
 export interface TaskIntegration {
+  deliveryId?: string;
+  targetKey?: string;
+  policyRevision?: string;
+  approvedCommits?: string[];
   jobId: string;
   state: "queued" | "running" | "blocked" | "pushed";
   commit: string;

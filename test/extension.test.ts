@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
 import test from "node:test";
-import piHandoff, { resolveChannel } from "../index.ts";
+import piCowork, { resolveChannel } from "../index.ts";
 import { taskLines } from "../ui.ts";
 import { HandoffStore } from "../store.ts";
 import { visibleWidth } from "@earendil-works/pi-tui";
@@ -20,32 +20,35 @@ function initRepo(root: string) {
 test("tool boundary binds identity to session, never accepts an actor from arguments, and checks real commits", async () => {
   const root = mkdtempSync(join(tmpdir(), "pi-task-extension-"));
   const state = mkdtempSync(join(tmpdir(), "pi-task-state-"));
-  const previousCwd = process.cwd(), previousState = process.env.PI_HANDOFF_STATE_DIR;
+  const previousCwd = process.cwd(), previousState = process.env.PI_COWORK_STATE_DIR;
   const handlers = new Map<string, Function>();
   try {
-    initRepo(root); process.chdir(root); process.env.PI_HANDOFF_STATE_DIR = state;
+    initRepo(root); process.chdir(root); process.env.PI_COWORK_STATE_DIR = state;
     const tools = new Map<string, any>();
     const commands = new Map<string, any>();
-    piHandoff({ registerTool: (tool: any) => tools.set(tool.name, tool), registerCommand: (name: string, command: any) => commands.set(name, command), on: (name: string, handler: Function) => handlers.set(name, handler) } as any);
+    piCowork({ registerTool: (tool: any) => tools.set(tool.name, tool), registerCommand: (name: string, command: any) => commands.set(name, command), on: (name: string, handler: Function) => handlers.set(name, handler) } as any);
     assert.equal(handlers.has("tool_call"), false);
+    assert.equal(commands.has('cowork'), true);
+    assert.equal(commands.has('handoff'), false);
+    assert.equal([...tools.keys()].some(name => name.startsWith('handoff_')), false);
     const context = (session: string) => ({ sessionManager: { getSessionId: () => session, getSessionName: () => `side ${session}` }, ui: { notify() {} } });
     const execute = (session: string, tool: string, args: unknown) => tools.get(tool).execute("call", args, undefined, undefined, context(session));
-    const a = (await execute("one", "handoff_identity", { name: "project lead" })).details.self;
-    const b = (await execute("two", "handoff_identity", { name: "data" })).details.self;
-    await execute("three", "handoff_identity", { name: "frontend" });
-    const created = await execute("one", "handoff_create", { to: b.id, subject: "secret", body: "PRIVATE-TEXT", items: ["done"], requiresIntegration: false });
+    const a = (await execute("one", "cowork_identity", { name: "project lead" })).details.self;
+    const b = (await execute("two", "cowork_identity", { name: "data" })).details.self;
+    await execute("three", "cowork_identity", { name: "frontend" });
+    const created = await execute("one", "cowork_create", { to: b.id, subject: "secret", body: "PRIVATE-TEXT", items: ["done"], requiresIntegration: false });
     const id = created.details.task.id;
-    await assert.rejects(execute("one", "handoff_block", { id, reason: "approval", waitingFor: "reviewer" }), /Only the assignee/);
-    await execute("two", "handoff_block", { id, reason: "approval then continue", waitingFor: "reviewer", dependencies: [] });
-    assert.equal((await execute("one", "handoff_read", { id })).details.task.block.waitingFor, "reviewer");
-    await assert.rejects(execute("three", "handoff_unblock", { id, note: "override" }), /not found or not visible/);
-    await execute("two", "handoff_unblock", { id, note: "approval verified" });
-    const ownList = (await execute("three", "handoff_list", {})).details;
+    await assert.rejects(execute("one", "cowork_block", { id, reason: "approval", waitingFor: "reviewer" }), /Only the assignee/);
+    await execute("two", "cowork_block", { id, reason: "approval then continue", waitingFor: "reviewer", dependencies: [] });
+    assert.equal((await execute("one", "cowork_read", { id })).details.task.block.waitingFor, "reviewer");
+    await assert.rejects(execute("three", "cowork_unblock", { id, note: "override" }), /not found or not visible/);
+    await execute("two", "cowork_unblock", { id, note: "approval verified" });
+    const ownList = (await execute("three", "cowork_list", {})).details;
     assert.equal(ownList.tasks.length, 0);
     assert.equal(ownList.self.sessionId, "three");
-    await assert.rejects(execute("three", "handoff_read", { id, actor: a.id }), /not found or not visible/);
+    await assert.rejects(execute("three", "cowork_read", { id, actor: a.id }), /not found or not visible/);
     const uiTheme = { fg: (_color: string, value: string) => value, strikethrough: (value: string) => value };
-    await commands.get("handoff").handler("", { ...context("three"), mode: "tui", ui: {
+    await commands.get("cowork").handler("", { ...context("three"), mode: "tui", ui: {
       custom: async (factory: Function, options: any) => {
         assert.equal(options.overlay, true);
         assert.equal(options.overlayOptions.width, "100%");
@@ -76,7 +79,7 @@ test("tool boundary binds identity to session, never accepts an actor from argum
         panel.handleInput("\t");
         assert.match(render(), /全项目/);
         assert.doesNotMatch(render(), /PRIVATE-TEXT/);
-        for (let i = 0; i < 32; i++) await execute("one", "handoff_create", { to: b.id, subject: `任务 ${i}`, body: Array.from({ length: 40 }, (_, line) => `DETAIL-${line}`).join("\n"), items: ["最后一项"], requiresIntegration: false });
+        for (let i = 0; i < 32; i++) await execute("one", "cowork_create", { to: b.id, subject: `任务 ${i}`, body: Array.from({ length: 40 }, (_, line) => `DETAIL-${line}`).join("\n"), items: ["最后一项"], requiresIntegration: false });
         panel.handleInput("r");
         const frame = panel.render(80);
         assert.equal(frame.length, Math.floor(terminal.rows * 0.6));
@@ -158,10 +161,10 @@ test("tool boundary binds identity to session, never accepts an actor from argum
         assert.match(render(), /secret/);
         const commit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" }).trim();
         for (const taskId of [2, 3]) {
-          await execute("two", "handoff_check", { id: taskId, item: 1, checked: true });
-          await execute("two", "handoff_complete", { id: taskId, commit, summary: "done" });
+          await execute("two", "cowork_check", { id: taskId, item: 1, checked: true });
+          await execute("two", "cowork_complete", { id: taskId, commit, summary: "done" });
         }
-        await execute("one", "handoff_close", { id: 2, commit, note: "reviewed" });
+        await execute("one", "cowork_close", { id: 2, commit, note: "reviewed" });
         terminal.rows = 24;
         const visibleIds = () => [...render().matchAll(/#([0-9]+)/g)].map((match) => Number(match[1]));
         panel.handleInput("r");
@@ -184,34 +187,40 @@ test("tool boundary binds identity to session, never accepts an actor from argum
         assert.equal(exited, true, "Esc in the list exits the panel");
       },
     } });
-    assert.deepEqual((await execute("three", "handoff_list", {})).details.tasks, []);
-    await assert.rejects(execute("three", "handoff_read", { id }), /not found or not visible/);
-    await execute("two", "handoff_check", { id, item: 1, checked: true });
-    await assert.rejects(execute("two", "handoff_complete", { id, commit: "f".repeat(40), summary: "fake" }), /not available/);
+    assert.deepEqual((await execute("three", "cowork_list", {})).details.tasks, []);
+    await assert.rejects(execute("three", "cowork_read", { id }), /not found or not visible/);
+    await execute("two", "cowork_check", { id, item: 1, checked: true });
+    await assert.rejects(execute("two", "cowork_complete", { id, commit: "f".repeat(40), summary: "fake" }), /not available/);
     const commit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" }).trim();
-    const completed = (await execute("two", "handoff_complete", { id, commit, summary: "done" })).details.task;
+    const completed = (await execute("two", "cowork_complete", { id, commit, summary: "done" })).details.task;
     const theme = { fg: (_color: string, value: string) => value, strikethrough: (value: string) => `\x1b[9m${value}\x1b[29m` };
     assert.equal(taskLines(completed, false, theme as any, 80).some((line) => line.includes("PRIVATE-TEXT")), false);
-    const closed = (await execute("one", "handoff_close", { id, commit, note: "reviewed" })).details.task;
+    const closed = (await execute("one", "cowork_close", { id, commit, note: "reviewed" })).details.task;
     assert.match(taskLines(closed, false, theme as any, 80).join("\n"), /\x1b\[9m/);
-    const component = tools.get("handoff_list").renderResult({ details: { tasks: [closed] } }, { expanded: false }, theme);
+    const component = tools.get("cowork_list").renderResult({ details: { tasks: [closed] } }, { expanded: false }, theme);
     assert.equal(component.render(30).length > 0, true);
     assert.doesNotThrow(() => component.invalidate());
     await handlers.get("session_shutdown")!();
-    assert.equal((await execute("one", "handoff_identity", {})).details.self.id, a.id);
-    assert.equal((await execute("one", "handoff_read", { id })).details.task.state, "closed");
+    assert.equal((await execute("one", "cowork_identity", {})).details.self.id, a.id);
+    assert.equal((await execute("one", "cowork_read", { id })).details.task.state, "closed");
     const event = { systemPromptOptions: { sections: {} } };
     handlers.get("before_agent_start")!(event);
     assert.doesNotMatch(JSON.stringify(event), /PRIVATE-TEXT|project lead/);
-    assert.equal((event.systemPromptOptions.sections as any).pi_handoff, HANDOFF_RUNTIME_RULES);
-    await commands.get("handoff").handler("init", context("one"));
+    assert.equal((event.systemPromptOptions.sections as any).pi_cowork, HANDOFF_RUNTIME_RULES);
+    await commands.get("cowork").handler("init", context("one"));
     const installed = readFileSync(join(root, "AGENTS.md"), "utf8");
     assert(installed.includes(HANDOFF_RULES));
-    await commands.get("handoff").handler("init", context("one"));
+    await commands.get("cowork").handler("init", context("one"));
     assert.equal(readFileSync(join(root, "AGENTS.md"), "utf8"), installed);
+    const third = (await execute('three', 'cowork_identity', {})).details.self;
+    await assert.rejects(execute('one', 'cowork_remove_side', { id: third.id, expectedSessionId: third.sessionId, reason: 'user request' }), /still running/);
+    await commands.get('cowork').handler('auto off', context('three'));
+    await commands.get('cowork').handler('remove', context('three'));
+    assert((await execute('three', 'cowork_identity', {})).details.self.removedAt);
+    assert.equal((await execute('one', 'cowork_sides', {})).details.sides.some((side: any) => side.id === third.id), false);
   } finally {
     handlers.get("session_shutdown")?.(); process.chdir(previousCwd);
-    if (previousState === undefined) delete process.env.PI_HANDOFF_STATE_DIR; else process.env.PI_HANDOFF_STATE_DIR = previousState;
+    if (previousState === undefined) delete process.env.PI_COWORK_STATE_DIR; else process.env.PI_COWORK_STATE_DIR = previousState;
     rmSync(root, { recursive: true, force: true }); rmSync(state, { recursive: true, force: true });
   }
 });
@@ -219,38 +228,38 @@ test("tool boundary binds identity to session, never accepts an actor from argum
 test("tool and command takeover both bind later calls to the inherited side and revoke its old session", async () => {
   const root = mkdtempSync(join(tmpdir(), "pi-takeover-extension-"));
   const state = mkdtempSync(join(tmpdir(), "pi-takeover-state-"));
-  const previousCwd = process.cwd(), previousState = process.env.PI_HANDOFF_STATE_DIR;
+  const previousCwd = process.cwd(), previousState = process.env.PI_COWORK_STATE_DIR;
   const tools = new Map<string, any>(), commands = new Map<string, any>(), handlers = new Map<string, Function>();
   let direct: HandoffStore | undefined;
   try {
-    initRepo(root); process.chdir(root); process.env.PI_HANDOFF_STATE_DIR = state;
-    piHandoff({ registerTool: (tool: any) => tools.set(tool.name, tool), registerCommand: (name: string, command: any) => commands.set(name, command), on: (name: string, handler: Function) => handlers.set(name, handler) } as any);
+    initRepo(root); process.chdir(root); process.env.PI_COWORK_STATE_DIR = state;
+    piCowork({ registerTool: (tool: any) => tools.set(tool.name, tool), registerCommand: (name: string, command: any) => commands.set(name, command), on: (name: string, handler: Function) => handlers.set(name, handler) } as any);
     const context = (session: string) => ({ sessionManager: { getSessionId: () => session, getSessionName: () => session }, ui: { notify() {} } });
     const execute = (session: string, name: string, input: unknown) => tools.get(name).execute("call", input, undefined, undefined, context(session));
-    const lead = (await execute("lead", "handoff_identity", {})).details.self;
-    const old = (await execute("old", "handoff_identity", { name: "tools" })).details.self;
-    const task = (await execute("lead", "handoff_create", { to: old.id, subject: "continue", body: "private", items: ["done"] })).details.task;
+    const lead = (await execute("lead", "cowork_identity", {})).details.self;
+    const old = (await execute("old", "cowork_identity", { name: "tools" })).details.self;
+    const task = (await execute("lead", "cowork_create", { to: old.id, subject: "continue", body: "private", items: ["done"] })).details.task;
     direct = new HandoffStore(resolveChannel(root, state).rootDir);
     direct.register({ ...old, pid: 2147483647 });
-    const inherited = (await execute("replacement", "handoff_takeover", { from: old.id, expectedSessionId: old.sessionId, reason: "User explicitly requested takeover" })).details.self;
+    const inherited = (await execute("replacement", "cowork_takeover", { from: old.id, expectedSessionId: old.sessionId, reason: "User explicitly requested takeover" })).details.self;
     assert.equal(inherited.id, old.id);
     assert.equal(inherited.name, old.name);
-    assert.equal((await execute("replacement", "handoff_read", { id: task.id })).details.task.id, task.id);
-    await execute("replacement", "handoff_check", { id: task.id, item: 1, checked: true });
-    await assert.rejects(execute("old", "handoff_list", {}), /replaced/);
-    await assert.rejects(execute("unrelated", "handoff_read", { id: task.id }), /not found or not visible/);
+    assert.equal((await execute("replacement", "cowork_read", { id: task.id })).details.task.id, task.id);
+    await execute("replacement", "cowork_check", { id: task.id, item: 1, checked: true });
+    await assert.rejects(execute("old", "cowork_list", {}), /replaced/);
+    await assert.rejects(execute("unrelated", "cowork_read", { id: task.id }), /not found or not visible/);
     await handlers.get("session_shutdown")!();
-    assert.equal((await execute("replacement", "handoff_identity", {})).details.self.id, old.id);
-    const commandTarget = (await execute("command-old", "handoff_identity", { name: "review" })).details.self;
+    assert.equal((await execute("replacement", "cowork_identity", {})).details.self.id, old.id);
+    const commandTarget = (await execute("command-old", "cowork_identity", { name: "review" })).details.self;
     direct.register({ ...commandTarget, pid: 2147483647 });
-    await commands.get("handoff").handler(`takeover ${commandTarget.id}`, context("command-new"));
-    assert.equal((await execute("command-new", "handoff_identity", {})).details.self.id, commandTarget.id);
-    await assert.rejects(execute("command-old", "handoff_identity", {}), /replaced/);
-    assert.equal((await execute("command-new", "handoff_status", {})).details.takeovers.length, 1);
+    await commands.get("cowork").handler(`takeover ${commandTarget.id}`, context("command-new"));
+    assert.equal((await execute("command-new", "cowork_identity", {})).details.self.id, commandTarget.id);
+    await assert.rejects(execute("command-old", "cowork_identity", {}), /replaced/);
+    assert.equal((await execute("command-new", "cowork_status", {})).details.takeovers.length, 1);
     assert.equal(lead.sessionId, "lead");
   } finally {
     direct?.close(); handlers.get("session_shutdown")?.(); process.chdir(previousCwd);
-    if (previousState === undefined) delete process.env.PI_HANDOFF_STATE_DIR; else process.env.PI_HANDOFF_STATE_DIR = previousState;
+    if (previousState === undefined) delete process.env.PI_COWORK_STATE_DIR; else process.env.PI_COWORK_STATE_DIR = previousState;
     rmSync(root, { recursive: true, force: true }); rmSync(state, { recursive: true, force: true });
   }
 });

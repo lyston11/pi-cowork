@@ -1,38 +1,17 @@
-import { spawn, execFileSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdirSync, realpathSync } from "node:fs";
-import { dirname, isAbsolute, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { mkdirSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { gitSync, integrationRepository } from "./repository.ts";
+export { integrationRepository } from "./repository.ts";
 import { IntegrationQueue } from "./integration-store.ts";
 import type { HandoffStore } from "./store.ts";
 import type { IntegrationJob } from "./types.ts";
-
-function gitSync(cwd: string, args: string[]): string {
-  return execFileSync("git", args, { cwd, encoding: "utf8", timeout: 15000, stdio: ["ignore", "pipe", "pipe"] }).trim();
-}
-
-export function integrationRepository(cwd: string): { repo: string; url: string; fingerprint: string } {
-  const repo = realpathSync(resolve(cwd, gitSync(cwd, ["rev-parse", "--git-common-dir"])));
-  // Resolve local remotes against the repository, not the temporary worktree.
-  const anchor = gitSync(dirname(repo), ["--git-dir", repo, "rev-parse", "--is-bare-repository"]) === "true" ? repo : dirname(repo);
-  const normalize = (value: string) => {
-    if (value.startsWith("file://")) return realpathSync(fileURLToPath(value));
-    if (isAbsolute(value) || value.startsWith(".")) return realpathSync(resolve(anchor, value));
-    if (!value.includes(":") && !value.includes("@")) return realpathSync(resolve(anchor, value));
-    return value;
-  };
-  const fetchUrls = gitSync(anchor, ["--git-dir", repo, "remote", "get-url", "--all", "origin"]).split("\n").map(normalize);
-  const pushUrls = gitSync(anchor, ["--git-dir", repo, "remote", "get-url", "--push", "--all", "origin"]).split("\n").map(normalize);
-  if (fetchUrls.length !== 1 || pushUrls.length !== 1 || fetchUrls[0] !== pushUrls[0]) throw new Error("Integration requires one origin with the same fetch and push destination");
-  let mirror = "";
-  try { mirror = gitSync(anchor, ["--git-dir", repo, "config", "--get", "remote.origin.mirror"]); } catch {}
-  if (mirror === "true") throw new Error("Mirror remotes cannot be used for integration");
-  return { repo, url: pushUrls[0], fingerprint: createHash("sha256").update(pushUrls[0]).digest("hex") };
-}
+import { WorkspaceLedger } from "./workspaces.ts";
 
 export function verifyPushedIntegration(cwd: string, job: IntegrationJob): void {
   const current = integrationRepository(cwd);
-  if (current.repo !== job.repo || current.fingerprint !== job.remoteFingerprint) throw new Error("Repository/origin changed since integration; verify the intended target before closing");
+  if (job.targetKey ? current.targetKey !== job.targetKey : current.repo !== job.repo || current.fingerprint !== job.remoteFingerprint) throw new Error("Repository/origin changed since integration; verify the intended target before closing");
   if (job.state !== "pushed" || !job.mainCommit) throw new Error("Integration has not been pushed");
   const ref = `refs/pi-handoff/integrations/${job.jobId}/closure`;
   gitSync(cwd, ["fetch", "--no-tags", "--no-write-fetch-head", "--", current.url, `+refs/heads/main:${ref}`]);
@@ -108,10 +87,12 @@ export class IntegrationWorker {
     let job: IntegrationJob | null = null;
     let worktree: string | undefined;
     let pushed: string | undefined;
+    const hostRepo = this.repo;
     this.controller = new AbortController();
     try {
-      job = this.queue.claim(this.repo);
+      job = this.queue.claim(this.repo, integrationRepository(dirname(this.repo)).targetKey);
       if (!job) return;
+      this.repo = job.repo;
       if (job.attempts > 3) throw new Error("Integration repeatedly interrupted; review the job and explicitly retry");
       const task = this.store.read(job.taskId, job.creator);
       if (task.state !== "completed" || task.commit !== job.commit) throw new Error("Delivery changed after review; review again before integration");
@@ -125,11 +106,27 @@ export class IntegrationWorker {
         await this.git(["fetch", "--no-tags", "--no-write-fetch-head", "--", repository.url, `+refs/heads/main:${remoteRef}`]);
         const target = await this.git(["rev-parse", remoteRef]);
         if (!await this.ancestor(job.reviewedBase, target)) throw new Error("Reviewed base is outside origin/main history; review the whole branch before retrying");
+        if (job.policyRevision) {
+          const ledger = new WorkspaceLedger(this.store);
+          try {
+            const policy = ledger.policy(repository.targetKey);
+            if (policy?.revision !== job.policyRevision || JSON.stringify(policy.checks) !== JSON.stringify(job.checks)) throw new Error('Project policy changed; review and explicitly retry');
+            const outside = await ledger.outsideQueue(dirname(this.repo), target);
+            let retained = '';
+            try { retained = await this.git(['rev-parse', `${ref}/candidate`]); } catch {}
+            if (outside.length && !(retained === target && outside.length === 1 && outside[0] === retained && await this.ancestor(job.commit, target))) throw new Error(`Queue-external main update requires review: ${outside.join(', ')}`);
+          } finally { ledger.close(); }
+        }
+        if (job.approvedCommits) {
+          const approved = new Set(job.approvedCommits);
+          const introduced = (await this.git(['rev-list', job.commit, '--not', target])).split('\n').filter(Boolean);
+          if (introduced.some(commit => !approved.has(commit))) throw new Error('Integration introduces commits outside the reviewed delivery');
+        }
         const included = await this.ancestor(job.commit, target);
         worktree = join(this.store.rootDir, "integrations", createHash("sha256").update(this.repo).digest("hex").slice(0, 16), `${job.jobId}-${randomUUID()}`);
         mkdirSync(dirname(worktree), { recursive: true, mode: 0o700 });
         await this.git(["worktree", "add", "--detach", worktree, target]);
-        if (!included) await this.git(["-c", "user.name=Pi Handoff", "-c", "user.email=pi-handoff@localhost", "merge", "--no-ff", "--no-edit", job.commit], worktree);
+        if (!included) await this.git(["-c", "user.name=Pi CoWork", "-c", "user.email=pi-cowork@localhost", "merge", "--no-ff", "--no-edit", "-m", `Merge handoff #${job.taskId}: ${task.subject.replace(/[\r\n]/g, ' ')} (${job.deliveryId ?? job.commit.slice(0, 12)})`, job.commit], worktree);
         const merged = await this.git(["rev-parse", "HEAD"], worktree);
         for (const check of job.checks) await this.command(worktree, check.command, check.args, 600000);
         if (await this.git(["rev-parse", "HEAD"], worktree) !== merged || await this.git(["status", "--porcelain", "--untracked-files=no"], worktree)) throw new Error("Integration checks changed HEAD or tracked files; nothing was pushed");
@@ -154,12 +151,16 @@ export class IntegrationWorker {
         const confirmed = await this.git(["rev-parse", `${ref}/confirmed`]);
         if (!await this.ancestor(pushed, confirmed)) throw new Error("Remote main no longer contains the integration; recheck before closure");
       }
-      this.queue.finish(job.jobId, "pushed", `已核实 origin/main 包含交付提交，通过 ${job.checks.length} 项合并后检查。集成提交 ${pushed}；本地主检出及各侧工作区未被重置。${job.note}`, pushed);
+      let localMain: unknown;
+      const ledger = new WorkspaceLedger(this.store);
+      try { localMain = await ledger.syncMain(dirname(this.repo), { jobId: job.jobId, mainCommit: pushed }); } catch (error) { localMain = { state: 'blocked', reason: String(error) }; } finally { ledger.close(); }
+      this.queue.finish(job.jobId, "pushed", `已核实 origin/main 包含交付提交，通过 ${job.checks.length} 项合并后检查。集成提交 ${pushed}；本地 main: ${JSON.stringify(localMain)}。${job.note}`, pushed);
     } catch (error) {
       if (job) this.queue.finish(job.jobId, this.stopped ? "queued" : "blocked", `${error instanceof Error ? error.message : String(error)}${worktree ? `\n隔离工作树保留于 ${worktree}` : ""}`.replace(/(https?:\/\/)[^\s/]*@/g, "$1[redacted]@"), pushed);
     } finally {
       if (worktree && pushed) { try { await this.git(["worktree", "remove", worktree]); } catch { /* Preserve unexpected files rather than forcing cleanup. */ } }
       if (job) this.queue.release(this.repo);
+      this.repo = hostRepo;
       this.controller = undefined;
     }
   }

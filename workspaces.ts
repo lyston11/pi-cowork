@@ -1,0 +1,313 @@
+import { createHash, randomUUID } from "node:crypto";
+import { existsSync, readdirSync, readlinkSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { dirname, join, resolve, sep } from "node:path";
+import { DatabaseSync } from "node:sqlite";
+import { git, gitSync, integrationRepository } from "./repository.ts";
+import type { IntegrationCheck } from "./types.ts";
+import type { HandoffStore } from "./store.ts";
+
+export function initializeWorkspaces(db: DatabaseSync): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS handoff_workspaces (
+      id TEXT PRIMARY KEY, repo TEXT NOT NULL, target_key TEXT NOT NULL,
+      owner TEXT NOT NULL REFERENCES handoff_sides(id), path TEXT NOT NULL, branch TEXT NOT NULL,
+      base TEXT NOT NULL, tasks_json TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'active', at TEXT NOT NULL
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS handoff_workspace_path ON handoff_workspaces(repo,path) WHERE state='active';
+    CREATE UNIQUE INDEX IF NOT EXISTS handoff_workspace_branch ON handoff_workspaces(repo,branch) WHERE state='active';
+    CREATE TABLE IF NOT EXISTS handoff_deliveries (
+      id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL REFERENCES handoff_workspaces(id),
+      base TEXT NOT NULL, tip TEXT NOT NULL, tree TEXT NOT NULL, commits_json TEXT NOT NULL,
+      files_json TEXT NOT NULL, digest TEXT NOT NULL, ref TEXT NOT NULL, at TEXT NOT NULL,
+      UNIQUE(workspace_id,base,tip)
+    );
+    CREATE TABLE IF NOT EXISTS handoff_workspace_events (
+      seq INTEGER PRIMARY KEY AUTOINCREMENT, workspace_id TEXT NOT NULL REFERENCES handoff_workspaces(id),
+      actor TEXT NOT NULL REFERENCES handoff_sides(id), kind TEXT NOT NULL, data_json TEXT NOT NULL, at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS handoff_integration_targets (
+      target_key TEXT PRIMARY KEY, revision TEXT NOT NULL, baseline TEXT NOT NULL,
+      checks_json TEXT NOT NULL, note TEXT NOT NULL, actor TEXT NOT NULL REFERENCES handoff_sides(id)
+    );
+    CREATE TABLE IF NOT EXISTS handoff_target_events (
+      seq INTEGER PRIMARY KEY AUTOINCREMENT, target_key TEXT NOT NULL, revision TEXT NOT NULL,
+      baseline TEXT NOT NULL, checks_json TEXT NOT NULL, actor TEXT NOT NULL, note TEXT NOT NULL, at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS handoff_reconcile_observations (
+      owner TEXT NOT NULL, repo TEXT NOT NULL, digest TEXT NOT NULL, report_json TEXT NOT NULL,
+      PRIMARY KEY(owner,repo)
+    );
+  `);
+  for (const table of ['handoff_deliveries', 'handoff_workspace_events', 'handoff_target_events']) db.exec(`
+    CREATE TRIGGER IF NOT EXISTS ${table}_no_update BEFORE UPDATE ON ${table} BEGIN SELECT RAISE(ABORT,'Handoff records are append-only'); END;
+    CREATE TRIGGER IF NOT EXISTS ${table}_no_delete BEFORE DELETE ON ${table} BEGIN SELECT RAISE(ABORT,'Handoff records are append-only'); END;
+  `);
+}
+
+export interface Workspace {
+  id: string; repo: string; targetKey: string; owner: string; path: string; branch: string; base: string;
+  tasks: number[]; state: string;
+}
+export interface Delivery {
+  id: string; workspaceId: string; base: string; tip: string; tree: string;
+  commits: string[]; files: string[]; digest: string; ref: string;
+}
+const list = (value: string) => value ? value.split("\n") : [];
+const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch (error) { return (error as NodeJS.ErrnoException).code !== 'ESRCH'; } };
+
+export function workspaceOccupancy(path: string): string | null {
+  if (process.platform !== 'linux') return 'Cannot prove process occupancy on this platform';
+  for (const entry of readdirSync('/proc')) {
+    if (!/^\d+$/.test(entry)) continue;
+    try {
+      if (statSync(`/proc/${entry}`).uid !== process.getuid!()) continue;
+      const cwd = readlinkSync(`/proc/${entry}/cwd`);
+      if ((cwd === path || cwd.startsWith(path + sep)) && alive(Number(entry))) return `Workspace occupied by PID ${entry}`;
+      const args = readFileSync(`/proc/${entry}/cmdline`, 'utf8').split('\0');
+      if (alive(Number(entry)) && args.some(arg => arg === path || arg.startsWith(path + sep))) return `Workspace referenced by PID ${entry}`;
+    } catch (error) { if (['EACCES', 'EPERM'].includes((error as NodeJS.ErrnoException).code ?? '')) return 'Cannot inspect all process occupancy'; }
+  }
+  return null;
+}
+
+export class WorkspaceLedger {
+  private db: DatabaseSync;
+  private store: HandoffStore;
+  constructor(store: HandoffStore) {
+    this.store = store;
+    this.db = new DatabaseSync(store.dbPath);
+    this.db.exec('PRAGMA busy_timeout=30000; PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL;');
+  }
+  close() { this.db.close(); }
+  private transaction<T>(fn: () => T): T {
+    this.db.exec('BEGIN IMMEDIATE');
+    try { const result = fn(); this.db.exec('COMMIT'); return result; } catch (error) { this.db.exec('ROLLBACK'); throw error; }
+  }
+  private workspace(row: Record<string, unknown>): Workspace {
+    return { id: String(row.id), repo: String(row.repo), targetKey: String(row.target_key), owner: String(row.owner),
+      path: String(row.path), branch: String(row.branch), base: String(row.base), tasks: JSON.parse(String(row.tasks_json)), state: String(row.state) };
+  }
+  all(repo: string, owner?: string): Workspace[] {
+    return this.db.prepare(`SELECT * FROM handoff_workspaces WHERE repo=? ${owner ? 'AND owner=?' : ''} ORDER BY at,id`)
+      .all(repo, ...(owner ? [owner] : [])).map(row => this.workspace(row));
+  }
+  read(id: string, owner?: string): Workspace {
+    const row = this.db.prepare(`SELECT * FROM handoff_workspaces WHERE id=? ${owner ? 'AND owner=?' : ''}`).get(id, ...(owner ? [owner] : []));
+    if (!row) throw new Error('Workspace not found or not owned by this side');
+    return this.workspace(row);
+  }
+  delivery(id: string): Delivery {
+    const row = this.db.prepare('SELECT * FROM handoff_deliveries WHERE id=?').get(id);
+    if (!row) throw new Error('Unknown delivery snapshot');
+    return { id: String(row.id), workspaceId: String(row.workspace_id), base: String(row.base), tip: String(row.tip), tree: String(row.tree),
+      commits: JSON.parse(String(row.commits_json)), files: JSON.parse(String(row.files_json)), digest: String(row.digest), ref: String(row.ref) };
+  }
+  async configure(cwd: string, actor: string, baseline: string, checks: IntegrationCheck[], note: string) {
+    if (!note.trim() || note.length > 4000 || !checks.length || checks.length > 10 || checks.some(c => !c.command || /[\x00\r\n]/.test(c.command) || c.command.length > 512 || !Array.isArray(c.args) || c.args.length > 100 || c.args.some(a => typeof a !== 'string' || a.includes('\0') || a.length > 4096))) throw new Error('Provide a review note and 1-10 valid project checks');
+    const target = integrationRepository(cwd), remote = await this.remoteHead(cwd);
+    if (remote !== baseline) throw new Error('Review the exact current remote main before approving a target baseline');
+    const revision = randomUUID();
+    return this.transaction(() => {
+      if (this.db.prepare("SELECT 1 FROM handoff_integrations WHERE target_key=? AND state IN ('queued','running')").get(target.targetKey)) throw new Error('Wait for pending integrations before changing project policy');
+      this.db.prepare('INSERT INTO handoff_integration_targets VALUES(?,?,?,?,?,?) ON CONFLICT(target_key) DO UPDATE SET revision=excluded.revision,baseline=excluded.baseline,checks_json=excluded.checks_json,note=excluded.note,actor=excluded.actor').run(target.targetKey, revision, baseline, JSON.stringify(checks), note, actor);
+      this.db.prepare('INSERT INTO handoff_target_events(target_key,revision,baseline,checks_json,actor,note,at) VALUES(?,?,?,?,?,?,?)').run(target.targetKey, revision, baseline, JSON.stringify(checks), actor, note, new Date().toISOString());
+      return this.policy(target.targetKey);
+    });
+  }
+  async remoteHead(cwd: string): Promise<string> {
+    const target = integrationRepository(cwd);
+    const ref = 'refs/pi-handoff/reconciliation/main';
+    await git(cwd, ['fetch', '--no-tags', '--no-write-fetch-head', '--', target.url, `+refs/heads/main:${ref}`]);
+    return git(cwd, ['rev-parse', ref]);
+  }
+  async register(cwd: string, actor: string, taskIds: number[] = []): Promise<Workspace> {
+    if (taskIds.length > 50 || new Set(taskIds).size !== taskIds.length) throw new Error('At most 50 unique task IDs are allowed');
+    taskIds.forEach(id => this.store.read(id, actor));
+    const target = integrationRepository(cwd), path = realpathSync(await git(cwd, ['rev-parse', '--show-toplevel']));
+    const branch = await git(path, ['symbolic-ref', '-q', 'HEAD']);
+    if (branch === 'refs/heads/main' || !branch.startsWith('refs/heads/')) throw new Error('Register an implementation branch, not main or detached HEAD');
+    const current = this.all(target.repo).find(w => w.state === 'active' && (w.path === path || w.branch === branch));
+    if (current) {
+      if (current.owner !== actor || current.path !== path || current.branch !== branch || current.targetKey !== target.targetKey) throw new Error('Workspace/branch is already registered to another owner or target; reconcile it first');
+      this.transaction(() => {
+        const tasks = [...new Set([...current.tasks, ...taskIds])];
+        this.db.prepare('UPDATE handoff_workspaces SET tasks_json=? WHERE id=?').run(JSON.stringify(tasks), current.id);
+      });
+      return this.read(current.id, actor);
+    }
+    const head = await this.remoteHead(path), base = await git(path, ['merge-base', head, 'HEAD']);
+    const id = randomUUID();
+    return this.transaction(() => {
+      this.db.prepare('INSERT INTO handoff_workspaces(id,repo,target_key,owner,path,branch,base,tasks_json,at) VALUES(?,?,?,?,?,?,?,?,?)')
+        .run(id, target.repo, target.targetKey, actor, path, branch, base, JSON.stringify(taskIds), new Date().toISOString());
+      this.event(id, actor, 'register', { base, branch, path });
+      return this.read(id, actor);
+    });
+  }
+  private event(id: string, actor: string, kind: string, data: unknown) {
+    this.db.prepare('INSERT INTO handoff_workspace_events(workspace_id,actor,kind,data_json,at) VALUES(?,?,?,?,?)')
+      .run(id, actor, kind, JSON.stringify(data), new Date().toISOString());
+  }
+  async snapshot(cwd: string, actor: string, taskId: number, tip: string): Promise<Delivery> {
+    const task = this.store.read(taskId, actor);
+    if (task.assignee.id !== actor || task.state !== 'open' || task.block || task.items.some(i => !i.checked)) throw new Error('Only a ready assigned task can create a delivery');
+    const w = await this.register(cwd, actor, [taskId]);
+    await git(cwd, ['merge-base', '--is-ancestor', w.base, tip]);
+    await git(cwd, ['merge-base', '--is-ancestor', tip, 'HEAD']);
+    const previous = this.db.prepare('SELECT id FROM handoff_deliveries WHERE workspace_id=? AND base=? AND tip=?').get(w.id, w.base, tip);
+    if (previous) return this.delivery(String(previous.id));
+    const commits = list(await git(cwd, ['rev-list', '--reverse', `${w.base}..${tip}`]));
+    const files = (await git(cwd, ['diff', '--name-status', '-z', w.base, tip])).split('\0').filter(Boolean);
+    const tree = await git(cwd, ['rev-parse', `${tip}^{tree}`]);
+    const id = randomUUID(), ref = `refs/pi-handoff/deliveries/${id}`;
+    const digest = createHash('sha256').update(JSON.stringify({ base: w.base, tip, tree, commits, files })).digest('hex');
+    await git(cwd, ['update-ref', ref, tip, '']);
+    return this.transaction(() => {
+      const existing = this.db.prepare('SELECT id FROM handoff_deliveries WHERE workspace_id=? AND base=? AND tip=?').get(w.id, w.base, tip);
+      if (existing) return this.delivery(String(existing.id));
+      this.db.prepare('INSERT INTO handoff_deliveries(id,workspace_id,base,tip,tree,commits_json,files_json,digest,ref,at) VALUES(?,?,?,?,?,?,?,?,?,?)')
+        .run(id, w.id, w.base, tip, tree, JSON.stringify(commits), JSON.stringify(files), digest, ref, new Date().toISOString());
+      this.event(w.id, actor, 'delivery', { id, tip, digest });
+      return this.delivery(id);
+    });
+  }
+  policy(targetKey: string) {
+    const row = this.db.prepare('SELECT * FROM handoff_integration_targets WHERE target_key=?').get(targetKey);
+    return row ? { targetKey, revision: String(row.revision), baseline: String(row.baseline), checks: JSON.parse(String(row.checks_json)), note: String(row.note) } : null;
+  }
+  async outsideQueue(cwd: string, head: string): Promise<string[]> {
+    const target = integrationRepository(cwd), policy = this.policy(target.targetKey);
+    if (!policy) return [];
+    await git(cwd, ['merge-base', '--is-ancestor', policy.baseline, head]);
+    const history = list(await git(cwd, ['rev-list', '--first-parent', `${policy.baseline}..${head}`]));
+    const receipts = new Set(this.db.prepare("SELECT main_commit FROM handoff_integrations WHERE target_key=? AND state='pushed'").all(target.targetKey).map(r => String(r.main_commit)));
+    return history.filter(commit => !receipts.has(commit));
+  }
+  async reconcile(cwd: string, actor?: string) {
+    const target = integrationRepository(cwd), workspaces = this.all(target.repo, actor).filter(w => w.state === 'active');
+    const errors: string[] = [];
+    let remote: string | null = null, outside: string[] = [];
+    try { remote = await this.remoteHead(cwd); outside = await this.outsideQueue(cwd, remote); } catch (e) { errors.push(String(e)); }
+    const registered = this.all(target.repo).filter(w => w.state === 'active');
+    const snapshots = this.db.prepare('SELECT d.* FROM handoff_deliveries d JOIN handoff_workspaces w ON w.id=d.workspace_id WHERE w.repo=?').all(target.repo);
+    const worktrees = (await git(cwd, ['worktree', 'list', '--porcelain', '-z'])).split('\0\0').map(block => {
+      const lines = block.split('\0');
+      return { path: lines.find(l => l.startsWith('worktree '))?.slice(9), branch: lines.find(l => l.startsWith('branch '))?.slice(7), head: lines.find(l => l.startsWith('HEAD '))?.slice(5) };
+    }).filter(w => w.path);
+    const actualWorktrees = await Promise.all(worktrees.map(async w => {
+      try {
+        const status = await git(w.path!, ['status', '--porcelain=v1', '-uall']);
+        const ignored = (await git(w.path!, ['ls-files', '--others', '--ignored', '--exclude-standard', '--directory', '-z'])).split('\0').filter(Boolean);
+        return { ...w, registered: registered.some(r => r.path === w.path && r.branch === w.branch), status: status ? status.split('\n') : [], ignored };
+      } catch (error) { errors.push(`Cannot inspect worktree ${w.path}: ${error}`); return { ...w, error: String(error), registered: false }; }
+    }));
+    const heads = list(await git(cwd, ['for-each-ref', '--format=%(refname) %(objectname)', 'refs/heads/']));
+    let remoteBranches: string[] = [];
+    try { remoteBranches = list(await git(cwd, ['ls-remote', '--heads', 'origin']));
+      await git(cwd, ['fetch', '--no-tags', '--no-write-fetch-head', '--', target.url, '+refs/heads/*:refs/pi-handoff/audit/heads/*']);
+    } catch (e) { errors.push(String(e)); }
+    const unregistered = heads.map(h => { const [branch, tip] = h.split(' '); return { branch, tip }; })
+      .filter(h => h.branch !== 'refs/heads/main' && !registered.some(w => w.branch === h.branch));
+    const detached = worktrees.filter(w => !w.branch);
+    const reports = [];
+    for (const w of workspaces) {
+      try {
+        if (!existsSync(w.path) || realpathSync(await git(w.path, ['rev-parse', '--show-toplevel'])) !== w.path || integrationRepository(w.path).repo !== w.repo || await git(w.path, ['symbolic-ref', '-q', 'HEAD']) !== w.branch) throw new Error('Registered worktree is missing, moved or has switched branch; preserve and review its registration');
+        const tip = await git(w.path, ['rev-parse', 'HEAD']);
+        const status = await git(w.path, ['status', '--porcelain=v1', '-uall']);
+        const ignored = (await git(w.path, ['ls-files', '--others', '--ignored', '--exclude-standard', '--directory', '-z'])).split('\0').filter(Boolean);
+        const delivered = snapshots.filter(d => d.workspace_id === w.id);
+        const valid = delivered.filter(d => this.db.prepare("SELECT 1 FROM handoff_task_events e WHERE e.kind='complete' AND json_extract(e.data_json,'$.deliveryId')=? AND NOT EXISTS(SELECT 1 FROM handoff_task_events later WHERE later.task_id=e.task_id AND later.kind='reopen' AND later.seq>e.seq)").get(String(d.id)));
+        const approved = new Set(valid.flatMap(d => JSON.parse(String(d.commits_json)) as string[]));
+        const ahead = remote ? list(await git(w.path, ['rev-list', tip, '--not', remote])) : null;
+        const undelivered = ahead?.filter(c => !approved.has(c)) ?? null;
+        const pending = valid.filter(d => !remote || !this.contains(w.path, String(d.tip), remote)).map(d => String(d.id));
+        const tasks = w.tasks.map(id => { const task = this.store.read(id, w.owner); return { id, state: task.state }; });
+        const blockers = [!remote ? 'remote-incomplete' : '', ahead?.length ? 'branch-not-integrated' : '', status ? 'uncommitted-files' : '', ignored.length ? 'ignored-data-needs-preservation' : '', tasks.some(t => t.state !== 'closed') ? 'open-tasks' : ''].filter(Boolean);
+        reports.push({ workspace: w, tip, status: status ? status.split('\n') : [], ignored, undelivered, pendingDeliveries: pending, tasks, blockers, eligibleForRetirement: blockers.length === 0 });
+      } catch (error) { errors.push(`${w.id}: ${error}`); reports.push({ workspace: w, error: String(error), eligibleForRetirement: false }); }
+    }
+    const localMain = await git(cwd, ['rev-parse', 'refs/heads/main']).catch(() => null);
+    const mainDifference = remote && localMain ? (await git(cwd, ['rev-list', '--left-right', '--count', `${localMain}...${remote}`])).split(/\s+/).map(Number) : null;
+    const mainTree = actualWorktrees.find(w => w.branch === 'refs/heads/main');
+    let mainReason: string | null = !remote ? 'Remote query incomplete' : !localMain ? 'Local main missing' : mainDifference?.[0] ? 'Local main has unique commits; manual review required' : null;
+    if (!mainReason && mainDifference?.[1] && mainTree) {
+      if ('error' in mainTree) mainReason = mainTree.error!;
+      else if (mainTree.status?.length || mainTree.ignored?.length) mainReason = 'Main worktree has modified, untracked or ignored data';
+      else mainReason = workspaceOccupancy(mainTree.path!);
+    }
+    const localMainStatus = { head: localMain, remote, difference: mainDifference, state: mainReason ? 'blocked' : mainDifference?.[1] ? 'fast-forward-available' : 'current', reason: mainReason };
+    const describeRef = async (tip: string | undefined) => {
+      if (!tip || !remote) return null;
+      try { return list(await git(cwd, ['rev-list', tip, '--not', remote])); }
+      catch (error) { errors.push(`Cannot inspect referenced commits ${tip}: ${error}`); return null; }
+    };
+    const unknown = await Promise.all(unregistered.map(async b => ({ ...b, unintegrated: await describeRef(b.tip) })));
+    const detachedHeads = await Promise.all(detached.map(async w => ({ ...w, unintegrated: await describeRef(w.head) })));
+    const remoteRefs = await Promise.all(remoteBranches.map(async row => { const [tip, branch] = row.split(/\s+/); return { tip, branch, unintegrated: await describeRef(tip) }; }));
+    const jobs = this.db.prepare(`SELECT j.id,j.task_id,j.delivery_id,j.state,j.main_commit,j.note FROM handoff_integrations j JOIN handoff_tasks t ON t.id=j.task_id
+      WHERE j.target_key=? ${actor ? 'AND (t.creator=? OR t.assignee=?)' : ''} ORDER BY j.rowid`).all(target.targetKey, ...(actor ? [actor,actor] : []));
+    const report = { complete: errors.length === 0, remote, mainDifference, localMainStatus, outsideQueue: outside, policy: this.policy(target.targetKey), workspaces: reports,
+      actualWorktrees, unregistered: unknown, detached: detachedHeads, remoteBranches: remoteRefs, jobs, errors };
+    if (actor) {
+      const digest = createHash('sha256').update(JSON.stringify(report)).digest('hex');
+      const previous = this.db.prepare('SELECT digest FROM handoff_reconcile_observations WHERE owner=? AND repo=?').get(actor, target.repo);
+      this.db.prepare('INSERT INTO handoff_reconcile_observations VALUES(?,?,?,?) ON CONFLICT(owner,repo) DO UPDATE SET digest=excluded.digest,report_json=excluded.report_json').run(actor, target.repo, digest, JSON.stringify(report));
+      return { ...report, changed: previous?.digest !== digest };
+    }
+    return report;
+  }
+  async syncMain(cwd: string, verifiedPush?: { jobId: string; mainCommit: string }) {
+    const target = integrationRepository(cwd), remote = await this.remoteHead(cwd);
+    if (this.policy(target.targetKey)) {
+      const outside = await this.outsideQueue(cwd, remote);
+      // The worker confirms the push before marking its job complete. Only its
+      // exact pinned merge is exempt; other queue-external changes still block.
+      const running = verifiedPush && this.db.prepare("SELECT commit_hash FROM handoff_integrations WHERE id=? AND target_key=? AND state='running'").get(verifiedPush.jobId, target.targetKey);
+      let pinned = '';
+      if (running) { try { pinned = await git(cwd, ['rev-parse', `refs/pi-handoff/integrations/${verifiedPush!.jobId}/candidate`]); } catch {} }
+      const ownPush = running && pinned === verifiedPush!.mainCommit && outside.length === 1 && outside[0] === pinned && this.contains(cwd, String(running.commit_hash), pinned);
+      if (outside.length && !ownPush) return { state: 'blocked', remote, reason: 'Queue-external main updates require review before synchronization' };
+    }
+    const main = await git(cwd, ['rev-parse', 'refs/heads/main']);
+    if (main === remote) return { state: 'current', main, remote };
+    if (!this.contains(cwd, main, remote)) return { state: 'blocked', main, remote, reason: 'Local main diverged; review local-only commits' };
+    const trees = (await git(cwd, ['worktree', 'list', '--porcelain', '-z'])).split('\0\0');
+    const block = trees.find(b => b.split('\0').includes('branch refs/heads/main'));
+    if (block) {
+      const path = block.split('\0').find(l => l.startsWith('worktree '))!.slice(9);
+      const occupied = workspaceOccupancy(path);
+      if (occupied) return { state: 'blocked', main, remote, reason: occupied };
+      if (await git(path, ['status', '--porcelain=v1', '-uall', '--ignored'])) return { state: 'blocked', main, remote, reason: 'Main worktree has modified, untracked or ignored data' };
+      if (await git(path, ['rev-parse', 'HEAD']) !== main || await git(path, ['symbolic-ref', '-q', 'HEAD']) !== 'refs/heads/main') throw new Error('Main worktree changed during synchronization');
+      await git(path, ['-c', 'core.hooksPath=/dev/null', 'merge', '--ff-only', '--no-edit', remote]);
+    } else await git(cwd, ['update-ref', 'refs/heads/main', remote, main]);
+    return { state: 'synced', main: remote, remote, repo: target.repo };
+  }
+  private contains(cwd: string, a: string, b: string) { try { gitSync(cwd, ['merge-base', '--is-ancestor', a, b]); return true; } catch { return false; } }
+  async retire(cwd: string, actor: string, id: string, remove = false) {
+    const w = this.read(id, actor);
+    if (w.state === 'retired') return w;
+    const report = await this.reconcile(cwd, actor), item = report.workspaces.find(r => r.workspace.id === id);
+    if (!report.complete || !item?.eligibleForRetirement || !('tip' in item)) throw new Error('Workspace still has unintegrated code, open tasks, files or incomplete evidence; retirement refused');
+    const occupied = workspaceOccupancy(w.path);
+    if (occupied) throw new Error(occupied);
+    const sides = this.store.sides().filter(s => s.worktree === w.path && alive(s.pid));
+    if (sides.length) throw new Error('A registered live Pi still owns this worktree; retire from another idle location');
+    const tip = item.tip!;
+    await git(cwd, ['update-ref', `refs/pi-handoff/retired/${w.id}`, tip]);
+    if (await git(w.path, ['rev-parse', 'HEAD']) !== tip || await git(w.path, ['status', '--porcelain=v1', '-uall', '--ignored']) || await git(w.path, ['symbolic-ref', '-q', 'HEAD']) !== w.branch) throw new Error('Workspace changed during retirement; nothing removed');
+    if (remove) {
+      // Git refuses dirty/locked worktrees. Keep a permanent ref and compare-delete the branch.
+      if (w.path === dirname(w.repo)) throw new Error('The main checkout cannot be removed');
+      await git(cwd, ['worktree', 'remove', w.path]);
+      if ((await git(cwd, ['worktree', 'list', '--porcelain'])).includes(`branch ${w.branch}\n`)) throw new Error('Branch is still checked out; reference retained');
+      await git(cwd, ['update-ref', '-d', w.branch, tip]);
+    }
+    return this.transaction(() => {
+      this.db.prepare("UPDATE handoff_workspaces SET state='retired' WHERE id=? AND state='active'").run(id);
+      this.event(id, actor, 'retire', { tip, removed: remove });
+      return this.read(id, actor);
+    });
+  }
+}

@@ -29,6 +29,11 @@ export function taskLines(task: HandoffTask | TaskSummary, expanded: boolean, th
     if ("body" in task) lines.push(...task.body.split("\n").map((line) => `  ${plain(line)}`));
     lines.push(...task.items.map((item, index) => `  [${item.checked ? "✓" : " "}] ${index + 1}. ${plain(item.text)}`));
     if (task.commit) lines.push(`  commit: ${task.commit}`);
+    if (task.delivery) {
+      lines.push(`  固定交付: ${task.delivery.id}`);
+      lines.push(`  范围: ${task.delivery.base.slice(0, 12)}..${task.delivery.tip.slice(0, 12)} · ${task.delivery.commits.length} 个提交`);
+      lines.push(`  摘要: ${task.delivery.digest}`);
+    }
     if (task.requiresIntegration) lines.push("  集成要求: 审查通过后合入并推送 origin/main，再关闭任务");
     if (task.integration) {
       lines.push(`  集成状态: ${task.integration.state} · ${plain(task.integration.note)}`);

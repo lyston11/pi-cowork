@@ -1,4 +1,5 @@
 import { initializeIntegration } from "./integration-store.ts";
+import { initializeWorkspaces } from "./workspaces.ts";
 import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
@@ -77,6 +78,20 @@ export class HandoffStore {
           reason TEXT NOT NULL,
           at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS handoff_side_removals (
+          side_id TEXT PRIMARY KEY REFERENCES handoff_sides(id),
+          session_id TEXT NOT NULL,
+          actor TEXT NOT NULL REFERENCES handoff_sides(id),
+          reason TEXT NOT NULL,
+          at TEXT NOT NULL
+        );
+        ${immutable("handoff_side_removals")}
+        CREATE TRIGGER IF NOT EXISTS handoff_removed_side_update BEFORE UPDATE ON handoff_sides
+          WHEN EXISTS(SELECT 1 FROM handoff_side_removals WHERE side_id=OLD.id)
+          BEGIN SELECT RAISE(ABORT,'Side was removed; it cannot register again'); END;
+        CREATE TRIGGER IF NOT EXISTS handoff_removed_side_insert BEFORE INSERT ON handoff_sides
+          WHEN EXISTS(SELECT 1 FROM handoff_side_removals WHERE side_id=NEW.id)
+          BEGIN SELECT RAISE(ABORT,'Side was removed; it cannot register again'); END;
         CREATE TRIGGER IF NOT EXISTS handoff_side_owner_guard BEFORE UPDATE ON handoff_sides
           WHEN EXISTS(SELECT 1 FROM handoff_side_bindings b WHERE b.side_id=OLD.id
             AND (b.session_id IS NULL OR b.session_id<>NEW.session_id))
@@ -106,11 +121,18 @@ export class HandoffStore {
         CREATE INDEX IF NOT EXISTS handoff_tasks_creator ON handoff_tasks(creator,id);
         CREATE INDEX IF NOT EXISTS handoff_tasks_assignee ON handoff_tasks(assignee,id);
         CREATE INDEX IF NOT EXISTS handoff_task_history ON handoff_task_events(task_id,seq);
+        CREATE TRIGGER IF NOT EXISTS handoff_removed_side_task BEFORE INSERT ON handoff_tasks
+          WHEN EXISTS(SELECT 1 FROM handoff_side_removals WHERE side_id IN (NEW.creator,NEW.assignee))
+          BEGIN SELECT RAISE(ABORT,'Removed sides cannot send or receive tasks'); END;
+        CREATE TRIGGER IF NOT EXISTS handoff_removed_side_event BEFORE INSERT ON handoff_task_events
+          WHEN EXISTS(SELECT 1 FROM handoff_side_removals WHERE side_id=NEW.actor)
+            OR EXISTS(SELECT 1 FROM handoff_tasks t JOIN handoff_side_removals r ON r.side_id IN (t.creator,t.assignee) WHERE t.id=NEW.task_id)
+          BEGIN SELECT RAISE(ABORT,'Removed sides cannot change task history'); END;
         ${immutable("handoff_tasks")}
         ${immutable("handoff_task_events")}
       `);
       this.initializeResume();
-      this.transaction(() => initializeIntegration(this.db));
+      this.transaction(() => { initializeWorkspaces(this.db); initializeIntegration(this.db); });
     } catch (error) {
       this.db.close();
       throw error;
@@ -184,6 +206,7 @@ export class HandoffStore {
 
   acquireResume(actor: string, sessionId: string, consumer: string, now = Date.now()): boolean {
     return this.transaction(() => {
+      if (this.db.prepare('SELECT 1 FROM handoff_side_removals WHERE side_id=?').get(actor)) return false;
       if (!this.db.prepare("SELECT 1 FROM handoff_sides WHERE id=? AND session_id=?").get(actor, sessionId)) return false;
       this.db.prepare("INSERT OR IGNORE INTO handoff_resume_state(side_id) VALUES(?)").run(actor);
       return this.db.prepare(`UPDATE handoff_resume_state SET consumer=?,lease_until=? WHERE side_id=? AND enabled=1
@@ -281,6 +304,7 @@ export class HandoffStore {
 
   setResumeEnabled(actor: string, enabled: boolean, reason: string | null = null): void {
     this.transaction(() => {
+      if (enabled && this.db.prepare('SELECT 1 FROM handoff_side_removals WHERE side_id=?').get(actor)) throw new Error('Side was removed; start a new Pi session to join again');
       const previous = this.db.prepare("SELECT enabled FROM handoff_resume_state WHERE side_id=?").get(actor);
       this.db.prepare(`INSERT INTO handoff_resume_state(side_id,enabled,reason) VALUES(?,?,?)
         ON CONFLICT(side_id) DO UPDATE SET enabled=excluded.enabled,reason=excluded.reason`).run(actor, Number(enabled), reason);
@@ -336,11 +360,11 @@ export class HandoffStore {
 
   sessionSide(sessionId: string): Side | undefined {
     const binding = this.db.prepare("SELECT side_id FROM handoff_side_bindings WHERE session_id=?").get(sessionId);
-    if (binding) return this.sides().find((side) => side.id === binding.side_id);
+    if (binding) return this.sides(true).find((side) => side.id === binding.side_id);
     if (this.db.prepare("SELECT 1 FROM handoff_side_transfers WHERE from_session=? LIMIT 1").get(sessionId)) {
       throw new Error("This session was replaced by a handoff takeover. It cannot reclaim the old side.");
     }
-    return this.sides().find((side) => side.sessionId === sessionId);
+    return this.sides(true).find((side) => side.sessionId === sessionId);
   }
 
   takeover(actor: Side, targetId: string, expectedSessionId: string, reason: string): Side {
@@ -372,12 +396,39 @@ export class HandoffStore {
     });
   }
 
-  sides(): Side[] {
-    return this.db.prepare(`SELECT * FROM handoff_sides s WHERE NOT EXISTS(
+  removeSide(actor: Side, targetId: string, expectedSessionId: string, reason: string): Side {
+    text(targetId, 'Side id', 256); text(expectedSessionId, 'Expected session id', 256); text(reason, 'Removal reason', 2000);
+    return this.transaction(() => {
+      const current = this.sides().find(side => side.id === actor.id);
+      if (!current || current.sessionId !== actor.sessionId) throw new Error('Current side ownership has changed');
+      const target = this.sides().find(side => side.id === targetId);
+      if (!target) throw new Error('Side not found; read cowork_sides again');
+      if (target.sessionId !== expectedSessionId) throw new Error('Side ownership changed; read cowork_sides again');
+      if (this.list(target.id, { activeOnly: true, limit: 1 }).tasks.length) throw new Error('Side still has unclosed sent or received tasks; finish their review first');
+      if (this.db.prepare("SELECT 1 FROM handoff_workspaces WHERE owner=? AND state='active' LIMIT 1").get(target.id)) throw new Error('Side still owns an active workspace; reconcile and safely retire it before removing the side');
+      const state = this.db.prepare('SELECT enabled,consumer,lease_until FROM handoff_resume_state WHERE side_id=?').get(target.id);
+      if (target.id === actor.id) {
+        if (target.pid !== actor.pid || target.pid !== process.pid) throw new Error('Current side is being used by another process');
+        if (!state || state.enabled) throw new Error('Pause this side with /cowork auto off before removing it');
+      } else {
+        try { process.kill(target.pid, 0); throw new Error('Side process is still running; stop it or remove the current side from its own Pi'); }
+        catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error; }
+      }
+      if (state?.consumer && Number(state.lease_until) > Date.now()) throw new Error('Side still has a resume consumer; wait for it to stop before removal');
+      const at = new Date().toISOString();
+      this.db.prepare('INSERT INTO handoff_side_removals(side_id,session_id,actor,reason,at) VALUES(?,?,?,?,?)').run(target.id, target.sessionId, actor.id, reason, at);
+      this.db.prepare("INSERT INTO handoff_resume_state(side_id,enabled,reason) VALUES(?,0,?) ON CONFLICT(side_id) DO UPDATE SET enabled=0,consumer=NULL,lease_until=0,reason=excluded.reason").run(target.id, 'Side removed');
+      return { ...target, removedAt: at };
+    });
+  }
+
+  sides(includeRemoved = false): Side[] {
+    return this.db.prepare(`SELECT s.*,r.at AS removed_at FROM handoff_sides s LEFT JOIN handoff_side_removals r ON r.side_id=s.id WHERE (? OR r.side_id IS NULL) AND NOT EXISTS(
       SELECT 1 FROM handoff_side_bindings b WHERE b.side_id=s.id AND b.session_id IS NULL
-    ) ORDER BY name,id`).all().map((row) => ({
+    ) ORDER BY name,id`).all(Number(includeRemoved)).map((row) => ({
       id: String(row.id), name: String(row.name), sessionId: String(row.session_id),
       pid: Number(row.pid), worktree: String(row.worktree), branch: String(row.branch),
+      ...(row.removed_at ? { removedAt: String(row.removed_at) } : {}),
     }));
   }
 
@@ -419,7 +470,7 @@ export class HandoffStore {
     return this.taskFromRow(row);
   }
 
-  private taskFromRow(row: Record<string, unknown>, sides = this.sides(), eventSeq = Number.MAX_SAFE_INTEGER): HandoffTask {
+  private taskFromRow(row: Record<string, unknown>, sides = this.sides(true), eventSeq = Number.MAX_SAFE_INTEGER): HandoffTask {
     const task: HandoffTask = {
       id: Number(row.id), creator: sides.find((side) => side.id === row.creator)!,
       assignee: sides.find((side) => side.id === row.assignee)!, subject: String(row.subject), body: String(row.body),
@@ -443,15 +494,21 @@ export class HandoffStore {
       if (event.kind === "unblock") task.block = null;
       if (event.kind === "complete") {
         task.block = null;
+        task.deliveryId = event.data.deliveryId ? String(event.data.deliveryId) : undefined;
         task.state = "completed"; task.commit = String(event.data.commit); task.summary = String(event.data.summary);
       }
       if (event.kind === "close") { task.state = "closed"; task.reviewNote = String(event.data.note); }
       if (event.kind === "integration") { task.integration = event.data as unknown as HandoffTask["integration"]; task.requiresIntegration = true; }
       if (event.kind === "reopen") {
-        task.integration = null;
+        task.integration = null; task.deliveryId = undefined;
         task.state = "open"; task.block = null; task.commit = null; task.summary = null; task.reviewNote = null;
         task.items.forEach((item) => { item.checked = false; });
       }
+    }
+    if (task.deliveryId) {
+      const d = this.db.prepare('SELECT * FROM handoff_deliveries WHERE id=?').get(task.deliveryId);
+      if (!d) throw new Error('Delivery snapshot is missing; preserve the task for reconciliation');
+      task.delivery = { id: String(d.id), workspaceId: String(d.workspace_id), base: String(d.base), tip: String(d.tip), tree: String(d.tree), commits: JSON.parse(String(d.commits_json)), files: JSON.parse(String(d.files_json)), digest: String(d.digest) };
     }
     if (task.block) task.block.needsReview = !!this.db.prepare(`SELECT 1 FROM handoff_task_dependencies d
       JOIN handoff_task_events e ON e.task_id=d.dependency_id
@@ -511,7 +568,7 @@ export class HandoffStore {
     const cursor = after === 0 ? -1 : snapshot.ids.indexOf(after);
     if (after !== 0 && cursor === -1) throw new Error("Unknown task cursor; refresh the panel");
     const ids = snapshot.ids.slice(cursor + 1, cursor + 1 + limit);
-    const sides = ids.length ? this.sides() : [];
+    const sides = ids.length ? this.sides(true) : [];
     const rows = ids.length ? this.db.prepare(`SELECT * FROM handoff_tasks WHERE id IN (${ids.map(() => "?").join(",")})`).all(...ids) : [];
     const byId = new Map(rows.map((row) => [Number(row.id), row]));
     const tasks = ids.map((id) => this.taskFromRow(byId.get(id)!, sides, snapshot.eventSeq));
@@ -577,14 +634,18 @@ export class HandoffStore {
     });
   }
 
-  complete(id: number, actor: string, commit: string, summary: string): HandoffTask {
+  complete(id: number, actor: string, commit: string, summary: string, deliveryId?: string): HandoffTask {
     text(summary, "Completion summary", 4000);
     if (!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(commit)) throw new Error("A full Git commit hash is required");
-    return this.update(id, actor, "complete", { commit, summary }, (task) => {
+    return this.update(id, actor, "complete", { commit, summary, ...(deliveryId ? { deliveryId } : {}) }, (task) => {
       if (task.assignee.id !== actor) throw new Error("Only the assignee can complete this task");
       if (task.state === "completed" && task.commit === commit && task.summary === summary) return false;
       if (task.state !== "open" || task.items.some((item) => !item.checked)) throw new Error("Check every item before completing an open task");
       if (task.block) throw new Error("Recheck dependencies and unblock the task before completing it");
+      if (deliveryId) {
+        const delivery = this.db.prepare('SELECT d.tip,w.owner FROM handoff_deliveries d JOIN handoff_workspaces w ON w.id=d.workspace_id WHERE d.id=?').get(deliveryId);
+        if (!delivery || delivery.tip !== commit || delivery.owner !== actor) throw new Error('Delivery snapshot must match this side and commit');
+      }
       return true;
     });
   }
