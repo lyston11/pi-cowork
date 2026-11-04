@@ -33,7 +33,7 @@ test("tool boundary binds identity to session, never accepts an actor from argum
     const a = (await execute("one", "handoff_identity", { name: "project lead" })).details.self;
     const b = (await execute("two", "handoff_identity", { name: "data" })).details.self;
     await execute("three", "handoff_identity", { name: "frontend" });
-    const created = await execute("one", "handoff_create", { to: b.id, subject: "secret", body: "PRIVATE-TEXT", items: ["done"] });
+    const created = await execute("one", "handoff_create", { to: b.id, subject: "secret", body: "PRIVATE-TEXT", items: ["done"], requiresIntegration: false });
     const id = created.details.task.id;
     await assert.rejects(execute("one", "handoff_block", { id, reason: "approval", waitingFor: "reviewer" }), /Only the assignee/);
     await execute("two", "handoff_block", { id, reason: "approval then continue", waitingFor: "reviewer", dependencies: [] });
@@ -76,7 +76,7 @@ test("tool boundary binds identity to session, never accepts an actor from argum
         panel.handleInput("\t");
         assert.match(render(), /全项目/);
         assert.doesNotMatch(render(), /PRIVATE-TEXT/);
-        for (let i = 0; i < 32; i++) await execute("one", "handoff_create", { to: b.id, subject: `任务 ${i}`, body: Array.from({ length: 40 }, (_, line) => `DETAIL-${line}`).join("\n"), items: ["最后一项"] });
+        for (let i = 0; i < 32; i++) await execute("one", "handoff_create", { to: b.id, subject: `任务 ${i}`, body: Array.from({ length: 40 }, (_, line) => `DETAIL-${line}`).join("\n"), items: ["最后一项"], requiresIntegration: false });
         panel.handleInput("r");
         const frame = panel.render(80);
         assert.equal(frame.length, Math.floor(terminal.rows * 0.6));

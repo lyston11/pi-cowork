@@ -1,3 +1,4 @@
+import { initializeIntegration } from "./integration-store.ts";
 import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
@@ -32,7 +33,7 @@ export interface HumanTaskSnapshot {
 export interface ResumeEvent {
   seq: number;
   taskId: number;
-  kind: "created" | "complete" | "reopen" | "close" | "dependency" | "checkpoint";
+  kind: "created" | "complete" | "reopen" | "close" | "dependency" | "checkpoint" | "integration";
 }
 
 export interface ResumeBatch {
@@ -109,6 +110,7 @@ export class HandoffStore {
         ${immutable("handoff_task_events")}
       `);
       this.initializeResume();
+      this.transaction(() => initializeIntegration(this.db));
     } catch (error) {
       this.db.close();
       throw error;
@@ -198,7 +200,7 @@ export class HandoffStore {
         const page = this.list(actor, { activeOnly: true, limit: 100, before });
         for (const task of page.tasks) {
           const needsWork = task.assignee.id === actor && task.state === "open" && (!task.block || task.block.needsReview)
-            || task.creator.id === actor && task.state === "completed";
+            || task.creator.id === actor && task.state === "completed" && task.integration?.state !== "queued" && task.integration?.state !== "running";
           if (!needsWork) continue;
           const ids = [task.id, ...(task.block?.dependencies ?? [])];
           const version = Number(this.db.prepare(
@@ -227,7 +229,7 @@ export class HandoffStore {
     const events = new Map<number, ResumeEvent>();
     for (const row of rows) {
       const kind = row.kind as ResumeEvent["kind"];
-      let relevant = kind === "complete" ? row.current_kind === "complete"
+      let relevant = kind === "complete" || kind === "integration" ? row.current_kind === "complete"
         : kind === "close" ? row.current_kind === "close" : row.current_kind === null || row.current_kind === "reopen";
       if (String(row.source).startsWith("task:") && row.current_seq !== null) relevant = false;
       if (String(row.source).startsWith("event:") && row.source !== `event:${row.current_seq}`) relevant = false;
@@ -249,7 +251,12 @@ export class HandoffStore {
       if (kind === "checkpoint") {
         const task = this.read(Number(row.task_id), actor);
         relevant = task.assignee.id === actor && task.state === "open" && (!task.block || task.block.needsReview)
-          || task.creator.id === actor && task.state === "completed";
+          || task.creator.id === actor && task.state === "completed" && task.integration?.state !== "queued" && task.integration?.state !== "running";
+      }
+      if (relevant && (kind === "complete" || kind === "integration")) {
+        const task = this.read(Number(row.task_id), actor);
+        if (task.integration?.state === "queued" || task.integration?.state === "running") relevant = false;
+        if (kind === "integration" && row.source !== `integration:${task.events.findLast(event => event.kind === "integration")?.seq}`) relevant = false;
       }
       if (relevant && (kind === "created" || kind === "reopen")) {
         const task = this.read(Number(row.task_id), actor);
@@ -382,13 +389,15 @@ export class HandoffStore {
     const items = input.items.map((item) => text(item, "Checklist item", 1000));
     if (input.refs !== undefined && (!Array.isArray(input.refs) || input.refs.length > 20)) throw new Error("At most 20 references are allowed");
     const refs = (input.refs ?? []).map((ref) => text(ref, "Reference", 512));
+    if (input.requiresIntegration !== undefined && typeof input.requiresIntegration !== "boolean") throw new Error("requiresIntegration must be boolean");
+    const requiresIntegration = input.requiresIntegration ?? false;
     const key = input.idempotencyKey === undefined ? null : text(input.idempotencyKey, "Idempotency key", 160);
     return this.transaction(() => {
       const matches = this.sides().filter((side) => side.id === to || side.name === to);
       if (matches.length !== 1) throw new Error("Assignee not found or name is ambiguous; use an id from handoff_sides");
       const assignee = matches[0].id;
       if (assignee === actor) throw new Error("Assign the handoff to another side");
-      const hash = createHash("sha256").update(JSON.stringify({ assignee, subject, body, items, refs })).digest("hex");
+      const hash = createHash("sha256").update(JSON.stringify({ assignee, subject, body, items, refs, ...(requiresIntegration ? { requiresIntegration } : {}) })).digest("hex");
       if (key !== null) {
         const existing = this.db.prepare("SELECT id,payload_hash FROM handoff_tasks WHERE creator=? AND idempotency_key=?").get(actor, key);
         if (existing) {
@@ -397,8 +406,8 @@ export class HandoffStore {
         }
       }
       const result = this.db.prepare(`INSERT INTO handoff_tasks(
-        creator,assignee,subject,body,items_json,refs_json,created_at,idempotency_key,payload_hash
-      ) VALUES(?,?,?,?,?,?,?,?,?)`).run(actor, assignee, subject, body, JSON.stringify(items), JSON.stringify(refs), new Date().toISOString(), key, hash);
+        creator,assignee,subject,body,items_json,refs_json,created_at,idempotency_key,payload_hash,requires_integration
+      ) VALUES(?,?,?,?,?,?,?,?,?,?)`).run(actor, assignee, subject, body, JSON.stringify(items), JSON.stringify(refs), new Date().toISOString(), key, hash, Number(requiresIntegration));
       return this.read(Number(result.lastInsertRowid), actor);
     });
   }
@@ -415,7 +424,7 @@ export class HandoffStore {
       id: Number(row.id), creator: sides.find((side) => side.id === row.creator)!,
       assignee: sides.find((side) => side.id === row.assignee)!, subject: String(row.subject), body: String(row.body),
       refs: JSON.parse(String(row.refs_json)), items: (JSON.parse(String(row.items_json)) as string[]).map((value) => ({ text: value, checked: false })),
-      state: "open", block: null, commit: null, summary: null, reviewNote: null, createdAt: String(row.created_at),
+      state: "open", block: null, commit: null, summary: null, reviewNote: null, requiresIntegration: !!row.requires_integration, integration: null, createdAt: String(row.created_at),
       events: this.db.prepare("SELECT * FROM handoff_task_events WHERE task_id=? AND seq<=? ORDER BY seq").all(Number(row.id), eventSeq).map((event) => ({
         seq: Number(event.seq), actor: String(event.actor), kind: String(event.kind) as TaskEvent["kind"], data: JSON.parse(String(event.data_json)), at: String(event.at),
       })),
@@ -437,7 +446,9 @@ export class HandoffStore {
         task.state = "completed"; task.commit = String(event.data.commit); task.summary = String(event.data.summary);
       }
       if (event.kind === "close") { task.state = "closed"; task.reviewNote = String(event.data.note); }
+      if (event.kind === "integration") { task.integration = event.data as unknown as HandoffTask["integration"]; task.requiresIntegration = true; }
       if (event.kind === "reopen") {
+        task.integration = null;
         task.state = "open"; task.block = null; task.commit = null; task.summary = null; task.reviewNote = null;
         task.items.forEach((item) => { item.checked = false; });
       }
@@ -580,11 +591,17 @@ export class HandoffStore {
 
   closeTask(id: number, actor: string, reviewedCommit: string, note: string): HandoffTask {
     text(note, "Review note", 4000);
-    return this.update(id, actor, "close", { commit: reviewedCommit, note }, (task) => {
+    const data: Record<string, unknown> = { commit: reviewedCommit, note };
+    return this.update(id, actor, "close", data, (task) => {
       if (task.creator.id !== actor) throw new Error("Only the creator can close this task");
       if (task.commit !== reviewedCommit) throw new Error("Reviewed commit must match the completed commit");
       if (task.state === "closed") return false;
       if (task.state !== "completed") throw new Error("The assignee must complete the task before review closure");
+      if (task.requiresIntegration) {
+        if (task.integration?.state !== "pushed" || task.integration.commit !== reviewedCommit || !task.integration.mainCommit) throw new Error("Integrate and push the reviewed commit before closing this code task");
+        data.mainCommit = task.integration.mainCommit;
+        data.jobId = task.integration.jobId;
+      }
       return true;
     });
   }
@@ -593,6 +610,8 @@ export class HandoffStore {
     text(note, "Return reason", 4000);
     return this.update(id, actor, "reopen", { note }, (task) => {
       if (task.creator.id !== actor || task.state !== "completed") throw new Error("Only the creator can return a completed task for changes");
+      if (task.integration?.state === "queued" || task.integration?.state === "running") throw new Error("Integration is queued/running; wait for its result before returning changes");
+      if (task.integration?.state === "pushed") throw new Error("Already integrated code requires a new corrective task, not reopening the delivered commit");
       return true;
     });
   }

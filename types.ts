@@ -1,4 +1,4 @@
-export const HANDOFF_EXTENSION_VERSION = "4.5.2";
+export const HANDOFF_EXTENSION_VERSION = "4.6.0";
 
 export interface Side {
   id: string;
@@ -20,7 +20,7 @@ export interface TaskBlock {
 export interface TaskEvent {
   seq: number;
   actor: string;
-  kind: "check" | "complete" | "close" | "reopen" | "block" | "unblock";
+  kind: "check" | "complete" | "close" | "reopen" | "block" | "unblock" | "integration";
   data: Record<string, unknown>;
   at: string;
 }
@@ -38,6 +38,8 @@ export interface HandoffTask {
   commit: string | null;
   summary: string | null;
   reviewNote: string | null;
+  requiresIntegration: boolean;
+  integration: TaskIntegration | null;
   createdAt: string;
   events: TaskEvent[];
 }
@@ -51,4 +53,28 @@ export interface CreateInput {
   items: string[];
   refs?: string[];
   idempotencyKey?: string;
+  requiresIntegration?: boolean;
+}
+
+export interface IntegrationCheck {
+  command: string;
+  args: string[];
+}
+
+export interface TaskIntegration {
+  jobId: string;
+  state: "queued" | "running" | "blocked" | "pushed";
+  commit: string;
+  mainCommit?: string;
+  note: string;
+}
+
+export interface IntegrationJob extends TaskIntegration {
+  taskId: number;
+  creator: string;
+  repo: string;
+  remoteFingerprint: string;
+  reviewedBase: string;
+  checks: IntegrationCheck[];
+  attempts: number;
 }

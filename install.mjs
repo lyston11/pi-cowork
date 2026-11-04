@@ -5,7 +5,7 @@ import { join } from "node:path";
 
 const source = import.meta.dirname;
 const destination = join(homedir(), ".pi", "agent", "extensions", "pi-handoff");
-const files = ["index.ts", "resume.ts", "channel.ts", "store.ts", "types.ts", "ui.ts", "instructions.ts", "README.md", "package.json"];
+const files = ["index.ts", "resume.ts", "channel.ts", "store.ts", "integration-store.ts", "integration.ts", "types.ts", "ui.ts", "instructions.ts", "README.md", "package.json"];
 const dependencySource = join(source, "node_modules", "typebox");
 const dependencyDestination = join(destination, "node_modules", "typebox");
 const checkOnly = process.argv.includes("--check");

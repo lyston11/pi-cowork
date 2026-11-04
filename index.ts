@@ -9,6 +9,8 @@ import { taskLines } from "./ui.ts";
 import { HANDOFF_RUNTIME_RULES, installHandoffRules } from "./instructions.ts";
 import type { HandoffTask, Side } from "./types.ts";
 import { resolveChannel } from "./channel.ts";
+import { IntegrationQueue } from "./integration-store.ts";
+import { IntegrationWorker, integrationRepository, verifyPushedIntegration } from "./integration.ts";
 import { EventResume } from "./resume.ts";
 export { resolveChannel } from "./channel.ts";
 
@@ -27,7 +29,15 @@ export default function piHandoff(pi: ExtensionAPI): void {
   const channel = resolveChannel(cwd);
   let store: HandoffStore | undefined;
   let resume: EventResume | undefined;
+  let integrationWorker: IntegrationWorker | undefined;
   const board = () => store ??= new HandoffStore(channel.rootDir);
+  const startIntegration = () => {
+    if (integrationWorker) return integrationWorker;
+    const { repo } = integrationRepository(cwd);
+    integrationWorker = new IntegrationWorker(board(), repo);
+    integrationWorker.start();
+    return integrationWorker;
+  };
 
   const identity = (ctx: ExtensionContext): Side => {
     const sessionId = ctx.sessionManager.getSessionId();
@@ -58,8 +68,8 @@ export default function piHandoff(pi: ExtensionAPI): void {
       resume.start();
     }
   };
-  pi.on("session_start", (_event, ctx) => { startResume(ctx); });
-  pi.on("session_shutdown", () => { resume?.stop(); resume = undefined; store?.close(); store = undefined; });
+  pi.on("session_start", (_event, ctx) => { startResume(ctx); try { startIntegration(); } catch { /* No origin: handoffs still work without integration. */ } });
+  pi.on("session_shutdown", async () => { resume?.stop(); resume = undefined; await integrationWorker?.stop(); integrationWorker = undefined; store?.close(); store = undefined; });
   pi.on("agent_start", () => { resume?.runStarted(); });
   pi.on("message_end", (event) => { resume?.observeMessage(event.message); });
   pi.on("agent_settled", (event) => { resume?.settled(event.aborted); });
@@ -132,16 +142,17 @@ export default function piHandoff(pi: ExtensionAPI): void {
 
   pi.registerTool({
     name: "handoff_create", label: "Assign a handoff task",
-    description: "Create a checklist task for one side from handoff_sides. Only this creator and that assignee may list or read it. Tasks persist independently of Git and process lifetime. A durable event resumes the assignee's live Pi within existing authorization.",
+    description: "Create a checklist task for one side from handoff_sides. Only this creator and that assignee may list or read it. Code deliveries default to requiring reviewed integration and push before closure; set requiresIntegration=false only for review/material tasks that need no merge. A durable event resumes the assignee's live Pi within existing authorization.",
     parameters: Type.Object({
       to: Type.String({ minLength: 1, maxLength: 256 }), subject: Type.String({ minLength: 1, maxLength: 160 }),
       body: Type.String({ minLength: 1, maxLength: 16000 }),
       items: Type.Array(Type.String({ minLength: 1, maxLength: 1000 }), { minItems: 1, maxItems: 50 }),
       refs: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 512 }), { maxItems: 20 })),
       idempotencyKey: Type.Optional(Type.String({ minLength: 1, maxLength: 160 })),
+      requiresIntegration: Type.Optional(Type.Boolean({ description: "Defaults to true for code delivery. Set false only for a review/material task that does not require merging." })),
     }),
     async execute(_id, input, _signal, _update, ctx) {
-      return toolResult({ task: board().create(input, identity(ctx).id) });
+      return toolResult({ task: board().create({ ...input, requiresIntegration: input.requiresIntegration ?? true }, identity(ctx).id) });
     }, renderResult,
   });
 
@@ -203,19 +214,45 @@ export default function piHandoff(pi: ExtensionAPI): void {
   });
 
   pi.registerTool({
+    name: "handoff_integrate", label: "Queue reviewed code for main integration",
+    description: "Creator only: after actually reviewing the entire delivered range and obtaining project merge/push authorization, queue the exact completed commit for serial integration into origin/main. Provide the reviewed base and real integration checks. Runs asynchronously in an isolated worktree. Conflict/check/push failures are recorded; never force pushes. It does not close the task. Use handoff_read for result; explicitly retry only after resolving a blocker.",
+    parameters: Type.Object({ id: idSchema, commit: Type.String({ minLength: 7, maxLength: 64 }),
+      reviewedBase: Type.String({ minLength: 7, maxLength: 64 }), note: Type.String({ minLength: 1, maxLength: 4000 }),
+      checks: Type.Array(Type.Object({ command: Type.String({ minLength: 1, maxLength: 512 }), args: Type.Array(Type.String({ maxLength: 4096 }), { maxItems: 100 }) }), { minItems: 1, maxItems: 10 }),
+      retry: Type.Optional(Type.Boolean()) }),
+    async execute(_id, input, _signal, _update, ctx) {
+      const actor = identity(ctx).id;
+      const repository = integrationRepository(cwd);
+      const queue = new IntegrationQueue(board());
+      try {
+        const job = queue.enqueue({ taskId: input.id, actor, commit: commitHash(input.commit), reviewedBase: commitHash(input.reviewedBase),
+          repo: repository.repo, remoteFingerprint: repository.fingerprint, checks: input.checks, note: input.note, retry: input.retry });
+        startIntegration();
+        return toolResult({ job, task: board().read(input.id, actor) });
+      } finally { queue.close(); }
+    }, renderResult,
+  });
+
+  pi.registerTool({
     name: "handoff_close", label: "Accept and close a handoff",
-    description: "Creator only: after reviewing the submitted commit, close the task with the same commit hash and review note. It remains in history, dim and struck through. No task is physically deleted.",
+    description: "Creator only: after actual review, close with the delivered commit and review note. Code tasks must first finish handoff_integrate; this tool rechecks origin/main and records mainCommit automatically. Queued, running or blocked integrations cannot close. Closed tasks remain in history, dim and struck through.",
     parameters: Type.Object({ id: idSchema, commit: Type.String({ minLength: 7, maxLength: 64 }), note: Type.String({ minLength: 1, maxLength: 4000 }) }),
     async execute(_id, input, _signal, _update, ctx) {
       const actor = identity(ctx).id;
-      board().read(input.id, actor);
+      const task = board().read(input.id, actor);
+      if (task.creator.id !== actor) throw new Error("Only the creator can close this task");
+      if (task.requiresIntegration) {
+        if (task.integration?.state !== "pushed") throw new Error("Queue and push the reviewed integration before closing this code task");
+        const queue = new IntegrationQueue(board());
+        try { verifyPushedIntegration(cwd, queue.read(task.integration.jobId)); } finally { queue.close(); }
+      }
       return toolResult({ task: board().closeTask(input.id, actor, commitHash(input.commit), input.note) });
     }, renderResult,
   });
 
   pi.registerTool({
     name: "handoff_reopen", label: "Return a handoff for changes",
-    description: "Creator only: return a completed task with a reason. The checklist resets for the next attempt; previous checks, commits and review events stay in history.",
+    description: "Creator only: return a completed task with a reason. Cannot return queued/running or pushed integrations; wait for queued work, and correct already merged code with a new task. The checklist resets for the next attempt; previous commits and review events stay in history.",
     parameters: Type.Object({ id: idSchema, note: Type.String({ minLength: 1, maxLength: 4000 }) }),
     async execute(_id, input, _signal, _update, ctx) { return toolResult({ task: board().reopen(input.id, identity(ctx).id, input.note) }); }, renderResult,
   });
