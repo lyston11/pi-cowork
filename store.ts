@@ -32,7 +32,7 @@ export interface HumanTaskSnapshot {
 export interface ResumeEvent {
   seq: number;
   taskId: number;
-  kind: "created" | "complete" | "reopen" | "close";
+  kind: "created" | "complete" | "reopen" | "close" | "dependency";
 }
 
 export interface ResumeBatch {
@@ -144,6 +144,28 @@ export class HandoffStore {
             SELECT CASE NEW.kind WHEN 'complete' THEN creator ELSE assignee END,
               NEW.task_id,NEW.kind,'event:'||NEW.seq FROM handoff_tasks WHERE id=NEW.task_id; END;
         ${immutable("handoff_resume_events")}
+        CREATE TABLE IF NOT EXISTS handoff_task_dependencies (
+          block_seq INTEGER NOT NULL REFERENCES handoff_task_events(seq),
+          task_id INTEGER NOT NULL REFERENCES handoff_tasks(id),
+          dependency_id INTEGER NOT NULL REFERENCES handoff_tasks(id),
+          observed_seq INTEGER NOT NULL,
+          PRIMARY KEY(block_seq, dependency_id)
+        );
+        CREATE INDEX IF NOT EXISTS handoff_dependency_target ON handoff_task_dependencies(dependency_id);
+        ${immutable("handoff_task_dependencies")}
+        CREATE TRIGGER IF NOT EXISTS handoff_dependency_index AFTER INSERT ON handoff_task_events
+          WHEN NEW.kind='block'
+          BEGIN INSERT INTO handoff_task_dependencies(block_seq,task_id,dependency_id,observed_seq)
+            SELECT NEW.seq,NEW.task_id,json_extract(value,'$.id'),json_extract(value,'$.seq')
+            FROM json_each(NEW.data_json,'$.dependencies'); END;
+        CREATE TRIGGER IF NOT EXISTS handoff_resume_dependency AFTER INSERT ON handoff_task_events
+          WHEN NEW.kind IN ('complete','reopen','close')
+          BEGIN INSERT INTO handoff_resume_events(recipient,task_id,kind,source)
+            SELECT t.assignee,d.task_id,'dependency','dependency:'||NEW.seq||':'||d.block_seq
+            FROM handoff_task_dependencies d JOIN handoff_tasks t ON t.id=d.task_id
+            WHERE d.dependency_id=NEW.task_id AND NEW.seq>d.observed_seq
+              AND d.block_seq=(SELECT seq FROM handoff_task_events WHERE task_id=d.task_id
+                AND kind IN ('block','unblock','complete','close','reopen') ORDER BY seq DESC LIMIT 1); END;
       `);
       // Bootstrap old clients' records once. Triggers also cover writes by Pi
       // processes still running an earlier extension version.
@@ -190,6 +212,17 @@ export class HandoffStore {
           (assignee=? AND COALESCE((SELECT kind FROM handoff_task_events WHERE task_id=t.id AND kind IN ('complete','close','reopen') ORDER BY seq DESC LIMIT 1),'reopen')='reopen')
           OR (creator=? AND (SELECT kind FROM handoff_task_events WHERE task_id=t.id AND kind IN ('complete','close','reopen') ORDER BY seq DESC LIMIT 1)='complete') LIMIT 1`).get(actor, actor);
         relevant = hasWork;
+      }
+      if (relevant && kind === "dependency") {
+        // Only a dependency of the current blocking record can request recheck.
+        relevant = !!this.db.prepare(`SELECT 1 FROM handoff_task_dependencies d
+          WHERE d.task_id=? AND ? LIKE 'dependency:%:'||d.block_seq
+            AND d.block_seq=(SELECT seq FROM handoff_task_events WHERE task_id=d.task_id
+              AND kind IN ('block','unblock','complete','close','reopen') ORDER BY seq DESC LIMIT 1)`).get(row.task_id, row.source);
+      }
+      if (relevant && (kind === "created" || kind === "reopen")) {
+        const task = this.read(Number(row.task_id), actor);
+        if (task.block && !task.block.needsReview) relevant = false;
       }
       if (relevant) events.set(Number(row.task_id), { seq: Number(row.seq), taskId: Number(row.task_id), kind });
     }
@@ -351,22 +384,37 @@ export class HandoffStore {
       id: Number(row.id), creator: sides.find((side) => side.id === row.creator)!,
       assignee: sides.find((side) => side.id === row.assignee)!, subject: String(row.subject), body: String(row.body),
       refs: JSON.parse(String(row.refs_json)), items: (JSON.parse(String(row.items_json)) as string[]).map((value) => ({ text: value, checked: false })),
-      state: "open", commit: null, summary: null, reviewNote: null, createdAt: String(row.created_at),
+      state: "open", block: null, commit: null, summary: null, reviewNote: null, createdAt: String(row.created_at),
       events: this.db.prepare("SELECT * FROM handoff_task_events WHERE task_id=? AND seq<=? ORDER BY seq").all(Number(row.id), eventSeq).map((event) => ({
         seq: Number(event.seq), actor: String(event.actor), kind: String(event.kind) as TaskEvent["kind"], data: JSON.parse(String(event.data_json)), at: String(event.at),
       })),
     };
+    let blockSeq = 0;
     for (const event of task.events) {
       if (event.kind === "check") task.items[Number(event.data.item) - 1].checked = event.data.checked === true;
+      if (event.kind === "block") {
+        blockSeq = event.seq;
+        task.block = {
+          reason: String(event.data.reason), waitingFor: String(event.data.waitingFor),
+          dependencies: (event.data.dependencies as { id: number }[]).map((dependency) => dependency.id),
+          needsReview: false,
+        };
+      }
+      if (event.kind === "unblock") task.block = null;
       if (event.kind === "complete") {
+        task.block = null;
         task.state = "completed"; task.commit = String(event.data.commit); task.summary = String(event.data.summary);
       }
       if (event.kind === "close") { task.state = "closed"; task.reviewNote = String(event.data.note); }
       if (event.kind === "reopen") {
-        task.state = "open"; task.commit = null; task.summary = null; task.reviewNote = null;
+        task.state = "open"; task.block = null; task.commit = null; task.summary = null; task.reviewNote = null;
         task.items.forEach((item) => { item.checked = false; });
       }
     }
+    if (task.block) task.block.needsReview = !!this.db.prepare(`SELECT 1 FROM handoff_task_dependencies d
+      JOIN handoff_task_events e ON e.task_id=d.dependency_id
+      WHERE d.block_seq=? AND e.seq>d.observed_seq AND e.seq<=?
+        AND e.kind IN ('complete','close','reopen') LIMIT 1`).get(blockSeq, eventSeq);
     return task;
   }
 
@@ -401,13 +449,18 @@ export class HandoffStore {
       try {
         const eventSeq = Number(this.db.prepare("SELECT COALESCE(MAX(seq),0) AS seq FROM handoff_task_events").get()!.seq);
         const order = options.sort === "pending" ? "state_rank ASC,id ASC" : options.sort === "reviewed" ? "state_rank DESC,id ASC" : "id ASC";
-        const rows = this.db.prepare(`SELECT t.id, COALESCE((
-          SELECT CASE kind WHEN 'complete' THEN 1 WHEN 'close' THEN 2 ELSE 0 END
-          FROM handoff_task_events WHERE task_id=t.id AND kind IN ('complete','close','reopen')
-          ORDER BY seq DESC LIMIT 1
-        ),0) AS state_rank FROM handoff_tasks t
+        const rows = this.db.prepare(`SELECT t.id, CASE e.kind
+          WHEN 'close' THEN 3 WHEN 'complete' THEN 1 WHEN 'block' THEN
+            CASE WHEN EXISTS(SELECT 1 FROM handoff_task_dependencies d
+              JOIN handoff_task_events changed ON changed.task_id=d.dependency_id
+              WHERE d.block_seq=e.seq AND changed.seq>d.observed_seq AND changed.seq<=?
+                AND changed.kind IN ('complete','close','reopen')) THEN 0 ELSE 2 END
+          ELSE 0 END AS state_rank
+        FROM handoff_tasks t LEFT JOIN handoff_task_events e ON e.seq=(
+          SELECT seq FROM handoff_task_events WHERE task_id=t.id
+            AND kind IN ('block','unblock','complete','close','reopen') ORDER BY seq DESC LIMIT 1)
         ${options.actor === undefined ? "" : "WHERE creator=? OR assignee=?"} ORDER BY ${order}`)
-          .all(...(options.actor === undefined ? [] : [options.actor, options.actor]));
+          .all(eventSeq, ...(options.actor === undefined ? [] : [options.actor, options.actor]));
         snapshot = { ids: rows.map((row) => Number(row.id)), eventSeq, actor: options.actor };
         this.db.exec("COMMIT");
       } catch (error) { this.db.exec("ROLLBACK"); throw error; }
@@ -433,6 +486,45 @@ export class HandoffStore {
     });
   }
 
+  block(id: number, actor: string, reason: string, waitingFor: string, dependencyIds: number[] = []): HandoffTask {
+    text(reason, "Block reason and recovery condition", 2000);
+    text(waitingFor, "Waiting for", 160);
+    if (!Array.isArray(dependencyIds) || dependencyIds.length > 20) throw new Error("At most 20 dependencies are allowed");
+    dependencyIds.forEach((dependency) => integer(dependency, "dependency id", 1));
+    if (new Set(dependencyIds).size !== dependencyIds.length) throw new Error("Dependency ids must be unique");
+    return this.transaction(() => {
+      const task = this.read(id, actor);
+      if (task.assignee.id !== actor || task.state !== "open") throw new Error("Only the assignee can block an open task");
+      const dependencies = dependencyIds.map((dependency) => {
+        if (dependency === id) throw new Error("A task cannot depend on itself");
+        this.read(dependency, actor); // Never allow linking another side's private task.
+        const cycle = this.db.prepare(`WITH RECURSIVE reachable(id) AS (
+          SELECT ? UNION SELECT d.dependency_id FROM handoff_task_dependencies d JOIN reachable r ON d.task_id=r.id
+          WHERE d.block_seq=(SELECT seq FROM handoff_task_events WHERE task_id=d.task_id
+            AND kind IN ('block','unblock','complete','close','reopen') ORDER BY seq DESC LIMIT 1)
+        ) SELECT 1 FROM reachable WHERE id=? LIMIT 1`).get(dependency, id);
+        if (cycle) throw new Error("Dependency would create a cycle");
+        const latest = this.db.prepare(`SELECT COALESCE(MAX(seq),0) AS seq FROM handoff_task_events
+          WHERE task_id=? AND kind IN ('complete','close','reopen')`).get(dependency)!;
+        return { id: dependency, seq: Number(latest.seq) };
+      }).sort((a, b) => a.id - b.id);
+      const data = { reason, waitingFor, dependencies };
+      const previous = task.events.findLast((event) => event.kind === "block");
+      if (task.block && JSON.stringify(previous?.data) === JSON.stringify(data)) return task;
+      this.db.prepare("INSERT INTO handoff_task_events(task_id,actor,kind,data_json,at) VALUES(?,?,'block',?,?)")
+        .run(id, actor, JSON.stringify(data), new Date().toISOString());
+      return this.read(id, actor);
+    });
+  }
+
+  unblock(id: number, actor: string, note: string): HandoffTask {
+    text(note, "Unblock evidence", 2000);
+    return this.update(id, actor, "unblock", { note }, (task) => {
+      if (task.assignee.id !== actor || task.state !== "open") throw new Error("Only the assignee can unblock an open task");
+      return task.block !== null;
+    });
+  }
+
   check(id: number, actor: string, item: number, checked: boolean): HandoffTask {
     integer(item, "checklist item", 1);
     if (typeof checked !== "boolean") throw new Error("checked must be boolean");
@@ -450,6 +542,7 @@ export class HandoffStore {
       if (task.assignee.id !== actor) throw new Error("Only the assignee can complete this task");
       if (task.state === "completed" && task.commit === commit && task.summary === summary) return false;
       if (task.state !== "open" || task.items.some((item) => !item.checked)) throw new Error("Check every item before completing an open task");
+      if (task.block) throw new Error("Recheck dependencies and unblock the task before completing it");
       return true;
     });
   }

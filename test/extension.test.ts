@@ -35,6 +35,11 @@ test("tool boundary binds identity to session, never accepts an actor from argum
     await execute("three", "handoff_identity", { name: "frontend" });
     const created = await execute("one", "handoff_create", { to: b.id, subject: "secret", body: "PRIVATE-TEXT", items: ["done"] });
     const id = created.details.task.id;
+    await assert.rejects(execute("one", "handoff_block", { id, reason: "approval", waitingFor: "reviewer" }), /Only the assignee/);
+    await execute("two", "handoff_block", { id, reason: "approval then continue", waitingFor: "reviewer", dependencies: [] });
+    assert.equal((await execute("one", "handoff_read", { id })).details.task.block.waitingFor, "reviewer");
+    await assert.rejects(execute("three", "handoff_unblock", { id, note: "override" }), /not found or not visible/);
+    await execute("two", "handoff_unblock", { id, note: "approval verified" });
     const ownList = (await execute("three", "handoff_list", {})).details;
     assert.equal(ownList.tasks.length, 0);
     assert.equal(ownList.self.sessionId, "three");
