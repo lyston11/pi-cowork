@@ -30,6 +30,8 @@ test('side directory pages are bounded, searchable and stable across display-nam
   try {
     for (let i = 0; i < 75; i++) f.store.register({ ...A, id: `s${String(i).padStart(3, '0')}`, sessionId: `ss${i}`, name: i % 2 ? 'data' : 'frontend' });
     assert.equal(f.store.sidePage().sides.length, 30);
+    assert.equal(f.store.sidePage().total, 78);
+    assert.equal(f.store.sidePage({ after: 's070' }).total, 78);
     const found: string[] = [];
     let after: string | undefined;
     do {
@@ -43,10 +45,14 @@ test('side directory pages are bounded, searchable and stable across display-nam
     assert.equal(new Set(found).size, 78);
     const filtered = f.store.sidePage({ query: 'DATA', limit: 100 });
     assert.equal(filtered.sides.length, 37);
+    assert.equal(filtered.total, 78);
+    assert.equal(filtered.matched, 37);
+    assert.equal(f.store.sidePage({ query: 'DATA', after: 's070' }).matched, 37);
     assert(filtered.sides.every(side => side.name === 'data'));
     assert.equal(filtered.nextAfter, null);
     assert.equal(f.store.sidePage({ query: 's002' }).sides[0].name, 'renamed');
     assert.equal(f.store.sidePage({ query: 'missing' }).sides.length, 0);
+    assert.equal(f.store.sidePage({ query: 'missing' }).matched, 0);
     assert.throws(() => f.store.sidePage({ limit: 101 }), /Limit/);
     assert.throws(() => f.store.sidePage({ limit: 0 }), /limit/);
     assert.throws(() => f.store.sidePage({ query: ' ' }), /query/);

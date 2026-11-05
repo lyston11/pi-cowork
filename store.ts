@@ -479,7 +479,17 @@ export class HandoffStore {
     }));
   }
 
-  sidePage(options: { query?: string; after?: string; limit?: number } = {}): { sides: Side[]; nextAfter: string | null } {
+  sideForHumanUi(id: string) {
+    const side = this.sides().find(side => side.id === id);
+    if (!side) throw new Error('Side not found; refresh the side directory');
+    const openTasks = Number(this.db.prepare(`SELECT COUNT(*) AS total FROM handoff_tasks t
+      WHERE (creator=? OR assignee=?) AND COALESCE((SELECT kind FROM handoff_task_events
+        WHERE task_id=t.id AND kind IN ('complete','close','reopen') ORDER BY seq DESC LIMIT 1),'reopen')<>'close'`).get(id, id)!.total);
+    const workspaces = Number(this.db.prepare("SELECT COUNT(*) AS total FROM handoff_workspaces WHERE owner=? AND state='active'").get(id)!.total);
+    return { side, openTasks, workspaces, autoResume: this.resumeStatus(id) };
+  }
+
+  sidePage(options: { query?: string; after?: string; limit?: number } = {}): { sides: Side[]; nextAfter: string | null; total: number; matched: number } {
     const limit = options.limit === undefined ? 30 : integer(options.limit, 'limit', 1);
     if (limit > 100) throw new Error('Limit must not exceed 100');
     const after = options.after === undefined ? '' : text(options.after, 'after', 256);
@@ -493,7 +503,11 @@ export class HandoffStore {
     if (hasMore) rows.pop();
     const sides = rows.map(row => ({ id: String(row.id), name: String(row.name), sessionId: String(row.session_id),
       pid: Number(row.pid), worktree: String(row.worktree), branch: String(row.branch) }));
-    return { sides, nextAfter: hasMore ? sides.at(-1)!.id : null };
+    const counts = this.db.prepare(`SELECT COUNT(*) AS total,
+      COALESCE(SUM(instr(lower(s.name),lower(?))>0 OR instr(lower(s.id),lower(?))>0),0) AS matched
+      FROM handoff_sides s WHERE NOT EXISTS(SELECT 1 FROM handoff_side_removals r WHERE r.side_id=s.id)
+      AND NOT EXISTS(SELECT 1 FROM handoff_side_bindings b WHERE b.side_id=s.id AND b.session_id IS NULL)`).get(query, query)!;
+    return { sides, nextAfter: hasMore ? sides.at(-1)!.id : null, total: Number(counts.total), matched: Number(counts.matched) };
   }
 
   create(input: CreateInput, actor: string): HandoffTask {
