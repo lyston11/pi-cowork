@@ -20,6 +20,34 @@ function fixture() {
 }
 const input = { to: "b", subject: "contract", body: "private contract", items: ["implement", "commit"] };
 
+test('side directory pages are bounded, searchable and stable across display-name changes', () => {
+  const f = fixture();
+  try {
+    for (let i = 0; i < 75; i++) f.store.register({ ...A, id: `s${String(i).padStart(3, '0')}`, sessionId: `ss${i}`, name: i % 2 ? 'data' : 'frontend' });
+    assert.equal(f.store.sidePage().sides.length, 30);
+    const found: string[] = [];
+    let after: string | undefined;
+    do {
+      const page = f.store.sidePage({ after, limit: 11 });
+      assert(page.sides.length <= 11);
+      found.push(...page.sides.map(side => side.id));
+      if (!after) f.store.register({ ...A, id: 's002', sessionId: 'ss2', name: 'renamed' });
+      after = page.nextAfter ?? undefined;
+    } while (after);
+    assert.deepEqual(found, f.store.sides().map(side => side.id).sort());
+    assert.equal(new Set(found).size, 78);
+    const filtered = f.store.sidePage({ query: 'DATA', limit: 100 });
+    assert.equal(filtered.sides.length, 37);
+    assert(filtered.sides.every(side => side.name === 'data'));
+    assert.equal(filtered.nextAfter, null);
+    assert.equal(f.store.sidePage({ query: 's002' }).sides[0].name, 'renamed');
+    assert.equal(f.store.sidePage({ query: 'missing' }).sides.length, 0);
+    assert.throws(() => f.store.sidePage({ limit: 101 }), /Limit/);
+    assert.throws(() => f.store.sidePage({ limit: 0 }), /limit/);
+    assert.throws(() => f.store.sidePage({ query: ' ' }), /query/);
+  } finally { f.close(); }
+});
+
 test("only creator and assignee can list/read/update; checklist, commit and review have separate owners", () => {
   const f = fixture();
   try {

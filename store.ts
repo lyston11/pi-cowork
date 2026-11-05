@@ -458,6 +458,23 @@ export class HandoffStore {
     }));
   }
 
+  sidePage(options: { query?: string; after?: string; limit?: number } = {}): { sides: Side[]; nextAfter: string | null } {
+    const limit = options.limit === undefined ? 30 : integer(options.limit, 'limit', 1);
+    if (limit > 100) throw new Error('Limit must not exceed 100');
+    const after = options.after === undefined ? '' : text(options.after, 'after', 256);
+    const query = options.query === undefined ? '' : text(options.query, 'query', 256);
+    const rows = this.db.prepare(`SELECT s.* FROM handoff_sides s WHERE s.id>?
+      AND NOT EXISTS(SELECT 1 FROM handoff_side_removals r WHERE r.side_id=s.id)
+      AND NOT EXISTS(SELECT 1 FROM handoff_side_bindings b WHERE b.side_id=s.id AND b.session_id IS NULL)
+      AND (instr(lower(s.name),lower(?))>0 OR instr(lower(s.id),lower(?))>0)
+      ORDER BY s.id LIMIT ?`).all(after, query, query, limit + 1);
+    const hasMore = rows.length > limit;
+    if (hasMore) rows.pop();
+    const sides = rows.map(row => ({ id: String(row.id), name: String(row.name), sessionId: String(row.session_id),
+      pid: Number(row.pid), worktree: String(row.worktree), branch: String(row.branch) }));
+    return { sides, nextAfter: hasMore ? sides.at(-1)!.id : null };
+  }
+
   create(input: CreateInput, actor: string): HandoffTask {
     const to = text(input.to, "Assignee", 256);
     const subject = text(input.subject, "Subject", 160);
