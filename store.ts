@@ -34,7 +34,7 @@ export interface HumanTaskSnapshot {
 export interface ResumeEvent {
   seq: number;
   taskId: number;
-  kind: "created" | "complete" | "reopen" | "close" | "dependency" | "checkpoint" | "integration";
+  kind: "created" | "complete" | "reopen" | "close" | "dependency" | "checkpoint" | "integration" | "blocked";
 }
 
 export interface ResumeBatch {
@@ -142,6 +142,7 @@ export class HandoffStore {
   private initializeResume(): void {
     this.transaction(() => {
       const exists = this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='handoff_resume_events'").get();
+      const blockerEscalationExists = this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='trigger' AND name='handoff_resume_blocked'").get();
       this.db.exec(`
         CREATE TABLE IF NOT EXISTS handoff_resume_events (
           seq INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -167,6 +168,13 @@ export class HandoffStore {
           BEGIN INSERT INTO handoff_resume_events(recipient,task_id,kind,source)
             SELECT CASE NEW.kind WHEN 'complete' THEN creator ELSE assignee END,
               NEW.task_id,NEW.kind,'event:'||NEW.seq FROM handoff_tasks WHERE id=NEW.task_id; END;
+        CREATE TRIGGER IF NOT EXISTS handoff_resume_blocked AFTER INSERT ON handoff_task_events
+          WHEN NEW.kind='block' AND NOT EXISTS(
+            SELECT 1 FROM handoff_task_events e WHERE e.task_id=NEW.task_id AND e.kind='block' AND e.seq<NEW.seq
+              AND e.seq>COALESCE((SELECT MAX(seq) FROM handoff_task_events
+                WHERE task_id=NEW.task_id AND kind IN ('unblock','complete','close','reopen') AND seq<NEW.seq),0))
+          BEGIN INSERT INTO handoff_resume_events(recipient,task_id,kind,source)
+            SELECT creator,NEW.task_id,'blocked','blocked:'||NEW.seq FROM handoff_tasks WHERE id=NEW.task_id; END;
         ${immutable("handoff_resume_events")}
         CREATE TABLE IF NOT EXISTS handoff_task_dependencies (
           block_seq INTEGER NOT NULL REFERENCES handoff_task_events(seq),
@@ -200,6 +208,18 @@ export class HandoffStore {
           SELECT CASE e.kind WHEN 'complete' THEN t.creator ELSE t.assignee END,
             t.id,e.kind,'event:'||e.seq FROM handoff_task_events e JOIN handoff_tasks t ON t.id=e.task_id
             WHERE e.kind IN ('complete','reopen','close') ORDER BY e.seq;
+      `);
+      // Notify creators of existing active blocker episodes once on upgrade.
+      // Reopening the store or revising the reason must not repeat escalation.
+      if (!blockerEscalationExists) this.db.exec(`
+        INSERT OR IGNORE INTO handoff_resume_events(recipient,task_id,kind,source)
+          SELECT t.creator,t.id,'blocked','blocked:'||e.seq FROM handoff_tasks t JOIN handoff_task_events e
+            ON e.task_id=t.id AND e.kind='block'
+          WHERE e.seq=(SELECT MIN(seq) FROM handoff_task_events WHERE task_id=t.id AND kind='block'
+            AND seq>COALESCE((SELECT MAX(seq) FROM handoff_task_events WHERE task_id=t.id
+              AND kind IN ('unblock','complete','close','reopen')),0))
+            AND (SELECT kind FROM handoff_task_events WHERE task_id=t.id
+              AND kind IN ('block','unblock','complete','close','reopen') ORDER BY seq DESC LIMIT 1)='block';
       `);
     });
   }
@@ -275,6 +295,12 @@ export class HandoffStore {
         const task = this.read(Number(row.task_id), actor);
         relevant = task.assignee.id === actor && task.state === "open" && (!task.block || task.block.needsReview)
           || task.creator.id === actor && task.state === "completed" && task.integration?.state !== "queued" && task.integration?.state !== "running";
+      }
+      if (kind === "blocked") {
+        const task = this.read(Number(row.task_id), actor);
+        const after = task.events.findLast((event) => ["unblock", "complete", "close", "reopen"].includes(event.kind))?.seq ?? 0;
+        const episode = task.events.find((event) => event.kind === "block" && event.seq > after);
+        relevant = task.creator.id === actor && task.state === "open" && task.block !== null && row.source === `blocked:${episode?.seq}`;
       }
       if (relevant && (kind === "complete" || kind === "integration")) {
         const task = this.read(Number(row.task_id), actor);

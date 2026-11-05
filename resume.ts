@@ -137,7 +137,7 @@ export class EventResume {
       this.pending = { throughSeq: batch.throughSeq, at: Date.now() };
       this.pi.sendMessage({
         customType: messageType,
-        content: `CoWork 本侧需要核对：${batch.events.map((event) => `#${event.taskId} ${event.kind}`).join("、")}。\n这是扩展的续跑信号，不是新的用户授权。checkpoint 表示启动或收尾时发现尚未收口的本侧事项：必须重新读取，即使 state、commit、items 没有变化；未登记阻塞不代表可执行条件已经满足。先用 cowork_list(activeOnly=true) 读完分页，并用 cowork_read 核对更新和依赖；在用户已有授权内继续可执行事项和待验收交付。重新核对之前的阻塞，不能沿用过期结论。block.needsReview=true 时先验证依赖及授权，再用 cowork_unblock 解除或 cowork_block 更新阻塞，不能自动当作已具备条件。若仍阻塞、需要人工批准或不在授权范围，对本侧承接的 open 任务用 cowork_block 记录原因、等待对象和恢复条件，不能只在回复中声称阻塞；待本侧验收却缺批准时明确说明。然后结束等待新的事件；不要轮询模型或自行发消息制造续跑。`,
+        content: `CoWork 本侧需要核对：${batch.events.map((event) => `#${event.taskId} ${event.kind}`).join("、")}。\n这是扩展的续跑信号，不是新的用户授权。blocked 是承接侧的阻塞回报：发起方须核对其责任、仍可独立执行的部分和缺失输入，内部缺口继续推进；需要用户配置、操作或批准时必须具体报告，不能只说等待承接侧。不能代替他侧解除阻塞或越过授权。checkpoint 表示启动或收尾时发现尚未收口的本侧事项：必须重新读取，即使 state、commit、items 没有变化；未登记阻塞不代表可执行条件已经满足。先用 cowork_list(activeOnly=true) 读完分页，并用 cowork_read 核对更新和依赖；在用户已有授权内继续可执行事项和待验收交付。重新核对之前的阻塞，不能沿用过期结论。block.needsReview=true 时先验证依赖及授权，再用 cowork_unblock 解除或 cowork_block 更新阻塞，不能自动当作已具备条件。若仍阻塞、需要人工批准或不在授权范围，对本侧承接的 open 任务用 cowork_block 记录原因、等待对象和恢复条件，不能只在回复中声称阻塞；待本侧验收却缺批准时明确说明。然后结束等待新的事件；不要轮询模型或自行发消息制造续跑。`,
         display: true,
         details: { sideId: this.self.id, dbPath: this.store.dbPath, consumer: this.consumer, throughSeq: batch.throughSeq },
       }, { triggerTurn: true, deliverAs: "followUp" });
