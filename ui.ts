@@ -27,6 +27,11 @@ export function taskLines(task: HandoffTask | TaskSummary, expanded: boolean, th
   }
   if (expanded) {
     if ("body" in task) lines.push(...task.body.split("\n").map((line) => `  ${plain(line)}`));
+    if ("events" in task) for (const reply of task.events.filter(event => event.kind === "reply")) {
+      const author = reply.actor === task.creator.id ? task.creator.name : task.assignee.name;
+      lines.push(`  沟通 #${reply.seq} · ${plain(author)}${reply.data.inReplyTo ? ` · 回应 #${reply.data.inReplyTo}` : ""}`);
+      lines.push(...String(reply.data.message).split("\n").map(line => `    ${plain(line)}`));
+    }
     lines.push(...task.items.map((item, index) => `  [${item.checked ? "✓" : " "}] ${index + 1}. ${plain(item.text)}`));
     if (task.commit) lines.push(`  commit: ${task.commit}`);
     if (task.delivery) {

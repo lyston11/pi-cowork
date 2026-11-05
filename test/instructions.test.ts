@@ -39,6 +39,19 @@ test("managed block upgrades leave surrounding bytes and line endings alone", ()
   assert.equal(withHandoffRules(updated), updated);
 });
 
+test("event scope keeps summary safeguards and never equates listed with read", () => {
+  assert.match(HANDOFF_RULES, /摘要分页/);
+  assert.match(HANDOFF_RULES, /本轮事件对象、必要依赖/);
+  assert.match(HANDOFF_RULES, /首次接触、上下文不足或版本不明/);
+  assert.match(HANDOFF_RULES, /不能用上轮已读代替本轮摘要检查/);
+  assert.match(HANDOFF_RUNTIME_RULES, /混合事件须覆盖全部指定任务/);
+  assert.match(HANDOFF_RUNTIME_RULES, /最近实际读过的 revision/);
+  assert.match(HANDOFF_RUNTIME_RULES, /checkpoint 事件要求对消息指定的任务重新 cowork_read/);
+  assert.match(HANDOFF_RUNTIME_RULES, /不能以定向事件为由遗漏/);
+  assert.match(HANDOFF_RUNTIME_RULES, /不能把“摘要已返回”当作“正文已核对”/);
+  assert.doesNotMatch(HANDOFF_RULES, /阅读分配给本侧的待办、待本侧验收的交付/);
+});
+
 test("malformed managed blocks fail without overwriting AGENTS", () => {
   const root = mkdtempSync(join(tmpdir(), "pi-handoff-markers-"));
   try {

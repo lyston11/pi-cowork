@@ -97,7 +97,7 @@ test("first upgrade backfills actionable old records and triggers catch old writ
   try {
     const task = f.create();
     const sql = new DatabaseSync(f.store.dbPath);
-    sql.exec("DROP TRIGGER handoff_resume_created; DROP TRIGGER handoff_resume_changed; DROP TRIGGER handoff_resume_dependency; DROP TRIGGER handoff_resume_integration; DROP TRIGGER handoff_resume_blocked; DROP TABLE handoff_resume_events; DROP TABLE handoff_resume_state;");
+    sql.exec("DROP TRIGGER handoff_resume_created; DROP TRIGGER handoff_resume_changed; DROP TRIGGER handoff_resume_dependency; DROP TRIGGER handoff_resume_integration; DROP TRIGGER handoff_resume_blocked; DROP TRIGGER handoff_resume_reply; DROP TABLE handoff_resume_events; DROP TABLE handoff_resume_state;");
     const upgraded = new HandoffStore(f.root);
     try {
       assert(upgraded.acquireResume(f.b.id, f.b.sessionId, "upgraded"));
@@ -110,12 +110,12 @@ test("first upgrade backfills actionable old records and triggers catch old writ
   } finally { f.cleanup(); }
 });
 
-function dispatcher(f: ReturnType<typeof fixture>, entries: unknown[] = []) {
+function dispatcher(f: ReturnType<typeof fixture>, entries: unknown[] = [], self = f.b) {
   let idle = true, pendingMessages = false, editor = "";
   const sent: any[] = [], notices: string[] = [];
   const ctx: any = { mode: "rpc", isIdle: () => idle, hasPendingMessages: () => pendingMessages,
     ui: { notify: (text: string) => notices.push(text), getEditorText: () => editor }, sessionManager: { getEntries: () => entries } };
-  const resume = new EventResume({ sendMessage: (message: any, options: any) => { sent.push({ ...message, options }); } } as any, f.store, f.b, ctx);
+  const resume = new EventResume({ sendMessage: (message: any, options: any) => { sent.push({ ...message, options }); } } as any, f.store, self, ctx);
   resume.start();
   return { resume, sent, ctx, notices, idle: (v: boolean) => idle = v,
     persist: (message: any) => {
@@ -137,9 +137,11 @@ test("idle dispatch batches events without task text; busy/UI/editor states defe
     d.editor(""); d.resume.tick();
     assert.equal(d.sent.length, 1);
     assert.equal(d.sent[0].customType, "pi-cowork-resume");
-    assert.match(d.sent[0].content, /#1 created.*#2 created/);
+    assert.match(d.sent[0].content, /#1、#2 created：承接方读取任务/);
+    assert.equal(d.sent[0].details.scope, 'targeted');
+    assert.deepEqual(d.sent[0].details.events, [{ taskId: 1, kind: 'created' }, { taskId: 2, kind: 'created' }]);
     assert.doesNotMatch(d.sent[0].content, /Authorized project work|deliver/);
-    assert(d.sent[0].content.length < 250, 'ordinary events do not repeat the entire runtime policy');
+    assert(d.sent[0].content.length < 300, 'ordinary events group targets instead of repeating policy per task');
     assert.doesNotMatch(d.sent[0].content, /blocked：|checkpoint：/);
     assert.deepEqual(d.sent[0].options, { triggerTurn: true, deliverAs: "followUp" });
     d.resume.tick(); assert.equal(d.sent.length, 1);
@@ -195,6 +197,8 @@ test('blocked and dependency signals retain their specific safety reminders', ()
     f.peer.block(dependency.id, f.a.id, 'needs user approval', 'user');
     d.resume.tick();
     assert.match(d.sent[0].content, /blocked：发起方复核/);
+    assert.match(d.sent[0].content, /其余只读新增、变化或仍可执行项/);
+    assert.match(d.sent[0].content, /未变等待项不重读全文/);
     assert.doesNotMatch(d.sent[0].content, /checkpoint：/);
     d.persist(d.sent[0]); d.resume.tick();
     const own = f.create();
@@ -203,6 +207,82 @@ test('blocked and dependency signals retain their specific safety reminders', ()
     f.complete(dependency.id, f.a.id);
     d.resume.tick();
     assert.match(d.sent.at(-1).content, /依赖变化先验证材料和授权/);
+  } finally { d.resume.stop(); f.cleanup(); }
+});
+
+test('all event types have distinct routes and mixed batches retain every target', () => {
+  const f = fixture(), d = dispatcher(f);
+  try {
+    const kinds = ['created', 'reopen', 'blocked', 'dependency', 'complete', 'integration', 'close', 'checkpoint', 'reply'] as const;
+    const events = kinds.map((kind, i) => ({ seq: i + 1, taskId: i + 10, kind }));
+    f.store.pendingResume = () => ({ throughSeq: 9, events });
+    d.resume.tick();
+    assert.equal(d.sent.length, 1);
+    assert.deepEqual(d.sent[0].details.events, events.map(({ taskId, kind }) => ({ taskId, kind })));
+    for (const event of events) assert(d.sent[0].content.includes(`#${event.taskId} ${event.kind}：`));
+    assert.match(d.sent[0].content, /重读退回意见/);
+    assert.match(d.sent[0].content, /对侧新增材料或澄清/);
+    assert.match(d.sent[0].content, /不能代他侧解除阻塞/);
+    assert.match(d.sent[0].content, /依赖变化先验证材料和授权/);
+    assert.match(d.sent[0].content, /精确提交及完整范围/);
+    assert.match(d.sent[0].content, /排队或运行中等待事件/);
+    assert.match(d.sent[0].content, /不重做已关闭交付/);
+    assert.match(d.sent[0].content, /必须重读指定未收口任务，即使摘要未变/);
+  } finally { d.resume.stop(); f.cleanup(); }
+});
+
+test('blocked report targets only that report, not stable blocked or waiting tasks', () => {
+  const f = fixture(), d = dispatcher(f);
+  try {
+    const stable = f.create();
+    f.peer.block(stable.id, f.b.id, 'approval unchanged', 'user');
+    const waiting = f.create(); f.complete(waiting.id);
+    f.create(f.b.id, f.a.id); // Sent work is not this side's implementation duty.
+    const target = f.create(f.b.id, f.a.id);
+    f.peer.block(target.id, f.a.id, 'missing external input', 'user');
+    d.resume.tick();
+    assert.deepEqual(d.sent[0].details.events, [{ taskId: target.id, kind: 'blocked' }]);
+    assert.doesNotMatch(d.sent[0].content, new RegExp(`#${stable.id}(?:[^0-9]|$)`));
+    assert.doesNotMatch(d.sent[0].content, new RegExp(`#${waiting.id}(?:[^0-9]|$)`));
+    d.persist(d.sent[0]); d.resume.tick();
+    d.resume.settled(false);
+    assert.equal(d.sent.length, 1, 'unchanged waiting work cannot trigger a global reread loop');
+  } finally { d.resume.stop(); f.cleanup(); }
+});
+
+test('dependency plan names the affected blocked task and keeps unrelated blockers quiet', () => {
+  const f = fixture();
+  let d: ReturnType<typeof dispatcher> | undefined;
+  try {
+    const dependency = f.create(f.b.id, f.a.id); f.complete(dependency.id, f.a.id);
+    assert(f.store.acquireResume(f.b.id, f.b.sessionId, 'baseline'));
+    f.store.acknowledgeResume(f.b.id, 'baseline', f.store.pendingResume(f.b.id, 'baseline')!.throughSeq);
+    f.store.releaseResume(f.b.id, 'baseline');
+    const target = f.create(); f.peer.block(target.id, f.b.id, 'reviewed input, waiting acceptance', 'a', [dependency.id]);
+    const stable = f.create(); f.peer.block(stable.id, f.b.id, 'external condition unchanged', 'user');
+    f.peer.closeTask(dependency.id, f.b.id, 'a'.repeat(40), 'input verified');
+    d = dispatcher(f); d.resume.tick();
+    assert.deepEqual(d.sent[0].details.events, [{ taskId: target.id, kind: 'dependency' }]);
+    assert.match(d.sent[0].content, /必要依赖/);
+    assert.match(d.sent[0].content, /不能自动放行/);
+    assert.doesNotMatch(d.sent[0].content, new RegExp(`#${stable.id}(?:[^0-9]|$)`));
+    assert.equal(f.store.read(target.id, f.b.id).block?.needsReview, true);
+  } finally { d?.resume.stop(); f.cleanup(); }
+});
+
+test('grouped plans keep large batches bounded and new arrivals are not lost while busy', () => {
+  const f = fixture(), d = dispatcher(f);
+  try {
+    for (let i = 0; i < 101; i++) f.create();
+    d.resume.tick();
+    assert.equal(d.sent[0].details.events.length, 100);
+    assert(d.sent[0].content.length < 1200);
+    assert.equal(d.sent[0].content.split('承接方读取任务').length - 1, 1);
+    d.persist(d.sent[0]); d.idle(false); d.resume.tick();
+    const newTask = f.create();
+    assert.equal(d.sent.length, 1);
+    d.idle(true); d.resume.settled(false);
+    assert.deepEqual(d.sent[1].details.events.map((event: any) => event.taskId), [101, newTask.id]);
   } finally { d.resume.stop(); f.cleanup(); }
 });
 
@@ -228,8 +308,7 @@ test("abort and model failure persistently pause event runs without discarding p
     d.resume.tick(); assert.equal(d.sent.length, 2);
     // Recovery rechecks both the failed, already-delivered task and the task
     // that arrived while paused. Repeated enabling cannot manufacture a loop.
-    assert.match(d.sent[1].content, /#1 created/);
-    assert.match(d.sent[1].content, /#2 created/);
+    assert.deepEqual(d.sent[1].details.events.map((event: any) => event.taskId).sort((a: number, b: number) => a - b), [1, 2]);
     d.persist(d.sent[1]);
     d.resume.tick();
     f.store.setResumeEnabled(f.b.id, true);

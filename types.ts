@@ -1,4 +1,4 @@
-export const HANDOFF_EXTENSION_VERSION = "5.0.4";
+export const HANDOFF_EXTENSION_VERSION = "5.0.5";
 
 export interface Side {
   id: string;
@@ -21,7 +21,7 @@ export interface TaskBlock {
 export interface TaskEvent {
   seq: number;
   actor: string;
-  kind: "check" | "complete" | "close" | "reopen" | "block" | "unblock" | "integration";
+  kind: "check" | "complete" | "close" | "reopen" | "block" | "unblock" | "integration" | "reply";
   data: Record<string, unknown>;
   at: string;
 }
@@ -36,6 +36,7 @@ export interface HandoffTask {
   items: { text: string; checked: boolean }[];
   state: TaskState;
   block: TaskBlock | null;
+  lastReply?: { seq: number; actor: string; at: string; inReplyTo?: number };
   deliveryId?: string;
   delivery?: { id: string; workspaceId: string; base: string; tip: string; tree: string; commits: string[]; files: string[]; digest: string };
   commit: string | null;
