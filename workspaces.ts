@@ -33,6 +33,12 @@ export function initializeWorkspaces(db: DatabaseSync): void {
       seq INTEGER PRIMARY KEY AUTOINCREMENT, target_key TEXT NOT NULL, revision TEXT NOT NULL,
       baseline TEXT NOT NULL, checks_json TEXT NOT NULL, actor TEXT NOT NULL, note TEXT NOT NULL, at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS handoff_main_sync_locks (
+      repo TEXT PRIMARY KEY, owner TEXT NOT NULL, pid INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS handoff_main_sync_results (
+      repo TEXT PRIMARY KEY, result_json TEXT NOT NULL, at TEXT NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS handoff_reconcile_observations (
       owner TEXT NOT NULL, repo TEXT NOT NULL, digest TEXT NOT NULL, report_json TEXT NOT NULL,
       PRIMARY KEY(owner,repo)
@@ -66,6 +72,16 @@ export function workspaceOccupancy(path: string): string | null {
       const args = readFileSync(`/proc/${entry}/cmdline`, 'utf8').split('\0');
       if (alive(Number(entry)) && args.some(arg => arg === path || arg.startsWith(path + sep))) return `Workspace referenced by PID ${entry}`;
     } catch (error) { if (['EACCES', 'EPERM'].includes((error as NodeJS.ErrnoException).code ?? '')) return 'Cannot inspect all process occupancy'; }
+  }
+  return null;
+}
+
+// Synchronizing a checkout is different from deleting it. Git protects files
+// during a fast-forward; live readers do not prevent it. An unfinished Git
+// operation does, even if no process currently holds its index lock.
+function mainGitOperation(path: string): string | null {
+  for (const name of ['MERGE_HEAD', 'CHERRY_PICK_HEAD', 'REVERT_HEAD', 'rebase-apply', 'rebase-merge', 'BISECT_START', 'index.lock', 'HEAD.lock']) {
+    if (existsSync(resolve(path, gitSync(path, ['rev-parse', '--git-path', name])))) return `Main worktree has an unfinished Git operation: ${name}`;
   }
   return null;
 }
@@ -233,10 +249,12 @@ export class WorkspaceLedger {
     let mainReason: string | null = !remote ? 'Remote query incomplete' : !localMain ? 'Local main missing' : mainDifference?.[0] ? 'Local main has unique commits; manual review required' : null;
     if (!mainReason && mainDifference?.[1] && mainTree) {
       if ('error' in mainTree) mainReason = mainTree.error!;
-      else if (mainTree.status?.length || mainTree.ignored?.length) mainReason = 'Main worktree has modified, untracked or ignored data';
-      else mainReason = workspaceOccupancy(mainTree.path!);
+      else mainReason = mainGitOperation(mainTree.path!);
     }
-    const localMainStatus = { head: localMain, remote, difference: mainDifference, state: mainReason ? 'blocked' : mainDifference?.[1] ? 'fast-forward-available' : 'current', reason: mainReason };
+    const lastSyncRow = this.db.prepare('SELECT result_json,at FROM handoff_main_sync_results WHERE repo=?').get(target.repo);
+    const lastSync = lastSyncRow ? { ...JSON.parse(String(lastSyncRow.result_json)), at: String(lastSyncRow.at) } : null;
+    if (!mainReason && mainDifference?.[1] && lastSync?.main === localMain && lastSync?.remote === remote && lastSync?.state === 'blocked') mainReason = lastSync.reason;
+    const localMainStatus = { head: localMain, remote, difference: mainDifference, state: mainReason ? 'blocked' : mainDifference?.[1] ? 'fast-forward-available' : 'current', reason: mainReason, lastSync };
     const describeRef = async (tip: string | undefined) => {
       if (!tip || !remote) return null;
       try { return list(await git(cwd, ['rev-list', tip, '--not', remote])); }
@@ -257,31 +275,44 @@ export class WorkspaceLedger {
     }
     return report;
   }
-  async syncMain(cwd: string, verifiedPush?: { jobId: string; mainCommit: string }) {
-    const target = integrationRepository(cwd), remote = await this.remoteHead(cwd);
-    if (this.policy(target.targetKey)) {
-      const outside = await this.outsideQueue(cwd, remote);
-      // The worker confirms the push before marking its job complete. Only its
-      // exact pinned merge is exempt; other queue-external changes still block.
-      const running = verifiedPush && this.db.prepare("SELECT commit_hash FROM handoff_integrations WHERE id=? AND target_key=? AND state='running'").get(verifiedPush.jobId, target.targetKey);
-      let pinned = '';
-      if (running) { try { pinned = await git(cwd, ['rev-parse', `refs/pi-handoff/integrations/${verifiedPush!.jobId}/candidate`]); } catch {} }
-      const ownPush = running && pinned === verifiedPush!.mainCommit && outside.length === 1 && outside[0] === pinned && this.contains(cwd, String(running.commit_hash), pinned);
-      if (outside.length && !ownPush) return { state: 'blocked', remote, reason: 'Queue-external main updates require review before synchronization' };
+  async syncMain(cwd: string) {
+    const target = integrationRepository(cwd), owner = randomUUID();
+    const claimed = this.transaction(() => {
+      const lock = this.db.prepare('SELECT pid FROM handoff_main_sync_locks WHERE repo=?').get(target.repo);
+      if (lock && alive(Number(lock.pid))) return false;
+      this.db.prepare('INSERT INTO handoff_main_sync_locks VALUES(?,?,?) ON CONFLICT(repo) DO UPDATE SET owner=excluded.owner,pid=excluded.pid').run(target.repo, owner, process.pid);
+      return true;
+    });
+    if (!claimed) return { state: 'busy', reason: 'Another local main synchronization is already running; other work can continue' };
+    try {
+      const result = await this.fastForwardMain(cwd);
+      this.db.prepare('INSERT INTO handoff_main_sync_results VALUES(?,?,?) ON CONFLICT(repo) DO UPDATE SET result_json=excluded.result_json,at=excluded.at').run(target.repo, JSON.stringify(result), new Date().toISOString());
+      return result;
+    } finally {
+      this.db.prepare('DELETE FROM handoff_main_sync_locks WHERE repo=? AND owner=?').run(target.repo, owner);
     }
+  }
+  private async fastForwardMain(cwd: string) {
+    const target = integrationRepository(cwd), remote = await this.remoteHead(cwd);
+    if (this.policy(target.targetKey) && (await this.outsideQueue(cwd, remote)).length) return { state: 'blocked', remote, reason: 'Queue-external main updates require review before synchronization' };
     const main = await git(cwd, ['rev-parse', 'refs/heads/main']);
     if (main === remote) return { state: 'current', main, remote };
     if (!this.contains(cwd, main, remote)) return { state: 'blocked', main, remote, reason: 'Local main diverged; review local-only commits' };
     const trees = (await git(cwd, ['worktree', 'list', '--porcelain', '-z'])).split('\0\0');
     const block = trees.find(b => b.split('\0').includes('branch refs/heads/main'));
-    if (block) {
-      const path = block.split('\0').find(l => l.startsWith('worktree '))!.slice(9);
-      const occupied = workspaceOccupancy(path);
-      if (occupied) return { state: 'blocked', main, remote, reason: occupied };
-      if (await git(path, ['status', '--porcelain=v1', '-uall', '--ignored'])) return { state: 'blocked', main, remote, reason: 'Main worktree has modified, untracked or ignored data' };
-      if (await git(path, ['rev-parse', 'HEAD']) !== main || await git(path, ['symbolic-ref', '-q', 'HEAD']) !== 'refs/heads/main') throw new Error('Main worktree changed during synchronization');
-      await git(path, ['-c', 'core.hooksPath=/dev/null', 'merge', '--ff-only', '--no-edit', remote]);
-    } else await git(cwd, ['update-ref', 'refs/heads/main', remote, main]);
+    try {
+      if (block) {
+        const path = block.split('\0').find(l => l.startsWith('worktree '))!.slice(9);
+        const operation = mainGitOperation(path);
+        if (operation) return { state: 'blocked', main, remote, reason: operation };
+        if (await git(path, ['rev-parse', 'HEAD']) !== main || await git(path, ['symbolic-ref', '-q', 'HEAD']) !== 'refs/heads/main') throw new Error('Main worktree changed during synchronization');
+        // Never stash/reset/clean. Git refuses overlapping local modifications,
+        // untracked files AND ignored files, while preserving unrelated data.
+        await git(path, ['-c', 'core.hooksPath=/dev/null', '-c', 'submodule.recurse=false', 'merge', '--ff-only', '--no-autostash', '--no-overwrite-ignore', '--no-edit', remote]);
+      } else await git(cwd, ['update-ref', 'refs/heads/main', remote, main]);
+    } catch (error) {
+      return { state: 'blocked', main, remote, reason: `Git refused safe main synchronization: ${error instanceof Error ? error.message : String(error)}` };
+    }
     return { state: 'synced', main: remote, remote, repo: target.repo };
   }
   private contains(cwd: string, a: string, b: string) { try { gitSync(cwd, ['merge-base', '--is-ancestor', a, b]); return true; } catch { return false; } }

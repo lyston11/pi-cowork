@@ -25,6 +25,7 @@ export class IntegrationWorker {
   private stopped = false;
   private timer?: ReturnType<typeof setInterval>;
   private running?: Promise<void>;
+  private mainSyncs = new Map<string, { again: boolean; run: Promise<void> }>();
   private controller?: AbortController;
   private queue: IntegrationQueue;
   private store: HandoffStore;
@@ -42,6 +43,7 @@ export class IntegrationWorker {
     if (this.timer) clearInterval(this.timer);
     this.controller?.abort();
     await this.running;
+    await Promise.all([...this.mainSyncs.values()].map(sync => sync.run));
     this.queue.close();
   }
   tick(): Promise<void> {
@@ -49,6 +51,22 @@ export class IntegrationWorker {
     if (this.running) return this.running;
     this.running = this.runOne().finally(() => { this.running = undefined; });
     return this.running;
+  }
+  private scheduleMainSync(repo: string): void {
+    if (this.stopped) return;
+    const pending = this.mainSyncs.get(repo);
+    if (pending) { pending.again = true; return; }
+    const sync = { again: false, run: Promise.resolve() };
+    sync.run = (async () => {
+      do {
+        sync.again = false;
+        const ledger = new WorkspaceLedger(this.store);
+        try { await ledger.syncMain(dirname(repo)); }
+        finally { ledger.close(); }
+      } while (!this.stopped && sync.again);
+    })().catch(error => console.error('CoWork local main synchronization:', error))
+      .finally(() => { this.mainSyncs.delete(repo); });
+    this.mainSyncs.set(repo, sync);
   }
   private command(cwd: string, command: string, args: string[], timeout = 120000): Promise<string> {
     return new Promise((done, fail) => {
@@ -151,15 +169,15 @@ export class IntegrationWorker {
         const confirmed = await this.git(["rev-parse", `${ref}/confirmed`]);
         if (!await this.ancestor(pushed, confirmed)) throw new Error("Remote main no longer contains the integration; recheck before closure");
       }
-      let localMain: unknown;
-      const ledger = new WorkspaceLedger(this.store);
-      try { localMain = await ledger.syncMain(dirname(this.repo), { jobId: job.jobId, mainCommit: pushed }); } catch (error) { localMain = { state: 'blocked', reason: String(error) }; } finally { ledger.close(); }
-      this.queue.finish(job.jobId, "pushed", `已核实 origin/main 包含交付提交，通过 ${job.checks.length} 项合并后检查。集成提交 ${pushed}；本地 main: ${JSON.stringify(localMain)}。${job.note}`, pushed);
+      this.queue.finish(job.jobId, "pushed", `已核实 origin/main 包含交付提交，通过 ${job.checks.length} 项合并后检查。集成提交 ${pushed}；本地 main 独立同步，其结果不阻塞本交付或后续集成，可用 cowork_reconcile 查看。${job.note}`, pushed);
     } catch (error) {
       if (job) this.queue.finish(job.jobId, this.stopped ? "queued" : "blocked", `${error instanceof Error ? error.message : String(error)}${worktree ? `\n隔离工作树保留于 ${worktree}` : ""}`.replace(/(https?:\/\/)[^\s/]*@/g, "$1[redacted]@"), pushed);
     } finally {
       if (worktree && pushed) { try { await this.git(["worktree", "remove", worktree]); } catch { /* Preserve unexpected files rather than forcing cleanup. */ } }
-      if (job) this.queue.release(this.repo);
+      if (job) {
+        this.queue.release(this.repo);
+        if (pushed && this.queue.read(job.jobId).state === 'pushed') this.scheduleMainSync(job.repo);
+      }
       this.repo = hostRepo;
       this.controller = undefined;
     }

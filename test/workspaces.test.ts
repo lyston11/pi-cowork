@@ -113,37 +113,58 @@ test('approved project checks cannot weaken and external main updates block unti
  }finally{f.close();}
 });
 
-test('safe local main synchronization fast-forwards only; dirty, occupied or divergent main stays untouched',async()=>{
+test('local main fast-forwards beside a live reader and preserves unrelated edits, untracked and ignored data',async()=>{
  const f=fixture();let child:ReturnType<typeof spawn>|undefined;try{
   const p=f.branch('feature'),tip=f.commit(p,'one');f.git(p,'push','origin',`${tip}:main`);
-  writeFileSync(join(f.repo,'uncommitted'),'preserve');assert.equal((await f.ledger.syncMain(p)).state,'blocked');assert.equal(f.git(f.repo,'rev-parse','main'),f.base);rmSync(join(f.repo,'uncommitted'));
-  const occupancy=workspaceOccupancy(f.repo);
-  if (occupancy) {
-    assert.equal((await f.ledger.syncMain(p)).state,'blocked');
-    assert.equal(f.git(f.repo,'rev-parse','main'),f.base);
-    // Even without process inspection, an unchecked-out main ref can use compare-and-swap.
-    f.git(f.repo,'switch','--detach',f.base);
-    assert.equal((await f.ledger.syncMain(p)).state,'synced');
-    f.git(f.repo,'switch','main');
-  } else {
-    const synced=await f.ledger.syncMain(p);assert.equal(synced.state,'synced',JSON.stringify(synced));
-  }
-  assert.equal(f.git(f.repo,'rev-parse','main'),tip);assert.equal(readFileSync(join(f.repo,'one'),'utf8'),'one\n');
-  child=spawn(process.execPath,['-e','setTimeout(()=>{},60000)'],{cwd:f.repo,stdio:'ignore'});
-  await new Promise<void>(resolve=>child!.once('spawn',resolve));const newer=f.commit(p,'two');f.git(p,'push','origin',`${newer}:main`);
-  assert.equal((await f.ledger.syncMain(p)).state,'blocked');child.kill();await new Promise<void>(resolve=>child!.once('exit',()=>resolve()));child=undefined;
-  f.commit(f.repo,'local-only');const diverged=await f.ledger.syncMain(p);assert.equal(diverged.state,'blocked');assert.match(diverged.reason!,/diverged/);assert.equal(readFileSync(join(f.repo,'local-only'),'utf8'),'local-only\n');
- }finally{child?.kill();f.close();}
+  writeFileSync(join(f.repo,'base'),'uncommitted local edit\n');
+  writeFileSync(join(f.repo,'untracked'),'preserve');
+  writeFileSync(join(f.repo,'.git','info','exclude'),'cache.tmp\n');writeFileSync(join(f.repo,'cache.tmp'),'ignored runtime data');
+  f.git(f.repo,'config','merge.autoStash','true');
+  child=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{cwd:f.repo,stdio:'ignore'});
+  await new Promise<void>(resolve=>child!.once('spawn',resolve));
+  const synced=await f.ledger.syncMain(p);assert.equal(synced.state,'synced',JSON.stringify(synced));
+  assert.equal(f.git(f.repo,'rev-parse','main'),tip);assert.equal(child.exitCode,null);
+  assert.equal(readFileSync(join(f.repo,'one'),'utf8'),'one\n');
+  assert.equal(readFileSync(join(f.repo,'base'),'utf8'),'uncommitted local edit\n');
+  assert.equal(readFileSync(join(f.repo,'untracked'),'utf8'),'preserve');assert.equal(readFileSync(join(f.repo,'cache.tmp'),'utf8'),'ignored runtime data');
+  assert.equal(f.git(f.repo,'stash','list'),'');
+  f.commit(f.repo,'local-only');const newer=f.commit(p,'two');f.git(p,'push','origin',`${newer}:main`);
+  const diverged=await f.ledger.syncMain(p);assert.equal(diverged.state,'blocked');assert.match(diverged.reason!,/diverged/);
+ }finally{if(child){child.kill();await new Promise<void>(resolve=>child!.once('exit',()=>resolve()));}f.close();}
 });
 
-test('a verified in-flight push can synchronize an idle local main before finalizing the job',async()=>{
+for(const kind of ['modified','untracked','ignored','git-operation'])test(`main synchronization preserves a conflicting ${kind} file and reports the actual Git blocker`,async()=>{
+ const f=fixture();try{
+  const p=f.branch('feature');
+  const file=kind==='modified'?'base':'one';
+  writeFileSync(join(p,file),'remote change\n');f.git(p,'add',file);f.git(p,'commit','-m','remote change');const tip=f.git(p,'rev-parse','HEAD');f.git(p,'push','origin',`${tip}:main`);
+  if(kind==='ignored')writeFileSync(join(f.repo,'.git','info','exclude'),'one\n');
+  const path=kind==='git-operation'?join(f.repo,'.git','MERGE_HEAD'):join(f.repo,file);
+  writeFileSync(path,kind==='git-operation'?f.base:'local data must survive\n');
+  const before=readFileSync(path,'utf8'),r=await f.ledger.syncMain(p);
+  assert.equal(r.state,'blocked',JSON.stringify(r));assert.match(r.reason!,kind==='git-operation'?/unfinished Git operation/:/Git refused safe/);
+  assert.equal(readFileSync(path,'utf8'),before);assert.equal(f.git(f.repo,'rev-parse','main'),f.base);
+  assert.equal(f.git(f.repo,'stash','list'),'');
+  const audit=await f.ledger.reconcile(p,'b');assert.equal(audit.localMainStatus.state,'blocked');
+ }finally{f.close();}
+});
+
+test('concurrent local synchronizations return busy instead of holding up other sides',async()=>{
+ const f=fixture(),other=new WorkspaceLedger(f.store);try{
+  const p=f.branch('feature'),tip=f.commit(p,'one');f.git(p,'push','origin',`${tip}:main`);
+  const [a,b]=await Promise.all([f.ledger.syncMain(p),other.syncMain(p)]);
+  assert.equal(a.state,'synced');assert.equal(b.state,'busy');assert.equal(f.git(f.repo,'rev-parse','main'),tip);
+ }finally{other.close();f.close();}
+});
+
+test('an idle local main synchronizes independently after the pushed job is recorded',async()=>{
  const f=fixture();try{
   await f.ledger.configure(f.repo,'a',f.base,f.checks,'reviewed baseline');
   const p=f.branch('feature'),t=f.task(),tip=f.commit(p,'included'),d=await f.deliver(p,t.id,tip);
   f.git(f.repo,'switch','--detach',f.base);
   const job=f.enqueue(t.id,d);await f.consume();
   const result=f.queue.read(job.jobId);assert.equal(result.state,'pushed',result.note);
-  assert.match(result.note,/"state":"synced"/);
+  assert.match(result.note,/本地 main 独立同步/);
   assert.equal(f.git(f.repo,'rev-parse','main'),result.mainCommit);
   assert.deepEqual(await f.ledger.outsideQueue(f.repo,result.mainCommit!),[]);
  }finally{f.close();}

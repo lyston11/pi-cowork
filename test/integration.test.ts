@@ -6,6 +6,7 @@ import { DatabaseSync } from "node:sqlite";
 import { setTimeout as delay } from "node:timers/promises";
 import assert from "node:assert/strict";
 import test from "node:test";
+import { WorkspaceLedger } from "../workspaces.ts";
 import { HandoffStore } from "../store.ts";
 import { IntegrationQueue } from "../integration-store.ts";
 import { IntegrationWorker, integrationRepository, verifyPushedIntegration } from "../integration.ts";
@@ -71,7 +72,7 @@ test("only reviewed creator can queue; code closure is guarded even for legacy S
     assert.equal(closed.state, "closed");
     assert.equal(closed.events.at(-1)!.data.mainCommit, pushed.mainCommit);
     assert.equal(closed.events.at(-1)!.data.jobId, job.jobId);
-    assert.equal(f.git(f.repo, "rev-parse", "main"), f.base, "main worktree is never reset under a working Pi");
+    assert.equal(f.git(f.repo, "rev-parse", "main"), pushed.mainCommit, "safe fast-forward is independent of the Pi process cwd");
     assert.equal(f.git(f.repo, "status", "--porcelain"), "");
   } finally { f.cleanup(); }
 });
@@ -97,8 +98,28 @@ test("two actual worker processes integrate independent branches serially withou
     f.git(f.repo, "merge-base", "--is-ancestor", a, head); f.git(f.repo, "merge-base", "--is-ancestor", b, head);
     assert.equal(f.git(f.repo, "show", `${head}:a.txt`), "A"); assert.equal(f.git(f.repo, "show", `${head}:b.txt`), "B");
     assert.equal(readFileSync(join(f.repo, "base.txt"), "utf8"), "uncommitted work must survive\n");
-    assert.equal(f.git(f.repo, "rev-parse", "main"), f.base);
+    f.git(f.repo, "merge-base", "--is-ancestor", f.git(f.repo, "rev-parse", "main"), head);
   } finally { f.cleanup(); }
+});
+
+test('slow local main synchronization cannot hold the target lock or delay the next reviewed delivery',async()=>{
+  const f=fixture(),original=WorkspaceLedger.prototype.syncMain;
+  let release!:()=>void,entered!:()=>void;
+  const gate=new Promise<void>(done=>{release=done;}),started=new Promise<void>(done=>{entered=done;});
+  WorkspaceLedger.prototype.syncMain=async function(cwd){entered();await gate;return original.call(this,cwd);};
+  const worker=new IntegrationWorker(f.store,f.target.repo);
+  try{
+    const a=f.code('first-sync','a.txt','A\n'),b=f.code('next-sync','b.txt','B\n');
+    const first=f.enqueue(f.task(a),a),next=f.enqueue(f.task(b,'c'),b);
+    await worker.tick();await started;
+    assert.equal(f.queue.read(first.jobId).state,'pushed');
+    // The local update is still held at the gate, but the next merge can finish.
+    await worker.tick();assert.equal(f.queue.read(next.jobId).state,'pushed');
+    assert.equal(f.git(f.repo,'rev-parse','main'),f.base);
+    const head=f.queue.read(next.jobId).mainCommit!;
+    f.git(f.repo,'merge-base','--is-ancestor',a,head);f.git(f.repo,'merge-base','--is-ancestor',b,head);
+    assert.equal(f.store.closeTask(first.taskId,'a',a,'remote integration reviewed').state,'closed');
+  }finally{release();await worker.stop();WorkspaceLedger.prototype.syncMain=original;f.cleanup();}
 });
 
 test("a conflicting branch blocks while later independent work can still integrate", async () => {
