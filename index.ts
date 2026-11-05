@@ -6,6 +6,7 @@ import { execFileSync } from "node:child_process";
 import { Key, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { HandoffStore, type HumanTaskSnapshot } from "./store.ts";
 import { taskLines } from "./ui.ts";
+import { showSides } from "./side-panel.ts";
 import { HANDOFF_RUNTIME_RULES, installHandoffRules } from "./instructions.ts";
 import type { HandoffTask, Side, TaskSummary } from "./types.ts";
 import { resolveChannel } from "./channel.ts";
@@ -387,10 +388,16 @@ export default function piCowork(pi: ExtensionAPI): void {
   });
 
   pi.registerCommand("cowork", {
-    description: "Open task board. /cowork [audit|init|status|auto [on|off]|name <name>|read <id>|takeover <side-id>]",
+    description: "Open task board; m opens side management. /cowork [sides [query]|audit|init|status|auto [on|off]|name <name>|read <id>|remove [side-id]|takeover <side-id>]",
     handler: async (args, ctx) => {
       const self = identity(ctx);
       const command = args.trim();
+      const manageSides = async (query = '') => {
+        const removed = await showSides(ctx, board(), self, query);
+        if (removed) { resume?.stop(); resume = undefined; }
+        return removed;
+      };
+      if (command === 'sides' || command.startsWith('sides ')) { await manageSides(command.slice(5).trim()); return; }
       if (command === 'audit') {
         const ledger = new WorkspaceLedger(board());
         let report;
@@ -495,12 +502,13 @@ export default function piCowork(pi: ExtensionAPI): void {
         const task = board().read(Number(command.slice(5)), self.id);
         ctx.ui.notify(JSON.stringify({ warning, task }, null, 2), "info"); return;
       }
-      if (command && command !== "list") throw new Error("Usage: /cowork [init|status|auto [on|off]|name <name>|read <id>|takeover <side-id>]");
+      if (command && command !== "list") throw new Error("Usage: /cowork [sides [query]|audit|init|status|auto [on|off]|name <name>|read <id>|remove [side-id]|takeover <side-id>]");
       if (ctx.mode !== "tui") {
         ctx.ui.notify(JSON.stringify({ warning, ...board().list(self.id) }, null, 2), "info"); return;
       }
       await ctx.ui.custom<void>((tui, theme, _keys, done) => {
         let tasks: HandoffTask[] = [];
+        let sideCount = board().sidePage({ limit: 1 }).total, managingSides = false;
         let nextAfter: number | null = null;
         let snapshot: HumanTaskSnapshot | undefined;
         let selected = 0;
@@ -585,14 +593,14 @@ export default function piCowork(pi: ExtensionAPI): void {
               "Enter/Esc返回 ↑↓滚动",
               "Enter/Esc返回",
             ] : [
-              "Esc退出 s排序 ↑↓选任务 Enter详情 Tab本侧/全项目 PgUp/PgDn滚动 Home/End首尾 r刷新",
-              "Esc退出 s排序 ↑↓选择 Enter详情 Tab切换 PgUp/PgDn滚动",
-              "Esc退出 s排序 ↑↓ Enter Tab PgUp/PgDn",
-              "Esc退出 s排序 Enter详情",
+              "Esc退出 m侧管理 s排序 ↑↓选任务 Enter详情 Tab本侧/全项目 PgUp/PgDn滚动 Home/End首尾 r刷新",
+              "Esc退出 m侧管理 s排序 ↑↓选择 Enter详情 Tab切换 PgUp/PgDn滚动",
+              "Esc退出 m侧管理 s排序 ↑↓ Enter Tab PgUp/PgDn",
+              "Esc退出 m侧管理 s排序 Enter详情",
             ];
             const footer = keys.map((keys) => `${position} │ ${keys}`).find((text) => visibleWidth(text) <= innerWidth) ?? (detailTask ? "Esc返回" : "Esc退出");
             const title = detailTask ? `任务详情 · #${detailTask.id} · ${detailTask.subject}`
-              : `交接任务 · ${projectView ? "全项目" : "本侧"} · ${sortLabels[sortIndex]} · ${self.name}`;
+              : `交接任务 · ${projectView ? "全项目" : "本侧"} · ${sortLabels[sortIndex]} · ${sideCount}侧 · ${self.name}`;
             return [
               rule("╭", "╮"),
               row(theme.fg("accent", title.replace(/[\x00-\x1f\x7f]/g, " "))),
@@ -617,6 +625,15 @@ export default function piCowork(pi: ExtensionAPI): void {
               return;
             }
             if (matchesKey(data, Key.escape)) { done(); return; }
+            if (data === 'm') {
+              if (managingSides) return;
+              managingSides = true;
+              void manageSides().then(removed => {
+                if (removed) done();
+                else { sideCount = board().sidePage({ limit: 1 }).total; tui.requestRender(); }
+              }).catch(error => ctx.ui.notify(String(error), 'error')).finally(() => { managingSides = false; });
+              return;
+            }
             if (matchesKey(data, Key.tab)) { projectView = !projectView; load(); }
             else if (matchesKey(data, Key.up)) { selected = Math.max(0, selected - 1); followSelection = true; }
             else if (matchesKey(data, Key.down)) {
@@ -626,7 +643,7 @@ export default function piCowork(pi: ExtensionAPI): void {
             else if (matchesKey(data, Key.enter) && tasks[selected]) {
               detailTask = tasks[selected]; detailScroll = 0;
             } else if (data === "s") { sortIndex = (sortIndex + 1) % sorts.length; load(); }
-            else if (data === "r") load();
+            else if (data === "r") { sideCount = board().sidePage({ limit: 1 }).total; load(); }
             else if (matchesKey(data, Key.pageDown)) {
               if (nextAfter !== null && scroll + 2 * viewportHeight >= (ranges.at(-1)?.end ?? 0)) load(true);
               scroll += viewportHeight; followSelection = false; selectVisible();
