@@ -139,6 +139,8 @@ test("idle dispatch batches events without task text; busy/UI/editor states defe
     assert.equal(d.sent[0].customType, "pi-cowork-resume");
     assert.match(d.sent[0].content, /#1 created.*#2 created/);
     assert.doesNotMatch(d.sent[0].content, /Authorized project work|deliver/);
+    assert(d.sent[0].content.length < 250, 'ordinary events do not repeat the entire runtime policy');
+    assert.doesNotMatch(d.sent[0].content, /blocked：|checkpoint：/);
     assert.deepEqual(d.sent[0].options, { triggerTurn: true, deliverAs: "followUp" });
     d.resume.tick(); assert.equal(d.sent.length, 1);
     const delivered = d.sent[0];
@@ -185,6 +187,24 @@ for (const customType of ["pi-handoff-resume", "pi-cowork-resume"]) {
     } finally { d?.resume.stop(); f.cleanup(); }
   });
 }
+
+test('blocked and dependency signals retain their specific safety reminders', () => {
+  const f = fixture(), d = dispatcher(f);
+  try {
+    const dependency = f.create(f.b.id, f.a.id);
+    f.peer.block(dependency.id, f.a.id, 'needs user approval', 'user');
+    d.resume.tick();
+    assert.match(d.sent[0].content, /blocked：发起方复核/);
+    assert.doesNotMatch(d.sent[0].content, /checkpoint：/);
+    d.persist(d.sent[0]); d.resume.tick();
+    const own = f.create();
+    f.peer.block(own.id, f.b.id, 'needs input', f.a.name, [dependency.id]);
+    f.peer.unblock(dependency.id, f.a.id, 'approval verified');
+    f.complete(dependency.id, f.a.id);
+    d.resume.tick();
+    assert.match(d.sent.at(-1).content, /依赖变化先验证材料和授权/);
+  } finally { d.resume.stop(); f.cleanup(); }
+});
 
 test("abort and model failure persistently pause event runs without discarding pending work", () => {
   const f = fixture();
@@ -273,6 +293,7 @@ test("startup and settled checkpoints resume once, warn without looping, and sur
     d.resume.tick();
     assert.equal(d.sent.length, 1, "reload discovers unclosed work even when old events were consumed");
     assert.match(d.sent[0].content, /#1 checkpoint/);
+    assert.match(d.sent[0].content, /必须重读/);
     d.persist(d.sent[0]); d.resume.tick();
     d.resume.runStarted(); d.resume.settled(false);
     assert.equal(d.sent.length, 1, "the unchanged task cannot loop");

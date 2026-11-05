@@ -24,6 +24,7 @@ test('removing a stopped side hides discovery, preserves closed history and surv
     const before = f.store.read(task.id, owner.id);
     assert(f.store.removeSide(owner, old.id, old.sessionId, 'User requested deletion').removedAt);
     assert.equal(f.store.sides().some(side => side.id === old.id), false);
+    assert.equal(f.store.sidePage({ query: old.id }).sides.length, 0);
     assert.deepEqual(f.store.read(task.id, owner.id).events, before.events);
     assert.equal(f.store.read(task.id, owner.id).assignee.name, old.name);
     const snapshot = f.store.listForHumanUi();
@@ -38,6 +39,7 @@ test('removing a stopped side hides discovery, preserves closed history and surv
     try {
       assert(restarted.sessionSide(old.sessionId)?.removedAt);
       assert.equal(restarted.sides().length, 1);
+      assert.equal(restarted.sidePage().sides.length, 1);
       assert.equal(restarted.read(task.id, old.id).state, 'closed');
       const legacy = new DatabaseSync(restarted.dbPath);
       try {
