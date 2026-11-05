@@ -1,12 +1,17 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { HandoffStore } from "../store.ts";
-import type { Side } from "../types.ts";
+import { HANDOFF_EXTENSION_VERSION, type Side } from "../types.ts";
+
+test("reported extension version matches package metadata", () => {
+  const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+  assert.equal(HANDOFF_EXTENSION_VERSION, pkg.version);
+});
 
 const A: Side = { id: "a", name: "planner", sessionId: "sa", pid: 1, worktree: "/a", branch: "main" };
 const B: Side = { ...A, id: "b", name: "backend", sessionId: "sb", pid: 2 };
