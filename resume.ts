@@ -1,9 +1,20 @@
 import { randomUUID } from "node:crypto";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { HandoffStore } from "./store.ts";
+import { HandoffStore, type ResumeEvent } from "./store.ts";
 import type { Side } from "./types.ts";
 
 const messageType = "pi-cowork-resume";
+const actions: Record<ResumeEvent["kind"], string> = {
+  created: "承接方读取任务，继续已授权工作，缺条件登记阻塞。",
+  reopen: "承接方重读退回意见，按原授权修正。",
+  blocked: "发起方复核阻塞回报、责任和独立可做部分；补内部输入或报告外部条件，不能代他侧解除阻塞。",
+  dependency: "重读待复核任务；依赖变化先验证材料和授权（包括新增回应），再解除或更新阻塞，不能自动放行。",
+  reply: "读取对侧新增材料或澄清及必要依赖，核对下一步责任；需要实质回应时用 cowork_reply 并引用 inReplyTo，不复述等待，不用回复代替交付或批准。",
+  complete: "发起方读取交付，审查精确提交及完整范围，再集成或验收。",
+  integration: "发起方读取集成结果和检查；已推送则核对并关闭，受阻则处理原因，排队或运行中等待事件。",
+  close: "读取验收结果，继续因此可推进的相关待办，不重做已关闭交付。",
+  checkpoint: "必须重读指定未收口任务，即使摘要未变；核对相关依赖、授权和实际阻塞。",
+};
 
 // One consumer per side. Peer events and bounded task checkpoints are durable;
 // unchanged unfinished work cannot schedule an endless model loop.
@@ -135,19 +146,21 @@ export class EventResume {
         return;
       }
       this.reconcile = false;
-      const kinds = new Set(batch.events.map(event => event.kind));
-      const guidance = [
-        '按现有协作规则用 cowork_list(activeOnly=true) 读完分页，cowork_read 核对更新和依赖；继续既有授权内可执行事项和验收。真实阻塞须登记，不新增授权，不轮询或自行制造续跑。',
-        ...(kinds.has('blocked') ? ['blocked：发起方复核责任和独立可做部分，推进内部缺口；缺用户配置、操作或批准须具体报告，不能代他侧解除阻塞。'] : []),
-        ...(kinds.has('checkpoint') ? ['checkpoint：必须重读相关任务，即使 state/commit/items 未变；未登记阻塞不保证条件已满足。'] : []),
-        ...(kinds.has('dependency') ? ['依赖变化先验证材料和授权，再 cowork_unblock 或更新 cowork_block；不能自动放行。'] : []),
-      ].join('\n');
+      const groups = new Map<ResumeEvent["kind"], number[]>();
+      for (const event of batch.events) {
+        const ids = groups.get(event.kind) ?? [];
+        ids.push(event.taskId);
+        groups.set(event.kind, ids);
+      }
+      const plan = [...groups].map(([kind, ids]) => `${ids.map(id => `#${id}`).join('、')} ${kind}：${actions[kind]}`).join('\n');
+      const guidance = '前后用 cowork_list(activeOnly=true) 摘要查完分页；先 cowork_read 上列事件对象和必要依赖，其余只读新增、变化或仍可执行项。未变等待项不重读全文；未知基线补查。不扩权、不轮询、不自行制造续跑。';
       this.pending = { throughSeq: batch.throughSeq, at: Date.now() };
       this.pi.sendMessage({
         customType: messageType,
-        content: `CoWork 本侧需要核对：${batch.events.map((event) => `#${event.taskId} ${event.kind}`).join("、")}。\n${guidance}`,
+        content: `CoWork 事件定向续跑：\n${plan}\n${guidance}`,
         display: true,
-        details: { sideId: this.self.id, dbPath: this.store.dbPath, consumer: this.consumer, throughSeq: batch.throughSeq },
+        details: { sideId: this.self.id, dbPath: this.store.dbPath, consumer: this.consumer, throughSeq: batch.throughSeq,
+          scope: "targeted", events: batch.events.map(({ taskId, kind }) => ({ taskId, kind })) },
       }, { triggerTurn: true, deliverAs: "followUp" });
     } catch (error) {
       this.pause(`续跑调度失败：${error instanceof Error ? error.message : String(error)}`);

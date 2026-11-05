@@ -34,7 +34,7 @@ export interface HumanTaskSnapshot {
 export interface ResumeEvent {
   seq: number;
   taskId: number;
-  kind: "created" | "complete" | "reopen" | "close" | "dependency" | "checkpoint" | "integration" | "blocked";
+  kind: "created" | "complete" | "reopen" | "close" | "dependency" | "checkpoint" | "integration" | "blocked" | "reply";
 }
 
 export interface ResumeBatch {
@@ -190,8 +190,15 @@ export class HandoffStore {
           BEGIN INSERT INTO handoff_task_dependencies(block_seq,task_id,dependency_id,observed_seq)
             SELECT NEW.seq,NEW.task_id,json_extract(value,'$.id'),json_extract(value,'$.seq')
             FROM json_each(NEW.data_json,'$.dependencies'); END;
-        CREATE TRIGGER IF NOT EXISTS handoff_resume_dependency AFTER INSERT ON handoff_task_events
-          WHEN NEW.kind IN ('complete','reopen','close')
+        CREATE UNIQUE INDEX IF NOT EXISTS handoff_reply_key ON handoff_task_events(task_id,actor,json_extract(data_json,'$.idempotencyKey')) WHERE kind='reply';
+        CREATE TRIGGER IF NOT EXISTS handoff_resume_reply AFTER INSERT ON handoff_task_events
+          WHEN NEW.kind='reply'
+          BEGIN INSERT INTO handoff_resume_events(recipient,task_id,kind,source)
+            SELECT CASE NEW.actor WHEN creator THEN assignee ELSE creator END,NEW.task_id,'reply','reply:'||NEW.seq
+            FROM handoff_tasks WHERE id=NEW.task_id; END;
+        DROP TRIGGER IF EXISTS handoff_resume_dependency;
+        CREATE TRIGGER handoff_resume_dependency AFTER INSERT ON handoff_task_events
+          WHEN NEW.kind IN ('complete','reopen','close','reply')
           BEGIN INSERT INTO handoff_resume_events(recipient,task_id,kind,source)
             SELECT t.assignee,d.task_id,'dependency','dependency:'||NEW.seq||':'||d.block_seq
             FROM handoff_task_dependencies d JOIN handoff_tasks t ON t.id=d.task_id
@@ -234,6 +241,14 @@ export class HandoffStore {
     });
   }
 
+  private replyNeedsAction(id: number, actor: string, fromSeq = 0): boolean {
+    return !!this.db.prepare(`SELECT 1 FROM handoff_task_events incoming
+      WHERE incoming.task_id=? AND incoming.kind='reply' AND incoming.actor<>? AND incoming.seq>=?
+        AND NOT EXISTS(SELECT 1 FROM handoff_task_events response WHERE response.task_id=incoming.task_id
+          AND response.actor=? AND response.seq>incoming.seq
+          AND (response.kind<>'reply' OR json_extract(response.data_json,'$.inReplyTo')>=incoming.seq)) LIMIT 1`).get(id, actor, fromSeq, actor);
+  }
+
   reconcileResume(actor: string, consumer: string): { queued: number[]; stalled: number[] } {
     return this.transaction(() => {
       const queued: number[] = [], stalled: number[] = [];
@@ -243,7 +258,8 @@ export class HandoffStore {
         const page = this.list(actor, { activeOnly: true, limit: 100, before });
         for (const task of page.tasks) {
           const needsWork = task.assignee.id === actor && task.state === "open" && (!task.block || task.block.needsReview)
-            || task.creator.id === actor && task.state === "completed" && task.integration?.state !== "queued" && task.integration?.state !== "running";
+            || task.creator.id === actor && task.state === "completed" && task.integration?.state !== "queued" && task.integration?.state !== "running"
+            || !!task.lastReply && this.replyNeedsAction(task.id, actor);
           if (!needsWork) continue;
           const ids = [task.id, ...(task.block?.dependencies ?? [])];
           const version = Number(this.db.prepare(
@@ -291,10 +307,15 @@ export class HandoffStore {
             AND d.block_seq=(SELECT seq FROM handoff_task_events WHERE task_id=d.task_id
               AND kind IN ('block','unblock','complete','close','reopen') ORDER BY seq DESC LIMIT 1)`).get(row.task_id, row.source);
       }
+      if (kind === "reply") {
+        const task = this.read(Number(row.task_id), actor);
+        relevant = task.state !== "closed" && this.replyNeedsAction(task.id, actor, Number(String(row.source).slice("reply:".length)));
+      }
       if (kind === "checkpoint") {
         const task = this.read(Number(row.task_id), actor);
         relevant = task.assignee.id === actor && task.state === "open" && (!task.block || task.block.needsReview)
-          || task.creator.id === actor && task.state === "completed" && task.integration?.state !== "queued" && task.integration?.state !== "running";
+          || task.creator.id === actor && task.state === "completed" && task.integration?.state !== "queued" && task.integration?.state !== "running"
+          || task.state !== "closed" && !!task.lastReply && this.replyNeedsAction(task.id, actor);
       }
       if (kind === "blocked") {
         const task = this.read(Number(row.task_id), actor);
@@ -534,6 +555,7 @@ export class HandoffStore {
           needsReview: false,
         };
       }
+      if (event.kind === "reply") task.lastReply = { seq: event.seq, actor: event.actor, at: event.at, ...(event.data.inReplyTo ? { inReplyTo: Number(event.data.inReplyTo) } : {}) };
       if (event.kind === "unblock") task.block = null;
       if (event.kind === "complete") {
         task.block = null;
@@ -556,7 +578,9 @@ export class HandoffStore {
     if (task.block) task.block.needsReview = !!this.db.prepare(`SELECT 1 FROM handoff_task_dependencies d
       JOIN handoff_task_events e ON e.task_id=d.dependency_id
       WHERE d.block_seq=? AND e.seq>d.observed_seq AND e.seq<=?
-        AND e.kind IN ('complete','close','reopen') LIMIT 1`).get(blockSeq, eventSeq);
+        AND e.kind IN ('complete','close','reopen','reply') LIMIT 1`).get(blockSeq, eventSeq)
+      || !!this.db.prepare(`SELECT 1 FROM handoff_task_events WHERE task_id=? AND kind='reply' AND actor=? AND seq>? AND seq<=? LIMIT 1`)
+        .get(task.id, task.creator.id, blockSeq, eventSeq);
     return task;
   }
 
@@ -647,7 +671,7 @@ export class HandoffStore {
         ) SELECT 1 FROM reachable WHERE id=? LIMIT 1`).get(dependency, id);
         if (cycle) throw new Error("Dependency would create a cycle");
         const latest = this.db.prepare(`SELECT COALESCE(MAX(seq),0) AS seq FROM handoff_task_events
-          WHERE task_id=? AND kind IN ('complete','close','reopen')`).get(dependency)!;
+          WHERE task_id=? AND kind IN ('complete','close','reopen','reply')`).get(dependency)!;
         return { id: dependency, seq: Number(latest.seq) };
       }).sort((a, b) => a.id - b.id);
       const data = { reason, waitingFor, dependencies };
@@ -656,6 +680,22 @@ export class HandoffStore {
       this.db.prepare("INSERT INTO handoff_task_events(task_id,actor,kind,data_json,at) VALUES(?,?,'block',?,?)")
         .run(id, actor, JSON.stringify(data), new Date().toISOString());
       return this.read(id, actor);
+    });
+  }
+
+  reply(id: number, actor: string, message: string, idempotencyKey: string, inReplyTo?: number): HandoffTask {
+    text(message, "Reply message", 4000);
+    text(idempotencyKey, "Reply idempotency key", 160);
+    if (inReplyTo !== undefined) integer(inReplyTo, "reply seq", 1);
+    return this.update(id, actor, "reply", { message, idempotencyKey, ...(inReplyTo !== undefined ? { inReplyTo } : {}) }, (task) => {
+      const previous = task.events.find(event => event.kind === "reply" && event.actor === actor && event.data.idempotencyKey === idempotencyKey);
+      if (previous) {
+        if (previous.data.message !== message || previous.data.inReplyTo !== inReplyTo) throw new Error("Reply idempotency key is already bound to different content");
+        return false;
+      }
+      if (task.state === "closed") throw new Error("Cannot reply to a closed task; create a new authorized task instead");
+      if (inReplyTo !== undefined && !task.events.some(event => event.seq === inReplyTo && event.kind === "reply" && event.actor !== actor)) throw new Error("inReplyTo must name a peer reply on this task");
+      return true;
     });
   }
 
