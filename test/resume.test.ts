@@ -8,7 +8,7 @@ import { HandoffStore } from "../store.ts";
 import { EventResume } from "../resume.ts";
 
 function fixture() {
-  const root = mkdtempSync(join(tmpdir(), "pi-handoff-resume-"));
+  const root = mkdtempSync(join(tmpdir(), "pi-cowork-resume-"));
   const store = new HandoffStore(root);
   const peer = new HandoffStore(root);
   const side = (id: string) => {
@@ -136,6 +136,7 @@ test("idle dispatch batches events without task text; busy/UI/editor states defe
     d.resume.uiWaiting(false); d.ctx.mode = "tui"; d.editor("draft"); d.resume.tick(); assert.equal(d.sent.length, 0);
     d.editor(""); d.resume.tick();
     assert.equal(d.sent.length, 1);
+    assert.equal(d.sent[0].customType, "pi-cowork-resume");
     assert.match(d.sent[0].content, /#1 created.*#2 created/);
     assert.doesNotMatch(d.sent[0].content, /Authorized project work|deliver/);
     assert.deepEqual(d.sent[0].options, { triggerTurn: true, deliverAs: "followUp" });
@@ -160,6 +161,30 @@ test("idle dispatch batches events without task text; busy/UI/editor states defe
     } finally { restored.resume.stop(); }
   } finally { d.resume.stop(); f.cleanup(); }
 });
+
+for (const customType of ["pi-handoff-resume", "pi-cowork-resume"]) {
+  test(`reload recovers persisted ${customType} cursors without replaying delivered events`, () => {
+    const f = fixture();
+    let d: ReturnType<typeof dispatcher> | undefined;
+    try {
+      f.create();
+      assert(f.store.acquireResume(f.b.id, f.b.sessionId, "before-reload"));
+      f.store.reconcileResume(f.b.id, "before-reload");
+      const batch = f.store.pendingResume(f.b.id, "before-reload")!;
+      f.store.releaseResume(f.b.id, "before-reload");
+      d = dispatcher(f, [{ type: "custom_message", customType, details: {
+        sideId: f.b.id, dbPath: f.store.dbPath, throughSeq: batch.throughSeq,
+      } }]);
+      d.resume.tick();
+      assert.equal(d.sent.length, 0);
+      assert.equal(f.store.resumeStatus(f.b.id).pendingEvents, 0);
+      f.create();
+      d.resume.tick();
+      assert.equal(d.sent.length, 1);
+      assert.equal(d.sent[0].customType, "pi-cowork-resume");
+    } finally { d?.resume.stop(); f.cleanup(); }
+  });
+}
 
 test("abort and model failure persistently pause event runs without discarding pending work", () => {
   const f = fixture();

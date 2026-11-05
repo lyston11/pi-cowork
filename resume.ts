@@ -3,7 +3,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { HandoffStore } from "./store.ts";
 import type { Side } from "./types.ts";
 
-const messageType = "pi-handoff-resume";
+const messageType = "pi-cowork-resume";
 
 // One consumer per side. Peer events and bounded task checkpoints are durable;
 // unchanged unfinished work cannot schedule an endless model loop.
@@ -34,7 +34,8 @@ export class EventResume {
     // A crash can occur between persisting the message and acknowledging its
     // cursor. Recover from the transcript instead of re-sending that batch.
     for (const entry of this.ctx.sessionManager.getEntries()) {
-      if (entry.type !== "custom_message" || entry.customType !== messageType) continue;
+      // Read the old name only to recover delivery cursors from existing transcripts.
+      if (entry.type !== "custom_message" || (entry.customType !== messageType && entry.customType !== "pi-handoff-resume")) continue;
       const details = entry.details as { sideId?: string; dbPath?: string; throughSeq?: number } | undefined;
       if (details?.sideId === this.self.id && details.dbPath === this.store.dbPath && Number.isSafeInteger(details.throughSeq)) {
         this.recoveredSeq = Math.max(this.recoveredSeq, details.throughSeq!);
