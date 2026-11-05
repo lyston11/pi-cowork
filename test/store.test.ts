@@ -53,6 +53,25 @@ test("only creator and assignee can list/read/update; checklist, commit and revi
   } finally { f.close(); }
 });
 
+test("legacy append-only errors adopt CoWork names without changing tasks or weakening their guards", () => {
+  const f = fixture();
+  try {
+    const task = f.store.create(input, A.id);
+    f.store.close();
+    const raw = new DatabaseSync(f.store.dbPath);
+    try { raw.exec("DROP TRIGGER handoff_tasks_no_delete; CREATE TRIGGER handoff_tasks_no_delete BEFORE DELETE ON handoff_tasks BEGIN SELECT RAISE(ABORT, 'Handoff records are append-only'); END;"); }
+    finally { raw.close(); }
+    const reopened = new HandoffStore(f.root);
+    try {
+      assert.equal(reopened.read(task.id, A.id).body, input.body);
+      const db = new DatabaseSync(reopened.dbPath);
+      try { assert.throws(() => db.exec("DELETE FROM handoff_tasks"), /CoWork records are append-only/); }
+      finally { db.close(); }
+      assert.equal(reopened.read(task.id, B.id).id, task.id);
+    } finally { reopened.close(); }
+  } finally { f.close(); }
+});
+
 test("restart, role rename and review return preserve identity and append-only evidence", () => {
   const f = fixture();
   try {

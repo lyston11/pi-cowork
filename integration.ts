@@ -13,7 +13,7 @@ export function verifyPushedIntegration(cwd: string, job: IntegrationJob): void 
   const current = integrationRepository(cwd);
   if (job.targetKey ? current.targetKey !== job.targetKey : current.repo !== job.repo || current.fingerprint !== job.remoteFingerprint) throw new Error("Repository/origin changed since integration; verify the intended target before closing");
   if (job.state !== "pushed" || !job.mainCommit) throw new Error("Integration has not been pushed");
-  const ref = `refs/pi-handoff/integrations/${job.jobId}/closure`;
+  const ref = `refs/pi-cowork/integrations/${job.jobId}/closure`;
   gitSync(cwd, ["fetch", "--no-tags", "--no-write-fetch-head", "--", current.url, `+refs/heads/main:${ref}`]);
   try {
     gitSync(cwd, ["merge-base", "--is-ancestor", job.commit, ref]);
@@ -33,7 +33,7 @@ export class IntegrationWorker {
   constructor(store: HandoffStore, repo: string) { this.store = store; this.repo = repo; this.queue = new IntegrationQueue(store); }
 
   start(): void {
-    const tick = () => { void this.tick().catch(error => console.error("Handoff integration worker:", error)); };
+    const tick = () => { void this.tick().catch(error => console.error("CoWork integration worker:", error)); };
     this.timer = setInterval(tick, 1000);
     this.timer.unref();
     tick();
@@ -117,7 +117,7 @@ export class IntegrationWorker {
       const repository = integrationRepository(dirname(this.repo));
       if (repository.fingerprint !== job.remoteFingerprint) throw new Error("origin changed after review; integration requires a new explicit review/retry");
       if (!await this.ancestor(job.reviewedBase, job.commit)) throw new Error("Reviewed base is not an ancestor of the delivered commit");
-      const ref = `refs/pi-handoff/integrations/${job.jobId}`;
+      const ref = `refs/pi-cowork/integrations/${job.jobId}`;
       for (let attempt = 0; attempt < 3; attempt++) {
         if (worktree) { await this.git(["worktree", "remove", worktree]); worktree = undefined; }
         const remoteRef = `${ref}/remote`;
@@ -131,7 +131,10 @@ export class IntegrationWorker {
             if (policy?.revision !== job.policyRevision || JSON.stringify(policy.checks) !== JSON.stringify(job.checks)) throw new Error('Project policy changed; review and explicitly retry');
             const outside = await ledger.outsideQueue(dirname(this.repo), target);
             let retained = '';
-            try { retained = await this.git(['rev-parse', `${ref}/candidate`]); } catch {}
+            try { retained = await this.git(['rev-parse', `${ref}/candidate`]); } catch {
+              // An older worker may have pushed before recording its receipt.
+              try { retained = await this.git(['rev-parse', `refs/pi-handoff/integrations/${job.jobId}/candidate`]); } catch {}
+            }
             if (outside.length && !(retained === target && outside.length === 1 && outside[0] === retained && await this.ancestor(job.commit, target))) throw new Error(`Queue-external main update requires review: ${outside.join(', ')}`);
           } finally { ledger.close(); }
         }
@@ -144,7 +147,7 @@ export class IntegrationWorker {
         worktree = join(this.store.rootDir, "integrations", createHash("sha256").update(this.repo).digest("hex").slice(0, 16), `${job.jobId}-${randomUUID()}`);
         mkdirSync(dirname(worktree), { recursive: true, mode: 0o700 });
         await this.git(["worktree", "add", "--detach", worktree, target]);
-        if (!included) await this.git(["-c", "user.name=Pi CoWork", "-c", "user.email=pi-cowork@localhost", "merge", "--no-ff", "--no-edit", "-m", `Merge handoff #${job.taskId}: ${task.subject.replace(/[\r\n]/g, ' ')} (${job.deliveryId ?? job.commit.slice(0, 12)})`, job.commit], worktree);
+        if (!included) await this.git(["-c", "user.name=Pi CoWork", "-c", "user.email=pi-cowork@localhost", "merge", "--no-ff", "--no-edit", "-m", `Merge CoWork #${job.taskId}: ${task.subject.replace(/[\r\n]/g, ' ')} (${job.deliveryId ?? job.commit.slice(0, 12)})`, job.commit], worktree);
         const merged = await this.git(["rev-parse", "HEAD"], worktree);
         for (const check of job.checks) await this.command(worktree, check.command, check.args, 600000);
         if (await this.git(["rev-parse", "HEAD"], worktree) !== merged || await this.git(["status", "--porcelain", "--untracked-files=no"], worktree)) throw new Error("Integration checks changed HEAD or tracked files; nothing was pushed");

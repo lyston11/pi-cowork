@@ -45,9 +45,17 @@ export function initializeWorkspaces(db: DatabaseSync): void {
     );
   `);
   for (const table of ['handoff_deliveries', 'handoff_workspace_events', 'handoff_target_events']) db.exec(`
-    CREATE TRIGGER IF NOT EXISTS ${table}_no_update BEFORE UPDATE ON ${table} BEGIN SELECT RAISE(ABORT,'Handoff records are append-only'); END;
-    CREATE TRIGGER IF NOT EXISTS ${table}_no_delete BEFORE DELETE ON ${table} BEGIN SELECT RAISE(ABORT,'Handoff records are append-only'); END;
+    CREATE TRIGGER IF NOT EXISTS ${table}_no_update BEFORE UPDATE ON ${table} BEGIN SELECT RAISE(ABORT,'CoWork records are append-only'); END;
+    CREATE TRIGGER IF NOT EXISTS ${table}_no_delete BEFORE DELETE ON ${table} BEGIN SELECT RAISE(ABORT,'CoWork records are append-only'); END;
   `);
+  // Store initialization runs this inside one transaction, so the old guards
+  // remain effective until their error text is replaced atomically.
+  const legacy = db.prepare("SELECT name,sql FROM sqlite_master WHERE type='trigger' AND instr(sql,'Handoff records are append-only')>0").all();
+  for (const row of legacy) {
+    const name = String(row.name);
+    if (!/^handoff_\w+_no_(update|delete)$/.test(name)) continue;
+    db.exec(`DROP TRIGGER "${name}"; ${String(row.sql).replaceAll('Handoff records are append-only', 'CoWork records are append-only')}`);
+  }
 }
 
 export interface Workspace {
@@ -132,7 +140,7 @@ export class WorkspaceLedger {
   }
   async remoteHead(cwd: string): Promise<string> {
     const target = integrationRepository(cwd);
-    const ref = 'refs/pi-handoff/reconciliation/main';
+    const ref = 'refs/pi-cowork/reconciliation/main';
     await git(cwd, ['fetch', '--no-tags', '--no-write-fetch-head', '--', target.url, `+refs/heads/main:${ref}`]);
     return git(cwd, ['rev-parse', ref]);
   }
@@ -175,7 +183,7 @@ export class WorkspaceLedger {
     const commits = list(await git(cwd, ['rev-list', '--reverse', `${w.base}..${tip}`]));
     const files = (await git(cwd, ['diff', '--name-status', '-z', w.base, tip])).split('\0').filter(Boolean);
     const tree = await git(cwd, ['rev-parse', `${tip}^{tree}`]);
-    const id = randomUUID(), ref = `refs/pi-handoff/deliveries/${id}`;
+    const id = randomUUID(), ref = `refs/pi-cowork/deliveries/${id}`;
     const digest = createHash('sha256').update(JSON.stringify({ base: w.base, tip, tree, commits, files })).digest('hex');
     await git(cwd, ['update-ref', ref, tip, '']);
     return this.transaction(() => {
@@ -220,7 +228,7 @@ export class WorkspaceLedger {
     const heads = list(await git(cwd, ['for-each-ref', '--format=%(refname) %(objectname)', 'refs/heads/']));
     let remoteBranches: string[] = [];
     try { remoteBranches = list(await git(cwd, ['ls-remote', '--heads', 'origin']));
-      await git(cwd, ['fetch', '--no-tags', '--no-write-fetch-head', '--', target.url, '+refs/heads/*:refs/pi-handoff/audit/heads/*']);
+      await git(cwd, ['fetch', '--no-tags', '--no-write-fetch-head', '--', target.url, '+refs/heads/*:refs/pi-cowork/audit/heads/*']);
     } catch (e) { errors.push(String(e)); }
     const unregistered = heads.map(h => { const [branch, tip] = h.split(' '); return { branch, tip }; })
       .filter(h => h.branch !== 'refs/heads/main' && !registered.some(w => w.branch === h.branch));
@@ -326,7 +334,7 @@ export class WorkspaceLedger {
     const sides = this.store.sides().filter(s => s.worktree === w.path && alive(s.pid));
     if (sides.length) throw new Error('A registered live Pi still owns this worktree; retire from another idle location');
     const tip = item.tip!;
-    await git(cwd, ['update-ref', `refs/pi-handoff/retired/${w.id}`, tip]);
+    await git(cwd, ['update-ref', `refs/pi-cowork/retired/${w.id}`, tip]);
     if (await git(w.path, ['rev-parse', 'HEAD']) !== tip || await git(w.path, ['status', '--porcelain=v1', '-uall', '--ignored']) || await git(w.path, ['symbolic-ref', '-q', 'HEAD']) !== w.branch) throw new Error('Workspace changed during retirement; nothing removed');
     if (remove) {
       // Git refuses dirty/locked worktrees. Keep a permanent ref and compare-delete the branch.

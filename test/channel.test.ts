@@ -102,7 +102,7 @@ test("ambiguous populated legacy histories fail explicitly without hiding or mod
     const main = repo(join(root, "main"), "https://example.test/team/repo.git");
     const ids = [hash("remote:https://example.test/team/repo"), hash("remote:example.test:team/repo")];
     for (const id of ids) history(state, id, main);
-    assert.throws(() => resolveChannel(main, state), /Multiple existing handoff histories/);
+    assert.throws(() => resolveChannel(main, state), /Multiple existing CoWork histories/);
     for (const id of ids) assertHistory(join(state, id));
     assert(existsSync(join(state, "channels.sqlite")));
   } finally { rmSync(root, { recursive: true, force: true }); }

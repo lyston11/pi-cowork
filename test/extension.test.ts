@@ -31,11 +31,13 @@ test("tool boundary binds identity to session, never accepts an actor from argum
     assert.equal(commands.has('cowork'), true);
     assert.equal(commands.has('handoff'), false);
     assert.equal([...tools.keys()].some(name => name.startsWith('handoff_')), false);
+    assert.doesNotMatch([...tools.values()].map(tool => tool.label).join('\n'), /handoff/i);
     const context = (session: string) => ({ sessionManager: { getSessionId: () => session, getSessionName: () => `side ${session}` }, ui: { notify() {} } });
     const execute = (session: string, tool: string, args: unknown) => tools.get(tool).execute("call", args, undefined, undefined, context(session));
     const a = (await execute("one", "cowork_identity", { name: "project lead" })).details.self;
     const b = (await execute("two", "cowork_identity", { name: "data" })).details.self;
     await execute("three", "cowork_identity", { name: "frontend" });
+    await assert.rejects(execute("one", "cowork_create", { to: "missing-side", subject: "secret", body: "PRIVATE-TEXT", items: ["done"], requiresIntegration: false }), /use an id from cowork_sides/);
     const created = await execute("one", "cowork_create", { to: b.id, subject: "secret", body: "PRIVATE-TEXT", items: ["done"], requiresIntegration: false });
     const id = created.details.task.id;
     await assert.rejects(execute("one", "cowork_block", { id, reason: "approval", waitingFor: "reviewer" }), /Only the assignee/);

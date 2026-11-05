@@ -65,6 +65,8 @@ test("only reviewed creator can queue; code closure is guarded even for legacy S
     await consume(f);
     const pushed = f.queue.read(job.jobId);
     assert.equal(pushed.state, "pushed", pushed.note); verifyPushedIntegration(f.repo, pushed);
+    assert.match(f.git(f.repo, "log", "-1", "--format=%s", pushed.mainCommit!), /^Merge CoWork #/);
+    assert(f.git(f.repo, "for-each-ref", "--format=%(refname)", "refs/pi-cowork/integrations").includes(`/${job.jobId}/closure`));
     assert.throws(() => f.store.reopen(id, 'a', 'already merged'), /Already integrated/);
     const old = new DatabaseSync(f.store.dbPath);
     try { assert.throws(() => old.prepare("INSERT INTO handoff_task_events(task_id,actor,kind,data_json,at) VALUES(?,?,'close',?,?)").run(id, 'a', JSON.stringify({ commit, note: 'missing integration receipt' }), new Date().toISOString()), /Integrate and push/); } finally { old.close(); }

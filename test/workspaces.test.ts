@@ -36,6 +36,7 @@ test('frozen C2 delivery never includes C3; closing its task cannot hide new cod
  const f=fixture();try{
   await f.ledger.configure(f.repo,'a',f.base,f.checks,'Reviewed existing main and project checks');
   const path=f.branch('feature'),t=f.task(),c2=f.commit(path,'C2'),d=await f.deliver(path,t.id,c2);
+  assert.match(d.ref,/^refs\/pi-cowork\/deliveries\//);
   const job=f.enqueue(t.id,d),c3=f.commit(path,'C3');
   await f.consume();const done=f.queue.read(job.jobId);assert.equal(done.state,'pushed',done.note);
   f.git(f.repo,'merge-base','--is-ancestor',c2,done.mainCommit!);
@@ -45,6 +46,19 @@ test('frozen C2 delivery never includes C3; closing its task cannot hide new cod
   const r=await f.ledger.reconcile(f.repo,'b'),w=r.workspaces[0];assert.ok('undelivered' in w);assert.deepEqual(w.undelivered,[c3]);assert.equal(w.eligibleForRetirement,false);assert.ok(w.ignored!.includes('ignored'));
   await assert.rejects(f.ledger.retire(f.repo,'b',w.workspace.id,true),/still has/);assert.equal(readFileSync(join(path,'ignored'),'utf8'),'keep too');
   assert.equal((await f.ledger.reconcile(f.repo,'c')).workspaces.length,0);
+ }finally{f.close();}
+});
+
+test('an interrupted legacy integration retains its candidate when new CoWork refs are used',async()=>{
+ const f=fixture();try{
+  await f.ledger.configure(f.repo,'a',f.base,f.checks,'reviewed existing main');
+  const p=f.branch('legacy'),t=f.task(),tip=f.commit(p,'ready'),d=await f.deliver(p,t.id,tip),job=f.enqueue(t.id,d);
+  const legacy=`refs/pi-handoff/integrations/${job.jobId}/candidate`;
+  f.git(f.repo,'update-ref',legacy,tip);f.git(p,'push','origin',`${tip}:main`);
+  await f.consume();const result=f.queue.read(job.jobId);assert.equal(result.state,'pushed',result.note);
+  assert.equal(f.git(f.repo,'rev-parse',legacy),tip);
+  assert.equal(f.git(f.repo,'rev-parse',`refs/pi-cowork/integrations/${job.jobId}/candidate`),tip);
+  assert.deepEqual(await f.ledger.outsideQueue(f.repo,tip),[]);
  }finally{f.close();}
 });
 
@@ -176,6 +190,6 @@ test('retirement preserves a pinned ref and removes only clean fully integrated,
   const w=f.ledger.read(d.workspaceId,'b');assert.equal((await f.ledger.reconcile(f.repo,'b')).workspaces[0].eligibleForRetirement,true);
   const occupied=workspaceOccupancy(p);
   if (occupied) { await assert.rejects(f.ledger.retire(f.repo,'b',w.id,true),/occupancy/);assert.ok(existsSync(p));assert.equal(f.ledger.read(w.id).state,'active'); }
-  else { const retired=await f.ledger.retire(f.repo,'b',w.id,true);assert.equal(retired.state,'retired');assert.equal(existsSync(p),false);assert.equal(f.git(f.repo,'rev-parse',`refs/pi-handoff/retired/${w.id}`),tip);assert.throws(()=>f.git(f.repo,'rev-parse','--verify','refs/heads/feature')); }
+  else { const retired=await f.ledger.retire(f.repo,'b',w.id,true);assert.equal(retired.state,'retired');assert.equal(existsSync(p),false);assert.equal(f.git(f.repo,'rev-parse',`refs/pi-cowork/retired/${w.id}`),tip);assert.throws(()=>f.git(f.repo,'rev-parse','--verify','refs/heads/feature')); }
  }finally{f.close();}
 });

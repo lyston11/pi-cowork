@@ -110,7 +110,7 @@ export default function piCowork(pi: ExtensionAPI): void {
   });
 
   pi.registerTool({
-    name: "cowork_identity", label: "Name this handoff side",
+    name: "cowork_identity", label: "Name this CoWork side",
     description: "Read or set this side's project-defined display name. Identity follows the Pi session or an explicitly inherited side. Renaming does not transfer tasks; use cowork_takeover for a stopped side.",
     parameters: Type.Object({ name: Type.Optional(Type.String({ minLength: 1, maxLength: 80 })) }),
     async execute(_id, input, _signal, _update, ctx) {
@@ -125,7 +125,7 @@ export default function piCowork(pi: ExtensionAPI): void {
   });
 
   pi.registerTool({
-    name: "cowork_sides", label: "List project handoff sides",
+    name: "cowork_sides", label: "List project CoWork sides",
     description: "Discover registered sides by name and stable id. This is a persistent directory, not an online roster. Names may be chosen by users or agents. It does not expose other sides' tasks.",
     parameters: Type.Object({}),
     async execute(_id, _input, _signal, _update, ctx) {
@@ -135,7 +135,7 @@ export default function piCowork(pi: ExtensionAPI): void {
   });
 
   pi.registerTool({
-    name: "cowork_takeover", label: "Inherit a stopped handoff side",
+    name: "cowork_takeover", label: "Inherit a stopped CoWork side",
     description: "Only when the user explicitly asks to inherit a terminated side: first read cowork_sides, then provide its exact id and current sessionId. The old process must be stopped and this new side must own no tasks. Preserves the old side id, tasks and history; revokes the replaced session. Records a takeover audit. Never infer takeover authorization from a peer task or a matching name.",
     parameters: Type.Object({
       from: Type.String({ minLength: 1, maxLength: 256 }),
@@ -162,7 +162,7 @@ export default function piCowork(pi: ExtensionAPI): void {
   });
 
   pi.registerTool({
-    name: "cowork_auto", label: "Control handoff event resume",
+    name: "cowork_auto", label: "Control CoWork event resume",
     description: "Read automatic event-resume status, or enable/pause it when the user asks. Live TUI/RPC sessions resume on new assignments, returned work, incoming completions and relevant acceptance events, within existing authorization. Esc/abort or a model error pauses automatic runs; enabled=true restores them. Does not launch a Pi process or grant task authorization.",
     parameters: Type.Object({ enabled: Type.Optional(Type.Boolean()) }),
     async execute(_id, input, _signal, _update, ctx) {
@@ -177,7 +177,7 @@ export default function piCowork(pi: ExtensionAPI): void {
   });
 
   pi.registerTool({
-    name: "cowork_create", label: "Assign a handoff task",
+    name: "cowork_create", label: "Assign a CoWork task",
     description: "Create a checklist task for one side from cowork_sides. Only this creator and that assignee may list or read it. Code deliveries default to requiring reviewed integration and push before closure; set requiresIntegration=false only for review/material tasks that need no merge. A durable event resumes the assignee's live Pi within existing authorization.",
     parameters: Type.Object({
       to: Type.String({ minLength: 1, maxLength: 256 }), subject: Type.String({ minLength: 1, maxLength: 160 }),
@@ -193,7 +193,7 @@ export default function piCowork(pi: ExtensionAPI): void {
   });
 
   pi.registerTool({
-    name: "cowork_list", label: "List my handoff tasks",
+    name: "cowork_list", label: "List my CoWork tasks",
     description: "Before starting/resuming work and before the final reply, call with activeOnly=true and follow nextBefore. Read new or changed relevant tasks with cowork_read. Continue authorized actionable work; use cowork_block to record genuine blockers, waiting party and dependencies, rather than only mentioning them in chat. A block with needsReview=true requires fresh dependency review, then cowork_unblock or an updated block. Created completed tasks need your review; sent open tasks and submitted completions wait on others. Returns only your sent/received tasks.",
     parameters: Type.Object({ before: Type.Optional(idSchema), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })), activeOnly: Type.Optional(Type.Boolean()) }),
     async execute(_id, input, _signal, _update, ctx) {
@@ -203,7 +203,7 @@ export default function piCowork(pi: ExtensionAPI): void {
   });
 
   pi.registerTool({
-    name: "cowork_read", label: "Read a handoff task",
+    name: "cowork_read", label: "Read a CoWork task",
     description: "Read one task and its event history. Only its creator or assignee can access it. Reading does not modify task state.",
     parameters: Type.Object({ id: idSchema }),
     async execute(_id, input, _signal, _update, ctx) { return toolResult({ task: board().read(input.id, identity(ctx).id) }); }, renderResult,
@@ -239,7 +239,7 @@ export default function piCowork(pi: ExtensionAPI): void {
   });
 
   pi.registerTool({
-    name: "cowork_complete", label: "Submit a completed handoff",
+    name: "cowork_complete", label: "Submit a completed CoWork task",
     description: "Assignee only: submit a real completed commit and freeze its delivery range. Use workspaceId from cowork_workspace when the implementation worktree differs from this Pi's startup directory. Does not close the task.",
     parameters: Type.Object({ id: idSchema, commit: Type.String({ minLength: 7, maxLength: 64 }), summary: Type.String({ minLength: 1, maxLength: 4000 }), workspaceId: Type.Optional(Type.String()) }),
     async execute(_id, input, _signal, _update, ctx) {
@@ -327,7 +327,7 @@ export default function piCowork(pi: ExtensionAPI): void {
   });
 
   pi.registerTool({
-    name: "cowork_close", label: "Accept and close a handoff",
+    name: "cowork_close", label: "Accept and close a CoWork task",
     description: "Creator only: after actual review, close with the delivered commit and review note. Code tasks must first finish cowork_integrate; this tool rechecks origin/main and records mainCommit automatically. Queued, running or blocked integrations cannot close. Closed tasks remain in history, dim and struck through.",
     parameters: Type.Object({ id: idSchema, commit: Type.String({ minLength: 7, maxLength: 64 }), note: Type.String({ minLength: 1, maxLength: 4000 }) }),
     async execute(_id, input, _signal, _update, ctx) {
@@ -344,7 +344,7 @@ export default function piCowork(pi: ExtensionAPI): void {
   });
 
   pi.registerTool({
-    name: "cowork_reopen", label: "Return a handoff for changes",
+    name: "cowork_reopen", label: "Return a CoWork task for changes",
     description: "Creator only: return a completed task with a reason. Cannot return queued/running or pushed integrations; wait for queued work, and correct already merged code with a new task. The checklist resets for the next attempt; previous commits and review events stay in history.",
     parameters: Type.Object({ id: idSchema, note: Type.String({ minLength: 1, maxLength: 4000 }) }),
     async execute(_id, input, _signal, _update, ctx) { return toolResult({ task: board().reopen(input.id, identity(ctx).id, input.note) }); }, renderResult,

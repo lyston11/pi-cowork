@@ -114,7 +114,7 @@ export function resolveChannel(cwd: string, stateBase = process.env.PI_COWORK_ST
         }
         const populated = [...candidates.values()].filter((candidate) => candidate.populated);
         if (alias && populated.some((candidate) => candidate.id !== alias.channel) || populated.length > 1) {
-          throw new Error("Multiple existing handoff histories resolve to this project. Databases are preserved; reconcile them before binding instead of hiding or renumbering tasks.");
+          throw new Error("Multiple existing CoWork histories resolve to this project. Databases are preserved; reconcile them before binding instead of hiding or renumbering tasks.");
         }
         id = alias ? String(alias.channel) : populated[0]?.id ?? [...candidates.keys()][0] ?? hash(remote?.alias ?? repoKey);
         registry.prepare("INSERT INTO project_bindings(project,channel) VALUES(?,?)").run(repoKey, id);

@@ -20,9 +20,9 @@ function integer(value: number, name: string, minimum: number): number {
 
 const immutable = (table: string) => `
   CREATE TRIGGER IF NOT EXISTS ${table}_no_update BEFORE UPDATE ON ${table}
-    BEGIN SELECT RAISE(ABORT, 'Handoff records are append-only'); END;
+    BEGIN SELECT RAISE(ABORT, 'CoWork records are append-only'); END;
   CREATE TRIGGER IF NOT EXISTS ${table}_no_delete BEFORE DELETE ON ${table}
-    BEGIN SELECT RAISE(ABORT, 'Handoff records are append-only'); END;
+    BEGIN SELECT RAISE(ABORT, 'CoWork records are append-only'); END;
 `;
 
 export interface HumanTaskSnapshot {
@@ -388,7 +388,7 @@ export class HandoffStore {
     const binding = this.db.prepare("SELECT side_id FROM handoff_side_bindings WHERE session_id=?").get(sessionId);
     if (binding) return this.sides(true).find((side) => side.id === binding.side_id);
     if (this.db.prepare("SELECT 1 FROM handoff_side_transfers WHERE from_session=? LIMIT 1").get(sessionId)) {
-      throw new Error("This session was replaced by a handoff takeover. It cannot reclaim the old side.");
+      throw new Error("This session was replaced by a CoWork takeover. It cannot reclaim the old side.");
     }
     return this.sides(true).find((side) => side.sessionId === sessionId);
   }
@@ -402,9 +402,9 @@ export class HandoffStore {
       const current = sides.find((side) => side.id === actor.id);
       const target = sides.find((side) => side.id === targetId);
       if (!current || current.sessionId !== actor.sessionId) throw new Error("Current side ownership has changed");
-      if (!target) throw new Error("Target side not found; use an id from handoff_sides");
+      if (!target) throw new Error("Target side not found; use an id from cowork_sides");
       if (target.id === actor.id) return current;
-      if (target.sessionId !== expectedSessionId) throw new Error("Target ownership changed; read handoff_sides again before taking over");
+      if (target.sessionId !== expectedSessionId) throw new Error("Target ownership changed; read cowork_sides again before taking over");
       if (this.db.prepare("SELECT 1 FROM handoff_tasks WHERE creator=? OR assignee=? LIMIT 1").get(actor.id, actor.id)) {
         throw new Error("Current side already owns tasks. Start a fresh Pi session to take over without losing its access.");
       }
@@ -471,9 +471,9 @@ export class HandoffStore {
     const key = input.idempotencyKey === undefined ? null : text(input.idempotencyKey, "Idempotency key", 160);
     return this.transaction(() => {
       const matches = this.sides().filter((side) => side.id === to || side.name === to);
-      if (matches.length !== 1) throw new Error("Assignee not found or name is ambiguous; use an id from handoff_sides");
+      if (matches.length !== 1) throw new Error("Assignee not found or name is ambiguous; use an id from cowork_sides");
       const assignee = matches[0].id;
-      if (assignee === actor) throw new Error("Assign the handoff to another side");
+      if (assignee === actor) throw new Error("Assign the CoWork task to another side");
       const hash = createHash("sha256").update(JSON.stringify({ assignee, subject, body, items, refs, ...(requiresIntegration ? { requiresIntegration } : {}) })).digest("hex");
       if (key !== null) {
         const existing = this.db.prepare("SELECT id,payload_hash FROM handoff_tasks WHERE creator=? AND idempotency_key=?").get(actor, key);
