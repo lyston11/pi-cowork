@@ -40,6 +40,9 @@ test("managed block upgrades leave surrounding bytes and line endings alone", ()
 });
 
 test("event scope keeps summary safeguards and never equates listed with read", () => {
+  assert.match(HANDOFF_RULES, /urgent、high、normal 或 low/);
+  assert.match(HANDOFF_RULES, /同一状态且条件具备/);
+  assert.match(HANDOFF_RULES, /高优先级不解除阻塞/);
   assert.match(HANDOFF_RULES, /摘要分页/);
   assert.match(HANDOFF_RULES, /本轮事件对象、必要依赖/);
   assert.match(HANDOFF_RULES, /首次接触、上下文不足或版本不明/);
