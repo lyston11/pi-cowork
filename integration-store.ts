@@ -67,7 +67,8 @@ export class IntegrationQueue {
     catch (error) { this.db.exec("ROLLBACK"); throw error; }
   }
   private job(row: Record<string, unknown>): IntegrationJob {
-    return { jobId: String(row.id), taskId: Number(row.task_id), creator: String(row.creator),
+    return { reviewMode: this.db.prepare("SELECT creator=assignee AS local FROM handoff_tasks WHERE id=?").get(Number(row.task_id))?.local ? "self" : "peer",
+      jobId: String(row.id), taskId: Number(row.task_id), creator: String(row.creator),
       state: row.state as TaskIntegration["state"], commit: String(row.commit_hash), repo: String(row.repo),
       remoteFingerprint: String(row.remote_fingerprint), reviewedBase: String(row.reviewed_base),
       checks: JSON.parse(String(row.checks_json)), attempts: Number(row.attempts),
@@ -78,9 +79,9 @@ export class IntegrationQueue {
       note: String(row.note), ...(row.main_commit ? { mainCommit: String(row.main_commit) } : {}) };
   }
   private event(job: IntegrationJob): void {
-    const { jobId, state, commit, mainCommit, note, deliveryId } = job;
+    const { jobId, state, commit, mainCommit, note, deliveryId, reviewMode } = job;
     this.db.prepare("INSERT INTO handoff_task_events(task_id,actor,kind,data_json,at) VALUES(?,?,'integration',?,?)")
-      .run(job.taskId, job.creator, JSON.stringify({ jobId, state, commit, mainCommit, note, deliveryId, ...(state === "pushed" ? { checks: job.checks } : {}) }), new Date().toISOString());
+      .run(job.taskId, job.creator, JSON.stringify({ jobId, state, commit, mainCommit, note, deliveryId, reviewMode, ...(state === "pushed" ? { checks: job.checks } : {}) }), new Date().toISOString());
   }
   read(id: string): IntegrationJob {
     const row = this.db.prepare("SELECT * FROM handoff_integrations WHERE id=?").get(id);

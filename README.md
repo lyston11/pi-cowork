@@ -4,7 +4,7 @@
 
 每个 Pi 会话自动成为一“侧”，用户或 Agent 可以给它命名为“前端”“数据”“工具”等角色。侧的数量和名称没有固定限制；同一侧既可以发起任务，也可以承接任务。通信不要求特定分支、worktree 或项目配置文件。
 
-当前版本：**V5.2.0**。项目、GitHub 仓库与扩展统一命名为 **pi-cowork**，唯一命令入口为 `/cowork`，Agent 工具统一为 `cowork_*`。旧命令和工具不提供别名。
+当前版本：**V5.3.0**。项目、GitHub 仓库与扩展统一命名为 **pi-cowork**，唯一命令入口为 `/cowork`，Agent 工具统一为 `cowork_*`。旧命令和工具不提供别名。
 
 ## 设计目标
 
@@ -13,8 +13,8 @@
 Pi CoWork 因此采用以下设计：
 
 - **项目外持久化：** 数据保存在用户级 SQLite 中，各工作树共用，不进入业务仓库的 Git 版本。
-- **定向任务：** 每条任务只有一个发起方和一个承接方，Agent 工具只允许双方访问。
-- **交付与验收分开：** 承接方完成不等于关闭，必须由发起方审查相同的 commit。
+- **本侧与跨侧任务：** 自己的工作自己登记和完成，需要其他侧实施时才转交；Agent 工具仍只允许任务参与方访问。
+- **交付与收口分开：** 本侧自行核查和集成，跨侧由发起方核查相同 commit。本侧核查不冒充独立审查。
 - **追加历史：** 勾选、交付、退回和关闭都记录事件，保留以前的尝试。
 - **事件续跑：** Agent 在开工和收尾时查询；相关交接事件到达后，存活的 Pi 会自动开始下一轮检查，不用再手动说“继续”。
 
@@ -166,12 +166,20 @@ cowork_takeover({ from: 旧侧ID, expectedSessionId: 旧会话ID, reason: 接管
 
 ## 任务状态、验收与责任
 
+### 本侧任务
+
+`cowork_create` 省略 `to`（或填写本侧 ID）即创建 `kind=local` 的本侧任务：自己实施、勾清单、提交、核查、入队集成并关闭。不需要发现其他侧，更不能为登记、核查或合并而把实施派出去。指定其他侧才是 `kind=handoff`，保留跨侧权限与发起方验收。
+
+本侧代码任务仍须登记工作树、冻结精确交付范围、执行统一检查并确认推送。集成和关闭记录标明 `reviewMode=self` 或 `peer`，它表示参与模式，不证明审查充分。项目明确要求独立审查时，另交纯审查任务（`requiresIntegration=false`），对侧只提供意见，实施和集成仍归原主责。清单只列交付前可验收事项，不能把集成、推送或关闭列作 `complete` 的前置条件。
+
 ```mermaid
 stateDiagram-v2
     [*] --> open: 发起方创建
     open --> completed: 承接方勾完清单并提交 commit
     completed --> closed: 发起方审查相同 commit 后关闭
     completed --> open: 发起方退回修改
+    open --> cancelled: 发起方附原因取消
+    completed --> cancelled: 未入队或集成受阻且未推送时取消
 ```
 
 | 状态 | 含义与下一步 |
@@ -179,6 +187,11 @@ stateDiagram-v2
 | `open` | 承接方待实施，可勾选或取消勾选清单 |
 | `completed` | 承接方已提交，等待发起方验收；不等于已关闭 |
 | `closed` | 发起方已验收，显示为灰色删除线，历史保留 |
+| `cancelled` | 正式撤回，保留原因和历史，不作为活动任务、完成或验收 |
+
+用 `cowork_cancel({ id, reason })` 或 `/cowork cancel <id> <reason>` 正式撤回，不能只回复“撤回”。只有发起方可取消，本侧任务由自己取消；取消后不可修改、交付或重开。排队、执行中或已推送的交付不能取消。取消通知对侧停止，让相关依赖进入复核，但不自动解除阻塞。本侧取消不对自己发送重复通知。
+
+取消不删除文件、提交、快照或未合入代码；工作区仍按实际代码和资料判断能否清理。升级不会自动撤回历史错派任务。
 
 任务优先级分为 `urgent`、`high`、`normal`、`low`，默认是 `normal`。创建任务时设置 `priority`，双方可用 `cowork_priority` 调整未关闭任务的优先级。同一状态且具备执行条件时，Agent 优先处理高等级任务；高优先级不会解除阻塞或覆盖依赖、责任与授权。面板在同一状态组内按紧急程度排序，并显示 P0–P3。旧任务迁移为 `normal`。
 
@@ -298,7 +311,8 @@ cowork_workspace({ action: "retire", workspaceId: 工作区ID, remove: true })
 | 发起方 | `open`，收到首次阻塞回报 | 核对责任和独立工作，补内部输入或向用户报告外部条件 |
 | 发起方 | `open`，无新阻塞回报 | 等待承接方交付 |
 | 承接方 | `completed` | 等待发起方验收 |
-| 任一参与方 | `closed` | 保留历史，无后续待办 |
+| 本侧任务主责 | `open`／`completed` | 自己实施、核查、集成和关闭，不等另一侧接手 |
+| 任一参与方 | `closed`／`cancelled` | 保留历史，无后续待办 |
 
 Agent 不能替另一侧勾清单或验收。等待他侧、缺少必要授权或外部依赖时，承接方应登记阻塞原因、责任方和恢复条件，不能只在对话中声称阻塞，也不需要为清空未关闭数量而反复查询或越权处理。
 
@@ -333,6 +347,9 @@ TUI 和 RPC 长驻 Pi 会话默认启用自动续跑；`--print` 单次进程不
 | 验收关闭 | 承接方；仅在仍有本侧待办或待验收事项时重查依赖 |
 | 登记的依赖交付、退回或验收 | 被阻塞任务的承接方，核对依赖后解除或更新阻塞 |
 | 首次登记阻塞 | 发起方复核并处理或报告；同一段持续阻塞只通知一次 |
+| 正式取消 | 对侧停止处理，相关依赖复核，已取消目标不再被旧事件唤起 |
+
+本侧任务的创建、提交、退回、阻塞、回应和取消不向自己重复通知；尚可执行但未收口的本侧任务仍由 checkpoint 兜底，集成结果和变化的依赖仍会触发续跑。
 | 读取、勾选、改名、更新／解除阻塞 | 不触发续跑 |
 
 数据库触发器在写任务的同一事务里写事件，旧版进程写入也能被新版接收。升级时补齐现有记录；处理前过滤已失效事件，同一批内同一任务的变化合并，只有任务编号和变更类型进入续跑提示，不包含他侧正文。
@@ -440,7 +457,7 @@ Agent 的 `cowork_list` 与面板排序不同：工具按编号倒序返回，�
 - `cowork_sides` 默认每页 30 侧，最多 100 侧；可传 `query` 按名称／ID 子串筛选。用返回的 `nextAfter` 作为下一次的 `after`，不能把第一页当作完整目录。分页按稳定 ID 排序，不受侧改名影响。
 - `cowork_list` 只向模型返回任务摘要、`revision`、清单进度、当前阻塞与集成状态；完整正文、清单、引用和历史用 `cowork_read` 读取。`revision` 用于比较摘要是否变化，不能替代 checkpoint 或依赖变化要求的重新核对。
 - 创建、勾选、阻塞等状态操作也只向模型返回摘要。用户面板保留完整详情，任务数据和权限没有删减。
-- 工具结果使用紧凑 JSON；续跑按 `created/reopen/blocked/dependency/reply/complete/integration/close/checkpoint` 分组生成定向计划，混合批次保留每个目标，不夹带任务正文。
+- 工具结果使用紧凑 JSON；续跑按 `created/reopen/blocked/dependency/reply/complete/integration/close/cancel/checkpoint` 分组生成定向计划，混合批次保留每个目标，不夹带任务正文。
 - 事件对象及必要依赖先读；前后仍查完摘要分页，其余只读新增、变化或仍可执行任务。只有当前会话真正读过全文并有已读 revision 基线的稳定等待项才可跳过；未知基线要补读，不能把列出视为已读。`cowork_read` 同时返回所读 revision，checkpoint 或复核事件即使摘要未变也必须重读。
 - 这是模型执行规则与定向消息计划，不是禁止模型读其他相关任务的工具门禁。权限、完整正文、阻塞复核、投递去重和暂停机制不变。
 
@@ -461,6 +478,7 @@ Agent 的 `cowork_list` 与面板排序不同：工具按编号倒序返回，�
 /cowork auto on             # 启用或恢复自动续跑
 /cowork auto off            # 暂停自动续跑，事件继续保留
 /cowork read 12             # 查看本侧参与的一条任务
+/cowork cancel 12 原因       # 正式撤回，保留历史和实际代码
 /cowork remove              # 注销当前侧，先 auto off；不删除任务历史
 /cowork remove pi_...       # 注销明确选定、已退出且无未关闭交接的侧
 /cowork takeover pi_...     # 从新会话显式接管已终止旧侧
@@ -477,7 +495,7 @@ Agent 的 `cowork_list` 与面板排序不同：工具按编号倒序返回，�
 | `cowork_remove_side` | 经用户明确要求，以目标 ID、expectedSessionId 和原因注销侧，保留历史 |
 | `cowork_takeover` | 经用户明确授权，以旧侧 ID、预期会话和原因接管 |
 | `cowork_auto` | 查询自动续跑状态；用户要求时通过 `enabled` 开启或暂停 |
-| `cowork_create` | 创建定向任务，填写 `to`、`subject`、`body`、`items`；可附 `priority`、`refs`、`idempotencyKey`；`requiresIntegration` 默认 true，纯审查任务显式 false |
+| `cowork_create` | 填写 `subject`、`body`、`items`；省略 `to` 创建本侧任务，指定其他侧才转交。可附 `priority`、`refs`、`idempotencyKey`；代码默认要求集成，纯审查显式 false |
 | `cowork_priority` | 任务双方调整未关闭任务的 `low`／`normal`／`high`／`urgent` 优先级；不改变权限、责任或状态 |
 | `cowork_list` | 查询本侧参与的任务，支持 `activeOnly`、`before`、`limit` 和返回的 `nextBefore` |
 | `cowork_read` | 读取本侧任务正文及历史，不改变状态 |
@@ -492,6 +510,7 @@ Agent 的 `cowork_list` 与面板排序不同：工具按编号倒序返回，�
 | `cowork_integrate` | 发起方审批集成，填 `id`、`commit`、`reviewedBase`、`checks`、`note`；受阻后显式 `retry=true` 重试 |
 | `cowork_close` | 发起方附相同 `commit`、审查 `note` 关闭；代码任务必须已推送并再次验证远端，自动记录集成提交 |
 | `cowork_reopen` | 发起方附原因 `note` 退回修改 |
+| `cowork_cancel` | 发起方附 `reason` 撤回未合入任务，终止待办并保留历史及代码 |
 | `cowork_status` | 本侧身份、频道、可见任务数、完整性和接管审计 |
 
 接收侧至少加载过一次扩展才能被发现。侧名可以重复，名称不明确时必须核对准确 ID；侧目录保留离线记录，不承诺对方在线。

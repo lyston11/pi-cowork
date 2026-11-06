@@ -32,6 +32,43 @@ function fixture() {
     close(){queue.close();ledger.close();store.close();rmSync(root,{recursive:true,force:true});}};
 }
 
+test('one owner can freeze its own range, queue, push and close without another implementer', async () => {
+ const f=fixture();try{
+  const p=f.branch('local-owner'),t=f.store.create({subject:'own implementation',body:'authorized by user',items:['done'],requiresIntegration:true},'a');
+  await f.ledger.configure(f.repo,'a',f.base,f.checks,'Reviewed current main and checks');
+  const tip=f.commit(p,'own-code');f.store.check(t.id,'a',1,true);
+  const d=await f.ledger.snapshot(p,'a',t.id,tip);f.store.complete(t.id,'a',tip,'implemented locally',d.id);
+  assert.throws(()=>f.store.closeTask(t.id,'a',tip,'too early'),/Integrate and push/);
+  const job=f.enqueue(t.id,d);assert.equal(job.reviewMode,'self');
+  assert.throws(()=>f.store.cancel(t.id,'a','race queue'),/queued\/running/);
+  await f.consume();const pushed=f.queue.read(job.jobId);assert.equal(pushed.state,'pushed',pushed.note);
+  assert.equal(pushed.reviewMode,'self');assert.equal(f.store.read(t.id,'a').integration!.reviewMode,'self');
+  assert.throws(()=>f.store.cancel(t.id,'a','hide pushed code'),/pushed/);
+  const closed=f.store.closeTask(t.id,'a',tip,'Self-verified; no independent review was claimed');
+  assert.equal(closed.state,'closed');assert.equal(closed.events.at(-1)!.data.reviewMode,'self');
+  assert.equal(f.git(f.repo,'show',pushed.mainCommit!+':own-code'),'own-code');
+  const report=await f.ledger.reconcile(f.repo,'a');assert.equal(report.workspaces[0].eligibleForRetirement,true);
+  assert.throws(()=>f.store.read(t.id,'b'),/not found or not visible/);
+ }finally{f.close();}
+});
+
+test('cancellation retires empty task obligations but cannot hide abandoned code or files', async () => {
+ const f=fixture();try{
+  const p=f.branch('cancelled-code'),t=f.task(),tip=f.commit(p,'keep-code'),d=await f.deliver(p,t.id,tip);
+  f.store.cancel(t.id,'a','mistaken delegation');
+  const report=await f.ledger.reconcile(f.repo,'b'),w=report.workspaces[0];
+  assert.ok(w.blockers!.includes('branch-not-integrated'));assert.ok(!w.blockers!.includes('open-tasks'));
+  assert.ok(w.undelivered!.includes(tip));assert.deepEqual(w.pendingDeliveries,[]);
+  assert.equal(f.git(p,'rev-parse',d.ref),tip,'cancel keeps the immutable code snapshot');
+  await assert.rejects(f.ledger.retire(f.repo,'b',w.workspace.id,true),/still has/);
+  assert.equal(existsSync(p),true);
+  const empty=f.branch('cancelled-empty'),local=f.store.create({subject:'unused',body:'withdrawn',items:['done'],requiresIntegration:true},'a');
+  const registration=await f.ledger.register(empty,'a',[local.id]);f.store.cancel(local.id,'a','not needed');
+  const clean=(await f.ledger.reconcile(f.repo,'a')).workspaces.find(x=>x.workspace.id===registration.id)!;
+  assert.equal(clean.eligibleForRetirement,true);
+ }finally{f.close();}
+});
+
 test('frozen C2 delivery never includes C3; closing its task cannot hide new code or files',async()=>{
  const f=fixture();try{
   await f.ledger.configure(f.repo,'a',f.base,f.checks,'Reviewed existing main and project checks');

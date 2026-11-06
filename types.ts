@@ -1,4 +1,4 @@
-export const HANDOFF_EXTENSION_VERSION = "5.2.0";
+export const HANDOFF_EXTENSION_VERSION = "5.3.0";
 
 export interface Side {
   id: string;
@@ -11,7 +11,8 @@ export interface Side {
 }
 
 export type TaskPriority = "urgent" | "high" | "normal" | "low";
-export type TaskState = "open" | "completed" | "closed";
+export type TaskState = "open" | "completed" | "closed" | "cancelled";
+export type TaskKind = "local" | "handoff";
 export interface TaskBlock {
   reason: string;
   waitingFor: string;
@@ -22,7 +23,7 @@ export interface TaskBlock {
 export interface TaskEvent {
   seq: number;
   actor: string;
-  kind: "check" | "complete" | "close" | "reopen" | "block" | "unblock" | "integration" | "reply" | "priority";
+  kind: "check" | "complete" | "close" | "reopen" | "block" | "unblock" | "integration" | "reply" | "priority" | "cancel";
   data: Record<string, unknown>;
   at: string;
 }
@@ -30,6 +31,9 @@ export interface TaskEvent {
 export interface HandoffTask {
   id: number;
   creator: Side;
+  assignee: Side;
+  kind: TaskKind;
+  cancellation?: { actor: string; reason: string; at: string };
   subject: string;
   priority: TaskPriority;
   body: string;
@@ -52,7 +56,8 @@ export interface HandoffTask {
 export type TaskSummary = Omit<HandoffTask, "body" | "events">;
 
 export interface CreateInput {
-  to: string;
+  to?: string;
+  refs?: string[];
   subject: string;
   body: string;
   items: string[];
@@ -67,6 +72,7 @@ export interface IntegrationCheck {
 }
 
 export interface TaskIntegration {
+  reviewMode?: "self" | "peer";
   deliveryId?: string;
   targetKey?: string;
   policyRevision?: string;

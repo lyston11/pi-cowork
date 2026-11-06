@@ -28,7 +28,7 @@ function modelTask(task: HandoffTask | TaskSummary) {
   const { body: _body, events: _events, ...summary } = task as HandoffTask;
   const stable = { ...summary, creator: side(task.creator), assignee: side(task.assignee) };
   return {
-    id: task.id, creator: stable.creator, assignee: stable.assignee, subject: task.subject, priority: task.priority,
+    id: task.id, kind: task.kind, ...(task.cancellation ? { cancellation: task.cancellation } : {}), creator: stable.creator, assignee: stable.assignee, subject: task.subject, priority: task.priority,
     state: task.state, revision: createHash('sha256').update(JSON.stringify(stable)).digest('hex').slice(0, 16),
     progress: { checked: task.items.filter(item => item.checked).length, total: task.items.length },
     block: task.block, lastReply: task.lastReply, commit: task.commit, requiresIntegration: task.requiresIntegration,
@@ -197,10 +197,10 @@ export default function piCowork(pi: ExtensionAPI): void {
   });
 
   pi.registerTool({
-    name: "cowork_create", label: "Assign a CoWork task",
-    description: "Create a checklist task for one side from cowork_sides. Priority is urgent/high/normal/low and defaults to normal; higher priority is shown first within each panel state. Only this creator and that assignee may list or read it. Code deliveries default to requiring reviewed integration and push before closure; set requiresIntegration=false only for review/material tasks that need no merge. A durable event resumes the assignee's live Pi within existing authorization.",
+    name: "cowork_create", label: "Create a local task or delegation",
+    description: "Create an authorized task. Omit to (or use your own side ID) for your own work: you may implement, complete, verify, integrate and close it yourself. Set to another exact side ID only for real delegation; never transfer your implementation merely to satisfy the workflow. Independent review, when required, is a separate review/material task and is not replaced by self-verification. Priority urgent/high/normal/low defaults to normal. Items are pre-delivery acceptance conditions only: do not require integration, push or closure before complete. Code tasks require integration/push by default; set requiresIntegration=false only when no merge is needed.",
     parameters: Type.Object({
-      to: Type.String({ minLength: 1, maxLength: 256 }), subject: Type.String({ minLength: 1, maxLength: 160 }),
+      to: Type.Optional(Type.String({ minLength: 1, maxLength: 256 })), subject: Type.String({ minLength: 1, maxLength: 160 }),
       body: Type.String({ minLength: 1, maxLength: 16000 }),
       items: Type.Array(Type.String({ minLength: 1, maxLength: 1000 }), { minItems: 1, maxItems: 50 }),
       priority: Type.Optional(Type.Union([Type.Literal('urgent'), Type.Literal('high'), Type.Literal('normal'), Type.Literal('low')])),
@@ -215,14 +215,14 @@ export default function piCowork(pi: ExtensionAPI): void {
 
   pi.registerTool({
     name: "cowork_priority", label: "Set task priority",
-    description: "Either task participant may set low/normal/high/urgent priority until the task is closed. Higher priority is ordered first within each state in the human panel. Priority does not grant authority or change task state.",
+    description: "Either task participant may set low/normal/high/urgent priority until the task is closed or cancelled. Higher priority is ordered first within each state in the human panel. Priority does not grant authority or change task state.",
     parameters: Type.Object({ id: idSchema, priority: Type.Union([Type.Literal("urgent"), Type.Literal("high"), Type.Literal("normal"), Type.Literal("low")]) }),
     async execute(_id, input, _signal, _update, ctx) { return toolResult({ task: board().setPriority(input.id, identity(ctx).id, input.priority) }); }, renderResult,
   });
 
   pi.registerTool({
     name: "cowork_list", label: "List my CoWork tasks",
-    description: "Before starting/resuming work and before the final reply, call with activeOnly=true and follow nextBefore. For event resumes, read the named targets and necessary dependencies first. For other summaries, read new, changed or actionable work; do not reread unchanged waiting tasks just because they are listed. Compare revision with a previously read version; if unknown, recover needed details. Always read full task details before acting. Continue authorized actionable work; use cowork_block to record genuine blockers, waiting party and dependencies, rather than only mentioning them in chat. A block with needsReview=true requires fresh dependency review, then cowork_unblock or an updated block. Created completed tasks need your review; sent open tasks and submitted completions wait on others. Returns compact summaries with revision and progress, not checklist text, refs or history; use cowork_read for details. Returns only your sent/received tasks.",
+    description: "Before starting/resuming work and before the final reply, call with activeOnly=true and follow nextBefore. For event resumes, read the named targets and necessary dependencies first. For other summaries, read new, changed or actionable work; do not reread unchanged waiting tasks just because they are listed. Compare revision with a previously read version; if unknown, recover needed details. Always read full task details before acting. Continue authorized actionable work; use cowork_block to record genuine blockers, waiting party and dependencies, rather than only mentioning them in chat. A block with needsReview=true requires fresh dependency review, then cowork_unblock or an updated block. Local tasks belong to you through completion, verification, integration and closure; do not wait for another side. For cross-side tasks, created completed tasks need your review; sent open tasks and submitted completions wait on others. Cancelled tasks are historical, not active work. Returns compact summaries with revision and progress, not checklist text, refs or history; use cowork_read for details. Returns only your sent/received tasks.",
     parameters: Type.Object({ before: Type.Optional(idSchema), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })), activeOnly: Type.Optional(Type.Boolean()) }),
     async execute(_id, input, _signal, _update, ctx) {
       const self = identity(ctx);
@@ -337,7 +337,7 @@ export default function piCowork(pi: ExtensionAPI): void {
 
   pi.registerTool({
     name: "cowork_integrate", label: "Queue reviewed code for main integration",
-    description: "Creator only: after actually reviewing the entire delivered range and obtaining project merge/push authorization, queue the exact completed commit for serial integration into origin/main. Provide the reviewed base and real integration checks. Runs asynchronously in an isolated worktree. Conflict/check/push failures are recorded; never force pushes. It does not close the task. Use cowork_read for result; explicitly retry only after resolving a blocker.",
+    description: "Creator/owner only, including local tasks: self-verification is recorded as self, not independent peer review. Satisfy explicitly required independent review separately. After actually reviewing the entire delivered range and obtaining project merge/push authorization, queue the exact completed commit for serial integration into origin/main. Provide the reviewed base and real integration checks. Runs asynchronously in an isolated worktree. Conflict/check/push failures are recorded; never force pushes. It does not close the task. Use cowork_read for result; explicitly retry only after resolving a blocker.",
     parameters: Type.Object({ id: idSchema, commit: Type.String({ minLength: 7, maxLength: 64 }),
       reviewedBase: Type.String({ minLength: 7, maxLength: 64 }), note: Type.String({ minLength: 1, maxLength: 4000 }),
       checks: Type.Array(Type.Object({ command: Type.String({ minLength: 1, maxLength: 512 }), args: Type.Array(Type.String({ maxLength: 4096 }), { maxItems: 100 }) }), { minItems: 1, maxItems: 10 }),
@@ -366,7 +366,7 @@ export default function piCowork(pi: ExtensionAPI): void {
 
   pi.registerTool({
     name: "cowork_close", label: "Accept and close a CoWork task",
-    description: "Creator only: after actual review, close with the delivered commit and review note. Code tasks must first finish cowork_integrate; this tool rechecks origin/main and records mainCommit automatically. Queued, running or blocked integrations cannot close. Closed tasks remain in history, dim and struck through.",
+    description: "Creator/owner only, including local tasks: after verification, close with the delivered commit and note. Local closure records self-verification, not independent review. Code tasks must first finish cowork_integrate; this tool rechecks origin/main and records mainCommit automatically. Queued, running or blocked integrations cannot close. Closed tasks remain in history, dim and struck through.",
     parameters: Type.Object({ id: idSchema, commit: Type.String({ minLength: 7, maxLength: 64 }), note: Type.String({ minLength: 1, maxLength: 4000 }) }),
     async execute(_id, input, _signal, _update, ctx) {
       const actor = identity(ctx).id;
@@ -379,6 +379,13 @@ export default function piCowork(pi: ExtensionAPI): void {
       }
       return toolResult({ task: board().closeTask(input.id, actor, commitHash(input.commit), input.note) });
     }, renderResult,
+  });
+
+  pi.registerTool({
+    name: "cowork_cancel", label: "Cancel a CoWork task",
+    description: "Creator/owner only: cancel a mistaken, withdrawn or superseded task with a concrete reason. Terminal and append-only: removes it from active work, notifies the assignee and current dependents to recheck, never auto-unblocks them. Cannot cancel closed tasks or queued/running/pushed code. Preserves commits, files, snapshots and history; cancellation is not integration or permission to delete code.",
+    parameters: Type.Object({ id: idSchema, reason: Type.String({ minLength: 1, maxLength: 2000 }) }),
+    async execute(_id, input, _signal, _update, ctx) { return toolResult({ task: board().cancel(input.id, identity(ctx).id, input.reason) }); }, renderResult,
   });
 
   pi.registerTool({
@@ -399,7 +406,7 @@ export default function piCowork(pi: ExtensionAPI): void {
   });
 
   pi.registerCommand("cowork", {
-    description: "Open the task board; m opens current-side management. /cowork sides opens current sides and h toggles history. /cowork [audit|init|status|auto [on|off]|name <name>|read <id>|remove [side-id]|takeover <side-id>]",
+    description: "Open the task board; m opens current-side management. /cowork sides opens current sides and h toggles history. /cowork [audit|init|status|auto [on|off]|name <name>|read <id>|cancel <id> <reason>|remove [side-id]|takeover <side-id>]",
     handler: async (args, ctx) => {
       const self = identity(ctx);
       const command = args.trim();
@@ -408,6 +415,13 @@ export default function piCowork(pi: ExtensionAPI): void {
         if (removed) { resume?.stop(); resume = undefined; }
         return removed;
       };
+      if (command === "cancel" || command.startsWith("cancel ")) {
+        const match = /^cancel\s+(\d+)\s+([\s\S]+)$/.exec(command);
+        if (!match) throw new Error("Usage: /cowork cancel <id> <reason>");
+        const task = board().cancel(Number(match[1]), self.id, match[2]);
+        ctx.ui.notify(`已取消 #${task.id}：${task.cancellation!.reason}。历史和代码保留，相关依赖需复核。`, "info");
+        return;
+      }
       if (command === 'sides' || command.startsWith('sides ')) { await manageSides(command.slice(5).trim()); return; }
       if (command === 'audit') {
         const ledger = new WorkspaceLedger(board());
@@ -513,7 +527,7 @@ export default function piCowork(pi: ExtensionAPI): void {
         const task = board().read(Number(command.slice(5)), self.id);
         ctx.ui.notify(JSON.stringify({ warning, task }, null, 2), "info"); return;
       }
-      if (command && command !== "list") throw new Error("Usage: /cowork [sides [query]|audit|init|status|auto [on|off]|name <name>|read <id>|remove [side-id]|takeover <side-id>]");
+      if (command && command !== "list") throw new Error("Usage: /cowork [sides [query]|audit|init|status|auto [on|off]|name <name>|read <id>|cancel <id> <reason>|remove [side-id]|takeover <side-id>]");
       if (ctx.mode !== "tui") {
         ctx.ui.notify(JSON.stringify({ warning, ...board().list(self.id) }, null, 2), "info"); return;
       }

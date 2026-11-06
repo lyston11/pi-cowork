@@ -241,13 +241,13 @@ export class WorkspaceLedger {
         const status = await git(w.path, ['status', '--porcelain=v1', '-uall']);
         const ignored = (await git(w.path, ['ls-files', '--others', '--ignored', '--exclude-standard', '--directory', '-z'])).split('\0').filter(Boolean);
         const delivered = snapshots.filter(d => d.workspace_id === w.id);
-        const valid = delivered.filter(d => this.db.prepare("SELECT 1 FROM handoff_task_events e WHERE e.kind='complete' AND json_extract(e.data_json,'$.deliveryId')=? AND NOT EXISTS(SELECT 1 FROM handoff_task_events later WHERE later.task_id=e.task_id AND later.kind='reopen' AND later.seq>e.seq)").get(String(d.id)));
+        const valid = delivered.filter(d => this.db.prepare("SELECT 1 FROM handoff_task_events e WHERE e.kind='complete' AND json_extract(e.data_json,'$.deliveryId')=? AND NOT EXISTS(SELECT 1 FROM handoff_task_events later WHERE later.task_id=e.task_id AND later.kind IN ('reopen','cancel') AND later.seq>e.seq)").get(String(d.id)));
         const approved = new Set(valid.flatMap(d => JSON.parse(String(d.commits_json)) as string[]));
         const ahead = remote ? list(await git(w.path, ['rev-list', tip, '--not', remote])) : null;
         const undelivered = ahead?.filter(c => !approved.has(c)) ?? null;
         const pending = valid.filter(d => !remote || !this.contains(w.path, String(d.tip), remote)).map(d => String(d.id));
         const tasks = w.tasks.map(id => { const task = this.store.read(id, w.owner); return { id, state: task.state }; });
-        const blockers = [!remote ? 'remote-incomplete' : '', ahead?.length ? 'branch-not-integrated' : '', status ? 'uncommitted-files' : '', ignored.length ? 'ignored-data-needs-preservation' : '', tasks.some(t => t.state !== 'closed') ? 'open-tasks' : ''].filter(Boolean);
+        const blockers = [!remote ? 'remote-incomplete' : '', ahead?.length ? 'branch-not-integrated' : '', status ? 'uncommitted-files' : '', ignored.length ? 'ignored-data-needs-preservation' : '', tasks.some(t => t.state !== 'closed' && t.state !== 'cancelled') ? 'open-tasks' : ''].filter(Boolean);
         reports.push({ workspace: w, tip, status: status ? status.split('\n') : [], ignored, undelivered, pendingDeliveries: pending, tasks, blockers, eligibleForRetirement: blockers.length === 0 });
       } catch (error) { errors.push(`${w.id}: ${error}`); reports.push({ workspace: w, error: String(error), eligibleForRetirement: false }); }
     }

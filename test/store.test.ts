@@ -141,7 +141,6 @@ test("arbitrary sides, ambiguous names, invalid checklist and pagination", () =>
   try {
     f.store.register({ ...C, name: B.name });
     assert.throws(() => f.store.create({ ...input, to: B.name }, A.id), /ambiguous/);
-    assert.throws(() => f.store.create({ ...input, to: A.id }, A.id), /another side/);
     assert.throws(() => f.store.create({ ...input, items: [] }, A.id), /checklist/);
     for (let i = 0; i < 3; i++) f.store.create({ ...input, subject: `task ${i}` }, A.id);
     const first = f.store.list(A.id, { limit: 2 });

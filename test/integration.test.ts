@@ -56,6 +56,7 @@ test("only reviewed creator can queue; code closure is guarded even for legacy S
     const job = f.enqueue(id, commit, "process.exit(7)");
     assert.equal(f.enqueue(id, commit).jobId, job.jobId);
     assert.throws(() => f.store.reopen(id, 'a', 'must not race with integration'), /queued\/running/);
+    assert.throws(() => f.store.cancel(id, "a", "must not race with integration"), /queued\/running/);
     await consume(f);
     assert.equal(f.queue.read(job.jobId).state, "blocked");
     assert.equal(f.git(f.repo, "ls-remote", "origin", "refs/heads/main").split(/\s/)[0], f.base);
@@ -77,6 +78,23 @@ test("only reviewed creator can queue; code closure is guarded even for legacy S
     assert.equal(f.git(f.repo, "rev-parse", "main"), pushed.mainCommit, "safe fast-forward is independent of the Pi process cwd");
     assert.equal(f.git(f.repo, "status", "--porcelain"), "");
   } finally { f.cleanup(); }
+});
+
+test('cancellation cannot race queued/running work; blocked jobs may cancel without losing commits', async () => {
+ const f=fixture();try{
+  const commit=f.code('cancel-queued','cancel.txt','keep\n'),id=f.task(commit),job=f.enqueue(id,commit,'process.exit(9)');
+  const raw=new DatabaseSync(f.store.dbPath);
+  const cancelSql=()=>raw.prepare("INSERT INTO handoff_task_events(task_id,actor,kind,data_json,at) VALUES(?,?,'cancel',?,?)").run(id,'a',JSON.stringify({reason:'legacy cancellation'}),new Date().toISOString());
+  try {
+   assert.throws(cancelSql,/queued\/running/);
+   const claimed=f.queue.claim(f.target.repo,'cancel-test');assert.equal(claimed!.state,'running');
+   assert.throws(()=>f.store.cancel(id,'a','race running'),/queued\/running/);assert.throws(cancelSql,/queued\/running/);
+   f.queue.finish(job.jobId,'blocked','check failed');
+  }finally{raw.close();}
+  assert.equal(f.store.cancel(id,'a','superseded before push').state,'cancelled');
+  assert.throws(()=>f.enqueue(id,commit,'process.exit(0)',true),/completed commit/);
+  assert.equal(f.git(f.repo,'show',commit+':cancel.txt'),'keep');
+ }finally{f.cleanup();}
 });
 
 function child(args: string[], cwd?: string): Promise<void> {
