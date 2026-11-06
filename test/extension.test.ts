@@ -32,7 +32,8 @@ test("tool boundary binds identity to session, never accepts an actor from argum
     assert.equal(commands.has('handoff'), false);
     assert.equal([...tools.keys()].some(name => name.startsWith('handoff_')), false);
     assert.doesNotMatch([...tools.values()].map(tool => tool.label).join('\n'), /handoff/i);
-    const context = (session: string) => ({ sessionManager: { getSessionId: () => session, getSessionName: () => `side ${session}` }, ui: { notify() {} } });
+    const notifications: string[] = [];
+    const context = (session: string) => ({ sessionManager: { getSessionId: () => session, getSessionName: () => `side ${session}` }, ui: { notify: (message: string) => notifications.push(message) } });
     const execute = (session: string, tool: string, args: unknown) => tools.get(tool).execute("call", args, undefined, undefined, context(session));
     const a = (await execute("one", "cowork_identity", { name: "project lead" })).details.self;
     const b = (await execute("two", "cowork_identity", { name: "data" })).details.self;
@@ -89,6 +90,16 @@ test("tool boundary binds identity to session, never accepts an actor from argum
     await assert.rejects(execute('three', 'cowork_reply', { id, message: 'private', idempotencyKey: 'intrusion' }), /not found or not visible/);
     await assert.rejects(execute("three", "cowork_unblock", { id, note: "override" }), /not found or not visible/);
     await execute("two", "cowork_unblock", { id, note: "approval verified" });
+    const userTest = await execute("one", "cowork_create", { to: b.id, subject: "manual verification", body: "Test a real UI path", items: ["report result"], requiresIntegration: false });
+    const userTestId = userTest.details.task.id;
+    await assert.rejects(execute("two", "cowork_block", { id: userTestId, reason: "Must verify with user data", waitingFor: "user" }), /userRequest is required/);
+    await execute("two", "cowork_block", { id: userTestId, reason: "Must verify with user data", waitingFor: "user", userRequest: "Open the real project, test import and report the exact error" });
+    assert.equal(notifications.length, 1);
+    assert.match(notifications[0], /manual verification/);
+    assert.match(notifications[0], /report the exact error/);
+    const surfaced = (await execute("one", "cowork_read", { id: userTestId })).details.task;
+    assert.equal(surfaced.block.userRequest, "Open the real project, test import and report the exact error");
+    assert.match(taskLines(surfaced, false, { fg: (_color: string, value: string) => value, strikethrough: (value: string) => value } as any, 140).join("\n"), /需要你配合/);
     const ownList = (await execute("three", "cowork_list", {})).details;
     assert.equal(ownList.tasks.length, 0);
     assert.equal(ownList.self.sessionId, "three");
@@ -107,17 +118,19 @@ test("tool boundary binds identity to session, never accepts an actor from argum
         assert.match(render(), /暂无与你相关的任务/);
         panel.handleInput("\t");
         assert.match(render(), /全项目/);
+        assert.match(render(), /需要你配合 1 项/);
         assert.match(render(), /project lead → data/);
         assert.match(render(), /▸/);
         assert.doesNotMatch(render(), /PRIVATE-TEXT/);
         panel.handleInput("\r");
-        assert.match(render(), /任务详情 · #1/);
-        assert.match(render(), /PRIVATE-TEXT/);
-        assert.doesNotMatch(render(), /s排序|Tab本侧/);
+        assert.match(render(), /任务详情 · #2/);
+        assert.match(render(), /Test a real UI path/);
+        assert.doesNotMatch(render(), /PRIVATE-TEXT/);
         panel.handleInput("\t");
-        assert.match(render(), /PRIVATE-TEXT/, "scope switching is inactive inside task details");
+        assert.match(render(), /Test a real UI path/, "scope switching is inactive inside task details");
         panel.handleInput("\r");
         assert.match(render(), /全项目/);
+        assert.doesNotMatch(render(), /Test a real UI path/);
         assert.doesNotMatch(render(), /PRIVATE-TEXT/);
         panel.handleInput("\t");
         assert.match(render(), /本侧/);
@@ -139,7 +152,7 @@ test("tool boundary binds identity to session, never accepts an actor from argum
         assert(wide.at(-2).includes("Home/End首尾"));
         assert(wide.at(-2).includes("r刷新"));
         assert(!wide.at(-2).includes("n加载"));
-        assert.match(wide.at(-2), /33项/);
+        assert.match(wide.at(-2), /34项/);
         assert(wide.at(-2).includes("Tab本侧/全项目"));
         assert.doesNotMatch(frame.join("\n"), /任务 31/);
         panel.handleInput("\x1b[6~");
@@ -170,8 +183,8 @@ test("tool boundary binds identity to session, never accepts an actor from argum
         panel.handleInput("\r");
         panel.handleInput("r");
         render();
-        for (let i = 0; i < 32; i++) { panel.handleInput("\x1b[B"); render(); }
-        assert.match(render(), /> ▸ \[P2 普通\] #33 .*任务 31/, "down arrows automatically cross the page boundary");
+        for (let i = 0; i < 33; i++) { panel.handleInput("\x1b[B"); render(); }
+        assert.match(render(), /> ▸ \[P2 普通\] #34 .*任务 31/, "down arrows automatically cross the page boundary");
         panel.handleInput("\t"); panel.handleInput("\t");
         panel.handleInput("r");
         render();
@@ -190,7 +203,7 @@ test("tool boundary binds identity to session, never accepts an actor from argum
         assert.match(render(), /DETAIL-39/);
         assert.match(render(), /最后一项/);
         panel.handleInput("\x1b[H");
-        assert.match(render(), /任务详情 · #33/);
+        assert.match(render(), /任务详情 · #34/);
         assert.match(render(), /DETAIL-0/);
         terminal.rows = 12;
         const small = panel.render(50);
@@ -202,10 +215,11 @@ test("tool boundary binds identity to session, never accepts an actor from argum
         panel.handleInput("\x1b");
         assert.equal(exited, false, "Esc returns from details instead of closing the panel");
         assert.match(render(), /交接任务/);
-        assert.match(render(), /> ▸ \[P2 普通\] #33 /);
+        assert.match(render(), /> ▸ \[P2 普通\] #34 /);
         panel.handleInput("\x1b[H");
-        assert.match(render(), /secret/);
+        assert.match(render(), /需要你配合/);
         const commit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" }).trim();
+        await execute("two", "cowork_unblock", { id: 2, note: "User test result received and verified." });
         for (const taskId of [2, 3]) {
           await execute("two", "cowork_check", { id: taskId, item: 1, checked: true });
           await execute("two", "cowork_complete", { id: taskId, commit, summary: "done" });

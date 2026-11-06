@@ -1,4 +1,4 @@
-export const HANDOFF_EXTENSION_VERSION = "5.3.0";
+export const HANDOFF_EXTENSION_VERSION = "5.3.2";
 
 export interface Side {
   id: string;
@@ -16,6 +16,7 @@ export type TaskKind = "local" | "handoff";
 export interface TaskBlock {
   reason: string;
   waitingFor: string;
+  userRequest?: string;
   dependencies: number[];
   needsReview: boolean;
 }

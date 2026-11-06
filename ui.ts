@@ -8,11 +8,11 @@ const plain = (value: string) => value.replace(/[\x00-\x1f\x7f]/g, " ");
 export function taskLines(task: HandoffTask | TaskSummary, expanded: boolean, theme: Theme, width: number): string[] {
   const checked = task.items.filter((item) => item.checked).length;
   const status = task.state === "open"
-    ? task.block ? task.block.needsReview ? "[!] 依赖更新待复核" : "[⏸] 被阻塞" : "[ ] 待核对/处理"
+    ? task.block?.userRequest ? "[! 需要你配合]" : task.block ? task.block.needsReview ? "[!] 依赖更新待复核" : "[⏸] 被阻塞" : "[ ] 待核对/处理"
     : task.state === "completed" ? task.integration ? `[✓] 集成${({ queued: "排队中", running: "执行中", blocked: "受阻", pushed: "已推送待关闭" })[task.integration.state]}` : task.kind === "local" ? "[✓] 待本侧核查/收口" : "[✓] 待发起方验收" : task.state === "cancelled" ? "[×] 已取消" : "[✓] 已验收关闭";
   const fold = expanded ? "▾" : "▸";
   const priorityLabel = ({ urgent: "P0 紧急", high: "P1 高", normal: "P2 普通", low: "P3 低" } as const)[task.priority];
-  const responsible = task.state === "completed" ? task.integration?.state === "queued" || task.integration?.state === "running" ? "集成队列执行"
+  const responsible = task.block?.userRequest ? "等待用户配合" : task.state === "completed" ? task.integration?.state === "queued" || task.integration?.state === "running" ? "集成队列执行"
     : `${plain(task.creator.name)}${task.integration?.state === "blocked" ? "处理集成阻塞" : task.integration?.state === "pushed" ? "核对集成并关闭" : task.kind === "local" ? "核查并收口" : "验收"}`
     : task.block && !task.block.needsReview ? `${plain(task.block.waitingFor)}提供条件`
     : `${plain(task.assignee.name)}${task.block ? "复核依赖" : "核对并处理"}`;
@@ -20,6 +20,10 @@ export function taskLines(task: HandoffTask | TaskSummary, expanded: boolean, th
   const lines = [heading];
   if (task.cancellation) lines.push(`  取消原因：${plain(task.cancellation.reason)}`);
   if (task.block) {
+    if (task.block.userRequest) {
+      const request = `  需要你配合：${plain(task.block.userRequest)}`;
+      lines.push(expanded ? request : truncateToWidth(request, width));
+    }
     const reason = `  阻塞：${plain(task.block.reason)}`;
     lines.push(expanded ? reason : truncateToWidth(reason, width));
     if (task.block.dependencies.length) {

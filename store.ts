@@ -13,6 +13,10 @@ function text(value: unknown, name: string, max: number): string {
   return value;
 }
 
+function isUserWaiting(value: string): boolean {
+  return /user|用户|manual test|人工测试|手工测试/i.test(value);
+}
+
 function integer(value: number, name: string, minimum: number): number {
   if (!Number.isSafeInteger(value) || value < minimum) throw new Error(`Invalid ${name}`);
   return value;
@@ -35,6 +39,7 @@ export interface HumanTaskSnapshot {
   ids: number[];
   eventSeq: number;
   actor?: string;
+  userRequestCount?: number;
 }
 
 export interface ResumeEvent {
@@ -199,6 +204,7 @@ export class HandoffStore {
     this.transaction(() => {
       const exists = this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='handoff_resume_events'").get();
       const blockerEscalationExists = this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='trigger' AND name='handoff_resume_blocked'").get();
+      const userRequestNotificationsExist = this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='handoff_user_request_notifications'").get();
       this.db.exec(`
         CREATE TABLE IF NOT EXISTS handoff_resume_events (
           seq INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -216,6 +222,14 @@ export class HandoffStore {
           consumer TEXT,
           lease_until INTEGER NOT NULL DEFAULT 0
         );
+        CREATE TABLE IF NOT EXISTS handoff_user_request_notifications (
+          task_id INTEGER NOT NULL REFERENCES handoff_tasks(id),
+          block_seq INTEGER NOT NULL REFERENCES handoff_task_events(seq),
+          side_id TEXT NOT NULL REFERENCES handoff_sides(id),
+          delivered_at INTEGER,
+          PRIMARY KEY(task_id,block_seq,side_id)
+        );
+        CREATE INDEX IF NOT EXISTS handoff_user_request_pending ON handoff_user_request_notifications(side_id,delivered_at,block_seq);
         DROP TRIGGER IF EXISTS handoff_resume_created;
         CREATE TRIGGER handoff_resume_created AFTER INSERT ON handoff_tasks
           WHEN NEW.creator<>NEW.assignee
@@ -295,7 +309,47 @@ export class HandoffStore {
             AND (SELECT kind FROM handoff_task_events WHERE task_id=t.id
               AND kind IN ('block','unblock','complete','close','reopen','cancel') ORDER BY seq DESC LIMIT 1)='block';
       `);
+      if (!userRequestNotificationsExist) {
+        const userRequest = `(length(trim(COALESCE(json_extract(e.data_json,'$.userRequest'),''))) > 0
+          OR lower(COALESCE(json_extract(e.data_json,'$.waitingFor'),'')) LIKE '%user%'
+          OR COALESCE(json_extract(e.data_json,'$.waitingFor'),'') LIKE '%用户%'
+          OR lower(COALESCE(json_extract(e.data_json,'$.waitingFor'),'')) LIKE '%manual test%'
+          OR COALESCE(json_extract(e.data_json,'$.waitingFor'),'') LIKE '%人工测试%'
+          OR COALESCE(json_extract(e.data_json,'$.waitingFor'),'') LIKE '%手工测试%')`;
+        this.db.exec(`
+          INSERT OR IGNORE INTO handoff_user_request_notifications(task_id,block_seq,side_id)
+            SELECT t.id,e.seq,t.creator FROM handoff_tasks t JOIN handoff_task_events e ON e.task_id=t.id
+            WHERE t.creator<>t.assignee AND e.kind='block' AND ${userRequest}
+              AND e.seq=(SELECT seq FROM handoff_task_events WHERE task_id=t.id
+                AND kind IN ('block','unblock','complete','close','reopen','cancel') ORDER BY seq DESC LIMIT 1)
+            UNION ALL
+            SELECT t.id,e.seq,t.assignee FROM handoff_tasks t JOIN handoff_task_events e ON e.task_id=t.id
+            WHERE e.kind='block' AND ${userRequest}
+              AND e.seq=(SELECT seq FROM handoff_task_events WHERE task_id=t.id
+                AND kind IN ('block','unblock','complete','close','reopen','cancel') ORDER BY seq DESC LIMIT 1);
+        `);
+      }
     });
+  }
+
+  claimUserRequestNotification(sideId: string, taskId: number, blockSeq: number): HandoffTask | undefined {
+    return this.transaction(() => {
+      const task = this.read(taskId, sideId);
+      if (task.state !== 'open' || !task.block?.userRequest || task.events.findLast((event) => event.kind === 'block')?.seq !== blockSeq) return undefined;
+      const delivered = this.db.prepare(`UPDATE handoff_user_request_notifications SET delivered_at=?
+        WHERE task_id=? AND block_seq=? AND side_id=? AND delivered_at IS NULL`).run(Date.now(), taskId, blockSeq, sideId);
+      return delivered.changes === 1 ? task : undefined;
+    });
+  }
+
+  pendingUserRequestNotifications(sideId: string, limit = 50): Array<{ taskId: number; blockSeq: number }> {
+    integer(limit, 'notification limit', 1);
+    return this.db.prepare(`SELECT n.task_id,n.block_seq FROM handoff_user_request_notifications n
+      JOIN handoff_tasks t ON t.id=n.task_id
+      WHERE n.side_id=? AND n.delivered_at IS NULL
+        AND n.block_seq=(SELECT seq FROM handoff_task_events WHERE task_id=t.id
+          AND kind IN ('block','unblock','complete','close','reopen','cancel') ORDER BY seq DESC LIMIT 1)
+      ORDER BY n.block_seq,n.task_id LIMIT ?`).all(sideId, limit).map((row) => ({ taskId: Number(row.task_id), blockSeq: Number(row.block_seq) }));
   }
 
   acquireResume(actor: string, sessionId: string, consumer: string, now = Date.now()): boolean {
@@ -688,8 +742,11 @@ export class HandoffStore {
       if (event.kind === "check") task.items[Number(event.data.item) - 1].checked = event.data.checked === true;
       if (event.kind === "block") {
         blockSeq = event.seq;
+        const waitingFor = String(event.data.waitingFor);
+        const userRequest = typeof event.data.userRequest === "string" && event.data.userRequest.trim()
+          ? event.data.userRequest : isUserWaiting(waitingFor) ? String(event.data.reason) : undefined;
         task.block = {
-          reason: String(event.data.reason), waitingFor: String(event.data.waitingFor),
+          reason: String(event.data.reason), waitingFor, ...(userRequest ? { userRequest } : {}),
           dependencies: (event.data.dependencies as { id: number }[]).map((dependency) => dependency.id),
           needsReview: false,
         };
@@ -757,12 +814,20 @@ export class HandoffStore {
         const eventSeq = Number(this.db.prepare("SELECT COALESCE(MAX(seq),0) AS seq FROM handoff_task_events").get()!.seq);
         const priorityAtSnapshot = "COALESCE((SELECT json_extract(p.data_json,'$.priority') FROM handoff_task_events p WHERE p.task_id=t.id AND p.kind='priority' AND p.seq<=? ORDER BY p.seq DESC LIMIT 1),t.priority)";
         const priorityRank = `CASE ${priorityAtSnapshot} WHEN 'urgent' THEN 4 WHEN 'high' THEN 3 WHEN 'normal' THEN 2 ELSE 1 END`;
+        const userRequestAtSnapshot = `CASE WHEN e.kind='block' AND (
+          length(trim(COALESCE(json_extract(e.data_json,'$.userRequest'),''))) > 0
+          OR instr(lower(COALESCE(json_extract(e.data_json,'$.waitingFor'),'')),'user') > 0
+          OR instr(COALESCE(json_extract(e.data_json,'$.waitingFor'),''),'用户') > 0
+          OR instr(lower(COALESCE(json_extract(e.data_json,'$.waitingFor'),'')),'manual test') > 0
+          OR instr(COALESCE(json_extract(e.data_json,'$.waitingFor'),''),'人工测试') > 0
+          OR instr(COALESCE(json_extract(e.data_json,'$.waitingFor'),''),'手工测试') > 0
+        ) THEN 1 ELSE 0 END`;
         const order = options.sort === "pending"
-          ? "state_rank ASC, priority_rank DESC, id ASC"
+          ? "user_request_rank DESC, state_rank ASC, priority_rank DESC, id ASC"
           : options.sort === "reviewed"
-            ? "state_rank DESC, priority_rank DESC, id ASC"
-            : "priority_rank DESC, id ASC";
-        const rows = this.db.prepare(`SELECT t.id, ${priorityRank} AS priority_rank, CASE e.kind
+            ? "user_request_rank DESC, state_rank DESC, priority_rank DESC, id ASC"
+            : "user_request_rank DESC, priority_rank DESC, id ASC";
+        const rows = this.db.prepare(`SELECT t.id, ${priorityRank} AS priority_rank, ${userRequestAtSnapshot} AS user_request_rank, CASE e.kind
           WHEN 'close' THEN 3 WHEN 'cancel' THEN 3 WHEN 'complete' THEN 1 WHEN 'block' THEN
             CASE WHEN EXISTS(SELECT 1 FROM handoff_task_dependencies d
               JOIN handoff_task_events changed ON changed.task_id=d.dependency_id
@@ -770,11 +835,16 @@ export class HandoffStore {
                 AND changed.kind IN ('complete','close','reopen','cancel')) THEN 0 ELSE 2 END
           ELSE 0 END AS state_rank
         FROM handoff_tasks t LEFT JOIN handoff_task_events e ON e.seq=(
-          SELECT seq FROM handoff_task_events WHERE task_id=t.id
+          SELECT seq FROM handoff_task_events WHERE task_id=t.id AND seq<=?
             AND kind IN ('block','unblock','complete','close','reopen','cancel') ORDER BY seq DESC LIMIT 1)
         ${options.actor === undefined ? "" : "WHERE creator=? OR assignee=?"} ORDER BY ${order}`)
-          .all(eventSeq, eventSeq, ...(options.actor === undefined ? [] : [options.actor, options.actor]));
-        snapshot = { ids: rows.map((row) => Number(row.id)), eventSeq, actor: options.actor };
+          .all(eventSeq, eventSeq, eventSeq, ...(options.actor === undefined ? [] : [options.actor, options.actor]));
+        const userRequestScope = options.actor === undefined ? "" : " AND (t.creator=? OR t.assignee=?)";
+        const userRequestCount = Number(this.db.prepare(`SELECT COUNT(*) AS count FROM handoff_tasks t
+          JOIN handoff_task_events e ON e.seq=(SELECT seq FROM handoff_task_events WHERE task_id=t.id AND seq<=?
+            AND kind IN ('block','unblock','complete','close','reopen','cancel') ORDER BY seq DESC LIMIT 1)
+          WHERE e.kind='block' AND ${userRequestAtSnapshot}${userRequestScope}`).get(eventSeq, ...(options.actor === undefined ? [] : [options.actor, options.actor]))!.count);
+        snapshot = { ids: rows.map((row) => Number(row.id)), eventSeq, actor: options.actor, userRequestCount };
         this.db.exec("COMMIT");
       } catch (error) { this.db.exec("ROLLBACK"); throw error; }
     }
@@ -806,9 +876,11 @@ export class HandoffStore {
       return task.priority !== next;
     });
   }
-  block(id: number, actor: string, reason: string, waitingFor: string, dependencyIds: number[] = []): HandoffTask {
+  block(id: number, actor: string, reason: string, waitingFor: string, dependencyIds: number[] = [], userRequest?: string): HandoffTask {
     text(reason, "Block reason and recovery condition", 2000);
     text(waitingFor, "Waiting for", 160);
+    if (userRequest !== undefined) { text(userRequest, "User action request", 1000); userRequest = userRequest.trim(); }
+    const effectiveUserRequest = userRequest || (isUserWaiting(waitingFor) ? reason : undefined);
     if (!Array.isArray(dependencyIds) || dependencyIds.length > 20) throw new Error("At most 20 dependencies are allowed");
     dependencyIds.forEach((dependency) => integer(dependency, "dependency id", 1));
     if (new Set(dependencyIds).size !== dependencyIds.length) throw new Error("Dependency ids must be unique");
@@ -828,11 +900,18 @@ export class HandoffStore {
           WHERE task_id=? AND kind IN ('complete','close','reopen','cancel','reply')`).get(dependency)!;
         return { id: dependency, seq: Number(latest.seq) };
       }).sort((a, b) => a.id - b.id);
-      const data = { reason, waitingFor, dependencies };
+      const data = { reason, waitingFor, dependencies, ...(effectiveUserRequest ? { userRequest: effectiveUserRequest } : {}) };
       const previous = task.events.findLast((event) => event.kind === "block");
       if (task.block && JSON.stringify(previous?.data) === JSON.stringify(data)) return task;
-      this.db.prepare("INSERT INTO handoff_task_events(task_id,actor,kind,data_json,at) VALUES(?,?,'block',?,?)")
+      const event = this.db.prepare("INSERT INTO handoff_task_events(task_id,actor,kind,data_json,at) VALUES(?,?,'block',?,?)")
         .run(id, actor, JSON.stringify(data), new Date().toISOString());
+      const blockSeq = Number(event.lastInsertRowid);
+      if (effectiveUserRequest) {
+        for (const sideId of new Set([task.creator.id, task.assignee.id])) {
+          this.db.prepare("INSERT OR IGNORE INTO handoff_user_request_notifications(task_id,block_seq,side_id) VALUES(?,?,?)")
+            .run(id, blockSeq, sideId);
+        }
+      }
       return this.read(id, actor);
     });
   }

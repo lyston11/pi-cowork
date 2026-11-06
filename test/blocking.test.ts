@@ -109,6 +109,44 @@ test("dependency cycles are rejected and old writers still route dependency even
   } finally { f.close(); }
 });
 
+test("user action requests are explicit, recoverable, surfaced first, and removed after verified unblock", () => {
+  const f = fixture();
+  try {
+    const ready = f.create(A.id, B.id, "ready work");
+    const userAction = f.create(A.id, B.id, "manual user test");
+    const waiting = f.create(A.id, C.id, "external dependency");
+    f.store.block(userAction.id, B.id, "Need a real UI test before proceeding", "user", [], "Open the exported project, test import and report the displayed error");
+    f.store.block(waiting.id, C.id, "Awaiting data artifact", "data team");
+    const anotherSideRequest = f.create(C.id, B.id, "other side manual test");
+    f.store.block(anotherSideRequest.id, B.id, "Waiting for their test", "user", [], "Run the sample on another side");
+    let page = f.store.listForHumanUi({ actor: A.id, sort: "pending" });
+    assert.equal(page.snapshot.userRequestCount, 1, "local view counts only requests visible to this side");
+    assert.equal(f.store.listForHumanUi().snapshot.userRequestCount, 2, "project view counts all active user requests");
+    assert.equal(page.snapshot.ids[0], userAction.id, "user work is surfaced ahead of regular tasks");
+    const priorityPage = f.store.listForHumanUi({ actor: A.id, sort: "priority" });
+    assert.equal(priorityPage.snapshot.userRequestCount, 1);
+    assert.equal(priorityPage.snapshot.ids[0], userAction.id, "user work stays pinned ahead of priority-only sorting");
+    const surfaced = page.tasks[0];
+    assert.equal(surfaced.block?.userRequest, "Open the exported project, test import and report the displayed error");
+    const theme: any = { fg: (_: string, text: string) => text, strikethrough: (text: string) => text };
+    const text = taskLines(surfaced, false, theme, 140).join("\n");
+    assert.match(text, /需要你配合/);
+    assert.match(text, /Open the exported project/);
+    const stable = page.snapshot;
+    f.store.unblock(userAction.id, B.id, "User test confirms import succeeds");
+    assert.equal(f.store.listForHumanUi({ actor: A.id, snapshot: stable }).snapshot.userRequestCount, 1, "existing view keeps its watermark");
+    page = f.store.listForHumanUi({ actor: A.id, sort: "pending" });
+    assert.equal(page.snapshot.userRequestCount, 0);
+    assert.notEqual(page.snapshot.ids[0], userAction.id);
+    const legacy = f.create(A.id, B.id, "legacy request");
+    f.store.block(legacy.id, B.id, "Run the package manually and report the result", "user");
+    const migrated = f.store.read(legacy.id, A.id);
+    assert.equal(migrated.block?.userRequest, "Run the package manually and report the result");
+    assert.equal(f.store.listForHumanUi({ actor: A.id }).snapshot.userRequestCount, 1);
+    assert.equal(f.store.read(ready.id, A.id).block, null);
+  } finally { f.close(); }
+});
+
 test("blocked sorting and dependency recheck use a stable snapshot across pages", () => {
   const f = fixture();
   try {

@@ -190,6 +190,46 @@ for (const customType of ["pi-handoff-resume", "pi-cowork-resume"]) {
   });
 }
 
+test("user test blockers notify the creator with the actionable request", () => {
+  const f = fixture();
+  const d = dispatcher(f, [], f.a);
+  try {
+    const task = f.create();
+    f.peer.block(task.id, f.b.id, "Need real manual verification", "user", [], "Run the installer on Windows and report the exact error text");
+    d.resume.tick();
+    assert.equal(d.notices.length, 1);
+    assert.match(d.notices[0], /需要你配合/);
+    assert.match(d.notices[0], /Run the installer on Windows/);
+    d.resume.tick();
+    assert.equal(d.notices.length, 1, "a persisted blocked event is notified once");
+    assert.equal(d.sent.length, 1);
+  } finally { d.resume.stop(); f.cleanup(); }
+});
+
+test("user requests notify once even when resume is paused and are backfilled for existing blockers", () => {
+  const f = fixture();
+  const task = f.create();
+  const request = "Open the saved build on Windows and report the exact startup error";
+  f.peer.block(task.id, f.b.id, "Need a real user test", "user", [], request);
+  (f.store as any).db.exec("DROP TABLE handoff_user_request_notifications");
+  const upgraded = new HandoffStore(f.root);
+  try {
+    assert.deepEqual(upgraded.pendingUserRequestNotifications(f.a.id), [{ taskId: task.id, blockSeq: f.store.read(task.id, f.a.id).events.findLast((event) => event.kind === "block")!.seq }]);
+    upgraded.close();
+    f.store.setResumeEnabled(f.a.id, false, "user paused this side");
+    const d = dispatcher(f, [], f.a);
+    try {
+      d.resume.tick();
+      assert.equal(d.notices.length, 1);
+      assert.match(d.notices[0], /report the exact startup error/);
+      assert.equal(d.sent.length, 0, "notification does not resume a paused model");
+      assert.equal(f.store.resumeStatus(f.a.id).enabled, false);
+      d.resume.tick();
+      assert.equal(d.notices.length, 1, "persisted notification is not duplicated");
+    } finally { d.resume.stop(); }
+  } finally { f.cleanup(); }
+});
+
 test('blocked and dependency signals retain their specific safety reminders', () => {
   const f = fixture(), d = dispatcher(f);
   try {

@@ -109,6 +109,12 @@ export class EventResume {
   tick(): void {
     if (this.stopped) return;
     try {
+      for (const pending of this.store.pendingUserRequestNotifications(this.self.id)) {
+        const task = this.store.claimUserRequestNotification(this.self.id, pending.taskId, pending.blockSeq);
+        if (task?.block?.userRequest) {
+          this.ctx.ui.notify(`CoWork 需要你配合 · #${task.id} ${task.subject}：${task.block.userRequest.replace(/\s+/g, " ").slice(0, 360)}`, "warning");
+        }
+      }
       if (!this.store.acquireResume(this.self.id, this.self.sessionId, this.consumer)) return;
       if (this.recoveredSeq) {
         this.store.acknowledgeResume(this.self.id, this.consumer, this.recoveredSeq);

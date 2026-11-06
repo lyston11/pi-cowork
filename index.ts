@@ -242,14 +242,27 @@ export default function piCowork(pi: ExtensionAPI): void {
 
   pi.registerTool({
     name: "cowork_block", label: "Record a task blocker",
-    description: "Assignee only, on an open task: record the concrete blocker, recovery condition, waiting party and relevant dependency task IDs. Dependency IDs must be readable to this side; omit them for external approvals or inputs. Does not complete or authorize the task. Dependency deliveries trigger a recheck, not automatic unblocking. The first blocker report in an episode notifies the creator; further substantive exchanges use cowork_reply.",
+    description: "Assignee only, on an open task: record the concrete blocker, recovery condition, waiting party and relevant dependency task IDs. If the user must manually test, approve, configure or provide input, userRequest is required: state exactly what the user should do and what result to report. This immediately notifies the blocking side and the creator; the request remains visible and prioritized in the task panel until resolved. Dependency IDs must be readable to this side; omit them for external approvals or inputs. Does not complete or authorize the task. Dependency deliveries trigger a recheck, not automatic unblocking. Further substantive exchanges use cowork_reply.",
     parameters: Type.Object({
       id: idSchema, reason: Type.String({ minLength: 1, maxLength: 2000 }),
       waitingFor: Type.String({ minLength: 1, maxLength: 160 }),
+      userRequest: Type.Optional(Type.String({ minLength: 1, maxLength: 1000 })),
       dependencies: Type.Optional(Type.Array(idSchema, { maxItems: 20, uniqueItems: true })),
     }),
     async execute(_id, input, _signal, _update, ctx) {
-      return toolResult({ task: board().block(input.id, identity(ctx).id, input.reason, input.waitingFor, input.dependencies) });
+      if (/user|用户|manual test|人工测试|手工测试/i.test(input.waitingFor) && !input.userRequest?.trim()) {
+        throw new Error("userRequest is required when waiting for user action");
+      }
+      const actor = identity(ctx).id;
+      const before = board().read(input.id, actor);
+      const previousBlockSeq = before.events.findLast((event) => event.kind === "block")?.seq;
+      const task = board().block(input.id, actor, input.reason, input.waitingFor, input.dependencies, input.userRequest);
+      const currentBlockSeq = task.events.findLast((event) => event.kind === "block")?.seq;
+      if (task.block?.userRequest && currentBlockSeq !== previousBlockSeq && currentBlockSeq !== undefined
+        && board().claimUserRequestNotification(actor, task.id, currentBlockSeq)) {
+        ctx.ui.notify(`CoWork 需要你配合 · #${task.id} ${task.subject}：${task.block.userRequest.replace(/\s+/g, " ").slice(0, 360)}`, "warning");
+      }
+      return toolResult({ task });
     }, renderResult,
   });
 
@@ -624,8 +637,9 @@ export default function piCowork(pi: ExtensionAPI): void {
               "Esc退出 m侧管理 s排序 Enter详情",
             ];
             const footer = keys.map((keys) => `${position} │ ${keys}`).find((text) => visibleWidth(text) <= innerWidth) ?? (detailTask ? "Esc返回" : "Esc退出");
+            const userRequests = snapshot?.userRequestCount ?? 0;
             const title = detailTask ? `任务详情 · #${detailTask.id} · ${detailTask.subject}`
-              : `交接任务 · ${projectView ? "全项目" : "本侧"} · ${sortLabels[sortIndex]} · ${sideCount}侧 · ${self.name}`;
+              : `交接任务 · ${projectView ? "全项目" : "本侧"} · ${sortLabels[sortIndex]} · ${userRequests ? `需要你配合 ${userRequests} 项 · ` : ""}${sideCount}侧 · ${self.name}`;
             return [
               rule("╭", "╮"),
               row(theme.fg("accent", title.replace(/[\x00-\x1f\x7f]/g, " "))),
