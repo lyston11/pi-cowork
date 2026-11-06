@@ -28,7 +28,7 @@ function modelTask(task: HandoffTask | TaskSummary) {
   const { body: _body, events: _events, ...summary } = task as HandoffTask;
   const stable = { ...summary, creator: side(task.creator), assignee: side(task.assignee) };
   return {
-    id: task.id, creator: stable.creator, assignee: stable.assignee, subject: task.subject,
+    id: task.id, creator: stable.creator, assignee: stable.assignee, subject: task.subject, priority: task.priority,
     state: task.state, revision: createHash('sha256').update(JSON.stringify(stable)).digest('hex').slice(0, 16),
     progress: { checked: task.items.filter(item => item.checked).length, total: task.items.length },
     block: task.block, lastReply: task.lastReply, commit: task.commit, requiresIntegration: task.requiresIntegration,
@@ -48,6 +48,7 @@ export default function piCowork(pi: ExtensionAPI): void {
   const channel = resolveChannel(cwd);
   let store: HandoffStore | undefined;
   let resume: EventResume | undefined;
+  let activeSide: Side | undefined;
   let integrationWorker: IntegrationWorker | undefined;
   let auditRun: Promise<void> | undefined;
   const audit = (ctx: ExtensionContext) => {
@@ -76,7 +77,7 @@ export default function piCowork(pi: ExtensionAPI): void {
 
   const identity = (ctx: ExtensionContext): Side => {
     const sessionId = ctx.sessionManager.getSessionId();
-    const known = board().sessionSide(sessionId);
+    const known = board().sessionSide(sessionId) ?? board().historicalSessionSide(sessionId);
     if (known?.removedAt) return known;
     const id = known?.id ?? `pi_${createHash("sha256").update(sessionId).digest("hex").slice(0, 24)}`;
     let branch = "not-a-git-worktree";
@@ -86,6 +87,7 @@ export default function piCowork(pi: ExtensionAPI): void {
       name: known?.name || process.env.PI_COWORK_NAME?.trim() || ctx.sessionManager.getSessionName()?.trim() || `Pi ${process.pid}`,
     };
     board().register(side);
+    activeSide = side;
     return side;
   };
 
@@ -96,6 +98,7 @@ export default function piCowork(pi: ExtensionAPI): void {
   };
 
   const startResume = (ctx: ExtensionContext, self = identity(ctx)) => {
+    activeSide = self;
     if (self.removedAt) { resume?.stop(); resume = undefined; return; }
     if (resume?.self.id === self.id && resume.self.sessionId === self.sessionId) return;
     resume?.stop();
@@ -106,7 +109,7 @@ export default function piCowork(pi: ExtensionAPI): void {
     }
   };
   pi.on("session_start", (_event, ctx) => { startResume(ctx); try { startIntegration(); } catch { /* No origin: handoffs still work without integration. */ } audit(ctx); });
-  pi.on("session_shutdown", async () => { resume?.stop(); resume = undefined; await integrationWorker?.stop(); integrationWorker = undefined; await auditRun; store?.close(); store = undefined; });
+  pi.on("session_shutdown", async () => { const self = activeSide; resume?.stop(); resume = undefined; if (self) store?.release(self); activeSide = undefined; await integrationWorker?.stop(); integrationWorker = undefined; await auditRun; store?.close(); store = undefined; });
   pi.on("agent_start", () => { resume?.runStarted(); });
   pi.on("message_end", (event) => { resume?.observeMessage(event.message); });
   pi.on("agent_settled", (event, ctx) => { resume?.settled(event.aborted); audit(ctx); });
@@ -143,11 +146,11 @@ export default function piCowork(pi: ExtensionAPI): void {
 
   pi.registerTool({
     name: "cowork_sides", label: "List project CoWork sides",
-    description: "Discover registered sides by name and stable id. Filter by query (name/id substring), or follow nextAfter to page through the persistent directory; this is not an online roster. Names may be ambiguous. Does not expose tasks.",
-    parameters: Type.Object({ query: Type.Optional(Type.String({ minLength: 1, maxLength: 256 })), after: Type.Optional(Type.String({ minLength: 1, maxLength: 256 })), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })) }),
+    description: "List project CoWork sides. Defaults to scope=current and only returns current session bindings; explicitly request scope=history or scope=all to inspect historical registrations. Filter by query (name/id substring), or follow nextAfter for stable pagination. currentTotal and historyTotal are scoped counts. Names may be ambiguous. Does not expose tasks.",
+    parameters: Type.Object({ query: Type.Optional(Type.String({ minLength: 1, maxLength: 256 })), after: Type.Optional(Type.String({ minLength: 1, maxLength: 256 })), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })), scope: Type.Optional(Type.Union([Type.Literal("current"), Type.Literal("history"), Type.Literal("all")])) }),
     async execute(_id, input, _signal, _update, ctx) {
       const self = identity(ctx);
-      return toolResult({ self, ...board().sidePage(input) });
+      return toolResult({ self, scope: input.scope ?? "current", currentTotal: board().sidePage({ scope: "current", query: input.query, limit: 1 }).total, historyTotal: board().sidePage({ scope: "history", query: input.query, limit: 1 }).total, ...board().sidePage(input) });
     },
   });
 
@@ -195,11 +198,12 @@ export default function piCowork(pi: ExtensionAPI): void {
 
   pi.registerTool({
     name: "cowork_create", label: "Assign a CoWork task",
-    description: "Create a checklist task for one side from cowork_sides. Only this creator and that assignee may list or read it. Code deliveries default to requiring reviewed integration and push before closure; set requiresIntegration=false only for review/material tasks that need no merge. A durable event resumes the assignee's live Pi within existing authorization.",
+    description: "Create a checklist task for one side from cowork_sides. Priority is urgent/high/normal/low and defaults to normal; higher priority is shown first within each panel state. Only this creator and that assignee may list or read it. Code deliveries default to requiring reviewed integration and push before closure; set requiresIntegration=false only for review/material tasks that need no merge. A durable event resumes the assignee's live Pi within existing authorization.",
     parameters: Type.Object({
       to: Type.String({ minLength: 1, maxLength: 256 }), subject: Type.String({ minLength: 1, maxLength: 160 }),
       body: Type.String({ minLength: 1, maxLength: 16000 }),
       items: Type.Array(Type.String({ minLength: 1, maxLength: 1000 }), { minItems: 1, maxItems: 50 }),
+      priority: Type.Optional(Type.Union([Type.Literal('urgent'), Type.Literal('high'), Type.Literal('normal'), Type.Literal('low')])),
       refs: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 512 }), { maxItems: 20 })),
       idempotencyKey: Type.Optional(Type.String({ minLength: 1, maxLength: 160 })),
       requiresIntegration: Type.Optional(Type.Boolean({ description: "Defaults to true for code delivery. Set false only for a review/material task that does not require merging." })),
@@ -207,6 +211,13 @@ export default function piCowork(pi: ExtensionAPI): void {
     async execute(_id, input, _signal, _update, ctx) {
       return toolResult({ task: board().create({ ...input, requiresIntegration: input.requiresIntegration ?? true }, identity(ctx).id) });
     }, renderResult,
+  });
+
+  pi.registerTool({
+    name: "cowork_priority", label: "Set task priority",
+    description: "Either task participant may set low/normal/high/urgent priority until the task is closed. Higher priority is ordered first within each state in the human panel. Priority does not grant authority or change task state.",
+    parameters: Type.Object({ id: idSchema, priority: Type.Union([Type.Literal("urgent"), Type.Literal("high"), Type.Literal("normal"), Type.Literal("low")]) }),
+    async execute(_id, input, _signal, _update, ctx) { return toolResult({ task: board().setPriority(input.id, identity(ctx).id, input.priority) }); }, renderResult,
   });
 
   pi.registerTool({
@@ -388,7 +399,7 @@ export default function piCowork(pi: ExtensionAPI): void {
   });
 
   pi.registerCommand("cowork", {
-    description: "Open task board; m opens side management. /cowork [sides [query]|audit|init|status|auto [on|off]|name <name>|read <id>|remove [side-id]|takeover <side-id>]",
+    description: "Open the task board; m opens current-side management. /cowork sides opens current sides and h toggles history. /cowork [audit|init|status|auto [on|off]|name <name>|read <id>|remove [side-id]|takeover <side-id>]",
     handler: async (args, ctx) => {
       const self = identity(ctx);
       const command = args.trim();

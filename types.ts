@@ -1,4 +1,4 @@
-export const HANDOFF_EXTENSION_VERSION = "5.0.6";
+export const HANDOFF_EXTENSION_VERSION = "5.2.0";
 
 export interface Side {
   id: string;
@@ -10,6 +10,7 @@ export interface Side {
   removedAt?: string;
 }
 
+export type TaskPriority = "urgent" | "high" | "normal" | "low";
 export type TaskState = "open" | "completed" | "closed";
 export interface TaskBlock {
   reason: string;
@@ -21,7 +22,7 @@ export interface TaskBlock {
 export interface TaskEvent {
   seq: number;
   actor: string;
-  kind: "check" | "complete" | "close" | "reopen" | "block" | "unblock" | "integration" | "reply";
+  kind: "check" | "complete" | "close" | "reopen" | "block" | "unblock" | "integration" | "reply" | "priority";
   data: Record<string, unknown>;
   at: string;
 }
@@ -29,8 +30,8 @@ export interface TaskEvent {
 export interface HandoffTask {
   id: number;
   creator: Side;
-  assignee: Side;
   subject: string;
+  priority: TaskPriority;
   body: string;
   refs: string[];
   items: { text: string; checked: boolean }[];
@@ -55,7 +56,7 @@ export interface CreateInput {
   subject: string;
   body: string;
   items: string[];
-  refs?: string[];
+  priority?: TaskPriority;
   idempotencyKey?: string;
   requiresIntegration?: boolean;
 }

@@ -37,7 +37,7 @@ test('removing a stopped side hides discovery, preserves closed history and surv
     f.store.close();
     const restarted = new HandoffStore(f.root);
     try {
-      assert(restarted.sessionSide(old.sessionId)?.removedAt);
+      assert.equal(restarted.db.prepare('SELECT session_id FROM handoff_side_bindings WHERE side_id=?').get(old.id)?.session_id, null);
       assert.equal(restarted.sides().length, 1);
       assert.equal(restarted.sidePage().sides.length, 1);
       assert.equal(restarted.read(task.id, old.id).state, 'closed');
@@ -82,7 +82,8 @@ test('a live current side must pause and release its consumer before deleting it
     f.store.releaseResume(owner.id, 'consumer');
     assert(f.store.removeSide(owner, owner.id, owner.sessionId, 'delete me').removedAt);
     assert.equal(f.store.resumeStatus(owner.id).enabled, false);
-    assert.equal(f.store.sessionSide(owner.sessionId)?.id, owner.id);
+    assert.equal(f.store.sessionSide(owner.sessionId)?.removedAt != null, true);
+    assert.equal(f.store.db.prepare('SELECT session_id FROM handoff_side_bindings WHERE side_id=?').get(owner.id)?.session_id, null);
     assert.throws(() => f.store.register(owner), /removed/);
   } finally { f.close(); }
 });

@@ -45,7 +45,7 @@ test('side directory pages are bounded, searchable and stable across display-nam
     assert.equal(new Set(found).size, 78);
     const filtered = f.store.sidePage({ query: 'DATA', limit: 100 });
     assert.equal(filtered.sides.length, 37);
-    assert.equal(filtered.total, 78);
+    assert.equal(filtered.total, 37);
     assert.equal(filtered.matched, 37);
     assert.equal(f.store.sidePage({ query: 'DATA', after: 's070' }).matched, 37);
     assert(filtered.sides.every(side => side.name === 'data'));

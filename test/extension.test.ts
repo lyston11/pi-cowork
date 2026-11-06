@@ -38,22 +38,32 @@ test("tool boundary binds identity to session, never accepts an actor from argum
     const b = (await execute("two", "cowork_identity", { name: "data" })).details.self;
     await execute("three", "cowork_identity", { name: "frontend" });
     await assert.rejects(execute("one", "cowork_create", { to: "missing-side", subject: "secret", body: "PRIVATE-TEXT", items: ["done"], requiresIntegration: false }), /use an id from cowork_sides/);
-    const created = await execute("one", "cowork_create", { to: b.id, subject: "secret", body: "PRIVATE-TEXT", items: ["done"], requiresIntegration: false });
+    const created = await execute("one", "cowork_create", { to: b.id, subject: "secret", body: "PRIVATE-TEXT", items: ["done"], priority: "high", requiresIntegration: false });
     const id = created.details.task.id;
     const compactCreated = JSON.parse(created.content[0].text).task;
+    assert.equal(compactCreated.priority, 'high');
     assert.equal(compactCreated.body, undefined);
     assert.equal(compactCreated.events, undefined);
     assert.deepEqual(compactCreated.progress, { checked: 0, total: 1 });
     assert.equal(created.details.task.body, 'PRIVATE-TEXT', 'UI details remain complete');
+    const prioritized = await execute('two', 'cowork_priority', { id, priority: 'urgent' });
+    assert.equal(prioritized.details.task.priority, 'urgent');
     const listed = JSON.parse((await execute('one', 'cowork_list', { activeOnly: true })).content[0].text);
-    assert.equal(listed.tasks[0].revision, compactCreated.revision);
+    assert.equal(listed.tasks[0].priority, 'urgent');
     assert.equal(listed.tasks[0].items, undefined);
     assert.equal(listed.tasks[0].refs, undefined);
     const same = JSON.parse((await execute('one', 'cowork_list', { activeOnly: true })).content[0].text);
     assert.deepEqual(same, listed, 'unchanged tasks produce identical model output');
     const sides = JSON.parse((await execute('one', 'cowork_sides', { query: 'data', limit: 1 })).content[0].text);
     assert.deepEqual(sides.sides.map((side: any) => side.id), [b.id]);
+    assert.equal(sides.scope, 'current');
+    assert.equal(sides.currentTotal, 1);
+    assert.equal(sides.historyTotal, 0);
     assert.equal(sides.nextAfter, null);
+    const allSides = JSON.parse((await execute('one', 'cowork_sides', { scope: 'all', limit: 100 })).content[0].text);
+    assert.equal(allSides.currentTotal, 3);
+    assert.equal(allSides.historyTotal, 0);
+    assert.equal(allSides.total, 3);
     await assert.rejects(execute("one", "cowork_block", { id, reason: "approval", waitingFor: "reviewer" }), /Only the assignee/);
     await execute("two", "cowork_block", { id, reason: "approval then continue", waitingFor: "reviewer", dependencies: [] });
     const fullRead = await execute('one', 'cowork_read', { id });
@@ -134,7 +144,7 @@ test("tool boundary binds identity to session, never accepts an actor from argum
         assert.doesNotMatch(frame.join("\n"), /任务 31/);
         panel.handleInput("\x1b[6~");
         const paged = render();
-        const selectedAfterPage = Number(paged.match(/> ▸ #([0-9]+)/)?.[1]);
+        const selectedAfterPage = Number(paged.match(/> ▸ \[P[0-3] [^\]]+\] #([0-9]+)/)?.[1]);
         assert(selectedAfterPage > 1, "page down should select a visible task");
         panel.handleInput("\r");
         const detail = render();
@@ -147,10 +157,10 @@ test("tool boundary binds identity to session, never accepts an actor from argum
         panel.handleInput("\x1b[6~");
         assert.match(render(), /DETAIL-/);
         panel.handleInput("\r");
-        assert(render().includes(`> ▸ #${selectedAfterPage} `), "return retains the same selected task");
+        assert(render().includes(`> ▸ [P2 普通] #${selectedAfterPage} `), "return retains the same selected task");
         for (const key of ["\x1b[5~", "\x1b[F", "\x1b[H"]) {
           panel.handleInput(key);
-          assert.match(render(), /> ▸ #[0-9]+/, "scrolling keeps a visible selection");
+          assert.match(render(), /> ▸ \[P[0-3] [^\]]+\] #[0-9]+/, "scrolling keeps a visible selection");
         }
         panel.handleInput("r");
         render();
@@ -161,7 +171,7 @@ test("tool boundary binds identity to session, never accepts an actor from argum
         panel.handleInput("r");
         render();
         for (let i = 0; i < 32; i++) { panel.handleInput("\x1b[B"); render(); }
-        assert.match(render(), /> ▸ #33 .*任务 31/, "down arrows automatically cross the page boundary");
+        assert.match(render(), /> ▸ \[P2 普通\] #33 .*任务 31/, "down arrows automatically cross the page boundary");
         panel.handleInput("\t"); panel.handleInput("\t");
         panel.handleInput("r");
         render();
@@ -192,7 +202,7 @@ test("tool boundary binds identity to session, never accepts an actor from argum
         panel.handleInput("\x1b");
         assert.equal(exited, false, "Esc returns from details instead of closing the panel");
         assert.match(render(), /交接任务/);
-        assert.match(render(), /> ▸ #33 /);
+        assert.match(render(), /> ▸ \[P2 普通\] #33 /);
         panel.handleInput("\x1b[H");
         assert.match(render(), /secret/);
         const commit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" }).trim();

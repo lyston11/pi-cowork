@@ -11,11 +11,12 @@ export function taskLines(task: HandoffTask | TaskSummary, expanded: boolean, th
     ? task.block ? task.block.needsReview ? "[!] 依赖更新待复核" : "[⏸] 被阻塞" : "[ ] 待核对/处理"
     : task.state === "completed" ? task.integration ? `[✓] 集成${({ queued: "排队中", running: "执行中", blocked: "受阻", pushed: "已推送待关闭" })[task.integration.state]}` : "[✓] 待发起方验收" : "[✓] 已验收关闭";
   const fold = expanded ? "▾" : "▸";
+  const priorityLabel = ({ urgent: "P0 紧急", high: "P1 高", normal: "P2 普通", low: "P3 低" } as const)[task.priority];
   const responsible = task.state === "completed" ? task.integration?.state === "queued" || task.integration?.state === "running" ? "集成队列执行"
     : `${plain(task.creator.name)}${task.integration?.state === "blocked" ? "处理集成阻塞" : task.integration?.state === "pushed" ? "核对集成并关闭" : "验收"}`
     : task.block && !task.block.needsReview ? `${plain(task.block.waitingFor)}提供条件`
     : `${plain(task.assignee.name)}${task.block ? "复核依赖" : "核对并处理"}`;
-  const heading = `${fold} #${task.id} ${status} ${plain(task.creator.name)} → ${plain(task.assignee.name)} · ${plain(task.subject)} · ${checked}/${task.items.length}${task.state === "closed" ? "" : ` · 下一步：${responsible}`}`;
+  const heading = `${fold} [${priorityLabel}] #${task.id} ${status} ${plain(task.creator.name)} → ${plain(task.assignee.name)} · ${plain(task.subject)} · ${checked}/${task.items.length}${task.state === "closed" ? "" : ` · 下一步：${responsible}`}`;
   const lines = [heading];
   if (task.block) {
     const reason = `  阻塞：${plain(task.block.reason)}`;

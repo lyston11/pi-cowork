@@ -17,13 +17,17 @@ export async function showSides(ctx: ExtensionContext, store: HandoffStore, self
   }
   return ctx.ui.custom<boolean>((tui, theme, _keys, done) => {
     let sides: Side[] = [], nextAfter: string | null = null, total = 0, matched = 0;
+    let currentTotal = 0, historyTotal = 0;
+    let scope: 'current' | 'history' = 'current';
     let query = initialQuery.trim(), selected = 0, listOffset = 0, offset = 0, height = 1;
     let view: 'list' | 'detail' | 'confirm' | 'error' = 'list';
     let detail: ReturnType<HandoffStore['sideForHumanUi']> | undefined;
     let notice = '', error = '', editing = false, focused = false;
     const input = new Input({ prompt: '搜索名称/ID: ' });
     const load = (more = false) => {
-      const page = store.sidePage({ query: query || undefined, after: more ? nextAfter ?? undefined : undefined, limit: 100 });
+      currentTotal = store.sidePage({ scope: 'current', limit: 1 }).total;
+      historyTotal = store.sidePage({ scope: 'history', limit: 1 }).total;
+      const page = store.sidePage({ query: query || undefined, scope, after: more ? nextAfter ?? undefined : undefined, limit: 100 });
       sides = more ? [...sides, ...page.sides] : page.sides;
       ({ nextAfter, total, matched } = page);
       if (!more) { selected = 0; listOffset = 0; }
@@ -56,8 +60,10 @@ export async function showSides(ctx: ExtensionContext, store: HandoffStore, self
         const rule = (a: string, b: string) => theme.fg('border', a + '─'.repeat(width - 2) + b);
         let lines: string[], title: string;
         if (view === 'list') {
-          title = `项目侧管理 · 已登记 ${total} 侧${query ? ` · 匹配 ${matched} 侧` : ''}`;
-          const prefix = height > 1 || editing ? [editing ? input.render(inner)[0] : plain(notice || (query ? `筛选: ${query}` : '历史侧也计入登记数；进程存活不代表正在执行任务'))] : [];
+          title = scope === 'current'
+            ? `当前绑定 ${currentTotal} 侧 · 历史登记 ${historyTotal} 侧${query ? ` · 匹配 ${matched} 侧` : ''}`
+            : `历史登记 ${historyTotal} 侧 · 当前绑定 ${currentTotal} 侧${query ? ` · 匹配 ${matched} 侧` : ''}`;
+          const prefix = height > 1 || editing ? [editing ? input.render(inner)[0] : plain(notice || (query ? `筛选: ${query}` : scope === 'current' ? '当前绑定侧；h 查看历史侧' : '历史侧；h 返回当前绑定侧'))] : [];
           const visibleCount = Math.max(1, height - prefix.length);
           listOffset = Math.min(listOffset, selected * 2);
           if (selected * 2 >= listOffset + visibleCount) listOffset = selected * 2 - visibleCount + 1;
@@ -97,7 +103,7 @@ export async function showSides(ctx: ExtensionContext, store: HandoffStore, self
           : view === 'confirm' ? 'y确认删除 n/Esc取消 ↑↓滚动'
           : view === 'error' ? 'Enter/Esc返回 ↑↓滚动'
           : view === 'detail' ? 'Enter/Esc返回 d删除 ↑↓滚动 PgUp/PgDn翻页 r刷新'
-          : `Esc返回 ↑↓选择 Enter详情 /搜索 d删除 r刷新 PgUp/PgDn翻页 Home/End首尾 · 已载 ${sides.length}/${matched}`;
+          : `Esc返回 h${scope === 'current' ? '历史侧' : '当前侧'} ↑↓选择 Enter详情 /搜索 d删除 r刷新 PgUp/PgDn翻页 Home/End首尾 · 已载 ${sides.length}/${matched}`;
         return [rule('╭','╮'),row(theme.fg('accent', title)),rule('├','┤'),
           ...Array.from({ length: height }, (_, i) => row(lines[i] ?? '')),rule('├','┤'),
           row(theme.fg('dim', view === 'list' && !editing && visibleWidth(help) > inner
@@ -126,6 +132,7 @@ export async function showSides(ctx: ExtensionContext, store: HandoffStore, self
             else return;
           } else if (matchesKey(data, Key.escape)) { done(false); return; }
           else if (data === '/') { editing = true; input.setValue(query); input.focused = focused; }
+          else if (data === 'h') { scope = scope === 'current' ? 'history' : 'current'; notice = ''; load(); }
           else if (data === 'r') { notice = ''; load(); }
           else if (matchesKey(data, Key.enter) || data === 'd') { inspect(); if (data === 'd' && detail) view = 'confirm'; }
           else if (matchesKey(data, Key.home)) { selected = 0; }

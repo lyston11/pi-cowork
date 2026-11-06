@@ -4,7 +4,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { HANDOFF_EXTENSION_VERSION, type CreateInput, type HandoffTask, type Side, type TaskEvent, type TaskSummary } from "./types.ts";
+import { HANDOFF_EXTENSION_VERSION, type CreateInput, type HandoffTask, type Side, type TaskEvent, type TaskPriority, type TaskSummary } from "./types.ts";
 
 function text(value: unknown, name: string, max: number): string {
   if (typeof value !== "string" || !value.trim() || value.length > max) {
@@ -16,6 +16,12 @@ function text(value: unknown, name: string, max: number): string {
 function integer(value: number, name: string, minimum: number): number {
   if (!Number.isSafeInteger(value) || value < minimum) throw new Error(`Invalid ${name}`);
   return value;
+}
+
+const priorityRank: Record<TaskPriority, number> = { urgent: 4, high: 3, normal: 2, low: 1 };
+function priority(value: unknown): TaskPriority {
+  if (value === "urgent" || value === "high" || value === "normal" || value === "low") return value;
+  throw new Error("Priority must be urgent, high, normal, or low");
 }
 
 const immutable = (table: string) => `
@@ -34,12 +40,28 @@ export interface HumanTaskSnapshot {
 export interface ResumeEvent {
   seq: number;
   taskId: number;
-  kind: "created" | "complete" | "reopen" | "close" | "dependency" | "checkpoint" | "integration" | "blocked" | "reply";
+  kind: "created" | "complete" | "reopen" | "close" | "dependency" | "checkpoint" | "integration" | "blocked" | "reply" | "priority";
 }
 
 export interface ResumeBatch {
   throughSeq: number;
   events: ResumeEvent[];
+}
+
+export type SideDirectoryScope = "current" | "history" | "all";
+
+export interface SidePageOptions {
+  query?: string;
+  after?: string;
+  limit?: number;
+  scope?: SideDirectoryScope;
+}
+
+export interface SidePage {
+  sides: Side[];
+  nextAfter: string | null;
+  total: number;
+  matched: number;
 }
 
 export class HandoffStore {
@@ -69,6 +91,11 @@ export class HandoffStore {
           side_id TEXT PRIMARY KEY REFERENCES handoff_sides(id),
           session_id TEXT UNIQUE
         );
+        CREATE TABLE IF NOT EXISTS handoff_side_sessions (
+          session_id TEXT PRIMARY KEY,
+          side_id TEXT NOT NULL REFERENCES handoff_sides(id),
+          released_at TEXT
+        );
         CREATE TABLE IF NOT EXISTS handoff_side_transfers (
           seq INTEGER PRIMARY KEY AUTOINCREMENT,
           side_id TEXT NOT NULL REFERENCES handoff_sides(id),
@@ -92,10 +119,15 @@ export class HandoffStore {
         CREATE TRIGGER IF NOT EXISTS handoff_removed_side_insert BEFORE INSERT ON handoff_sides
           WHEN EXISTS(SELECT 1 FROM handoff_side_removals WHERE side_id=NEW.id)
           BEGIN SELECT RAISE(ABORT,'Side was removed; it cannot register again'); END;
-        CREATE TRIGGER IF NOT EXISTS handoff_side_owner_guard BEFORE UPDATE ON handoff_sides
-          WHEN EXISTS(SELECT 1 FROM handoff_side_bindings b WHERE b.side_id=OLD.id
-            AND (b.session_id IS NULL OR b.session_id<>NEW.session_id))
+        DROP TRIGGER IF EXISTS handoff_side_owner_guard_v2;
+        CREATE TRIGGER IF NOT EXISTS handoff_side_owner_guard_v3 BEFORE UPDATE ON handoff_sides
+          WHEN NEW.session_id<>OLD.session_id AND (
+            EXISTS(SELECT 1 FROM handoff_side_transfers t WHERE t.side_id=OLD.id AND t.from_session=NEW.session_id)
+            OR (NOT EXISTS(SELECT 1 FROM handoff_side_bindings b WHERE b.side_id=OLD.id AND b.session_id=NEW.session_id)
+              AND NOT EXISTS(SELECT 1 FROM handoff_side_sessions s WHERE s.side_id=OLD.id AND s.session_id=NEW.session_id AND s.released_at IS NOT NULL))
+          )
           BEGIN SELECT RAISE(ABORT, 'Side ownership transferred; this session cannot reclaim it'); END;
+        DROP TRIGGER IF EXISTS handoff_side_owner_guard;
         ${immutable("handoff_side_transfers")}
         CREATE TABLE IF NOT EXISTS handoff_tasks (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -131,6 +163,17 @@ export class HandoffStore {
         ${immutable("handoff_tasks")}
         ${immutable("handoff_task_events")}
       `);
+      if (!(this.db.prepare("PRAGMA table_info(handoff_tasks)").all() as Array<{ name: string }>).some(column => column.name === "priority")) {
+        this.db.exec("ALTER TABLE handoff_tasks ADD COLUMN priority TEXT NOT NULL DEFAULT 'normal'");
+      }
+      this.transaction(() => {
+        this.db.exec(`
+          INSERT OR IGNORE INTO handoff_side_sessions(session_id,side_id,released_at)
+            SELECT s.session_id,s.id,CASE WHEN EXISTS(SELECT 1 FROM handoff_side_bindings b WHERE b.side_id=s.id AND b.session_id=s.session_id) THEN NULL ELSE CURRENT_TIMESTAMP END FROM handoff_sides s;
+          INSERT OR IGNORE INTO handoff_side_sessions(session_id,side_id,released_at) SELECT from_session,side_id,at FROM handoff_side_transfers;
+          INSERT OR IGNORE INTO handoff_side_sessions(session_id,side_id,released_at) SELECT to_session,side_id,NULL FROM handoff_side_transfers;
+        `);
+      });
       this.initializeResume();
       this.transaction(() => { initializeWorkspaces(this.db); initializeIntegration(this.db); });
     } catch (error) {
@@ -168,6 +211,11 @@ export class HandoffStore {
           BEGIN INSERT INTO handoff_resume_events(recipient,task_id,kind,source)
             SELECT CASE NEW.kind WHEN 'complete' THEN creator ELSE assignee END,
               NEW.task_id,NEW.kind,'event:'||NEW.seq FROM handoff_tasks WHERE id=NEW.task_id; END;
+        CREATE TRIGGER IF NOT EXISTS handoff_resume_priority AFTER INSERT ON handoff_task_events
+          WHEN NEW.kind='priority'
+          BEGIN INSERT INTO handoff_resume_events(recipient,task_id,kind,source)
+            SELECT CASE WHEN NEW.actor=t.creator THEN t.assignee ELSE t.creator END,t.id,'priority','priority:'||NEW.seq
+            FROM handoff_tasks t WHERE t.id=NEW.task_id; END;
         CREATE TRIGGER IF NOT EXISTS handoff_resume_blocked AFTER INSERT ON handoff_task_events
           WHEN NEW.kind='block' AND NOT EXISTS(
             SELECT 1 FROM handoff_task_events e WHERE e.task_id=NEW.task_id AND e.kind='block' AND e.seq<NEW.seq
@@ -281,7 +329,8 @@ export class HandoffStore {
     if (!state) return null;
     const rows = this.db.prepare(`SELECT r.seq,r.task_id,r.kind,r.source,
       (SELECT kind FROM handoff_task_events WHERE task_id=r.task_id AND kind IN ('complete','reopen','close') ORDER BY seq DESC LIMIT 1) AS current_kind,
-      (SELECT seq FROM handoff_task_events WHERE task_id=r.task_id AND kind IN ('complete','reopen','close') ORDER BY seq DESC LIMIT 1) AS current_seq
+      (SELECT seq FROM handoff_task_events WHERE task_id=r.task_id AND kind IN ('complete','reopen','close') ORDER BY seq DESC LIMIT 1) AS current_seq,
+      (SELECT seq FROM handoff_task_events WHERE task_id=r.task_id AND kind='priority' ORDER BY seq DESC LIMIT 1) AS current_priority_seq
       FROM handoff_resume_events r WHERE recipient=? AND seq>? ORDER BY seq LIMIT 100`).all(actor, Number(state.ack_seq));
     if (!rows.length) return null;
     let hasWork: boolean | undefined;
@@ -290,6 +339,7 @@ export class HandoffStore {
       const kind = row.kind as ResumeEvent["kind"];
       let relevant = kind === "complete" || kind === "integration" ? row.current_kind === "complete"
         : kind === "close" ? row.current_kind === "close" : row.current_kind === null || row.current_kind === "reopen";
+      if (kind === "priority") relevant = row.source === `priority:${row.current_priority_seq}`;
       if (String(row.source).startsWith("task:") && row.current_seq !== null) relevant = false;
       if (String(row.source).startsWith("event:") && row.source !== `event:${row.current_seq}`) relevant = false;
       if (relevant && kind === "close") {
@@ -395,23 +445,49 @@ export class HandoffStore {
 
   register(side: Side): void {
     this.transaction(() => {
+      if (this.db.prepare("SELECT 1 FROM handoff_side_removals WHERE side_id=?").get(side.id)) throw new Error("Side was removed; it cannot register again");
       const bound = this.sessionSide(side.sessionId);
+      const historical = this.historicalSessionSide(side.sessionId);
+      if (historical && historical.id !== side.id) throw new Error("Session belongs to another historical side; use its inherited identity");
       if (bound && bound.id !== side.id) throw new Error("Session is bound to another side; use its inherited identity");
       this.db.prepare(`INSERT INTO handoff_sides(id,name,session_id,pid,worktree,branch) VALUES(?,?,?,?,?,?)
         ON CONFLICT(id) DO UPDATE SET name=excluded.name,session_id=excluded.session_id,
         pid=excluded.pid,worktree=excluded.worktree,branch=excluded.branch`).run(
           side.id, side.name, side.sessionId, side.pid, side.worktree, side.branch,
         );
+      this.db.prepare(`INSERT INTO handoff_side_bindings(side_id,session_id) VALUES(?,?)
+        ON CONFLICT(side_id) DO UPDATE SET session_id=excluded.session_id`).run(side.id, side.sessionId);
+      this.db.prepare(`INSERT INTO handoff_side_sessions(session_id,side_id,released_at) VALUES(?,?,NULL)
+        ON CONFLICT(session_id) DO UPDATE SET released_at=NULL WHERE side_id=excluded.side_id`).run(side.sessionId, side.id);
+    });
+  }
+
+  release(side: Side): void {
+    this.transaction(() => {
+      this.db.prepare("UPDATE handoff_side_bindings SET session_id=NULL WHERE side_id=? AND session_id=?").run(side.id, side.sessionId);
+      this.db.prepare("UPDATE handoff_side_sessions SET released_at=? WHERE side_id=? AND session_id=?").run(new Date().toISOString(), side.id, side.sessionId);
     });
   }
 
   sessionSide(sessionId: string): Side | undefined {
-    const binding = this.db.prepare("SELECT side_id FROM handoff_side_bindings WHERE session_id=?").get(sessionId);
-    if (binding) return this.sides(true).find((side) => side.id === binding.side_id);
+    const binding = this.db.prepare("SELECT side_id FROM handoff_side_bindings WHERE session_id=? AND session_id IS NOT NULL").get(sessionId);
+    if (binding) return this.sideById(String(binding.side_id));
     if (this.db.prepare("SELECT 1 FROM handoff_side_transfers WHERE from_session=? LIMIT 1").get(sessionId)) {
       throw new Error("This session was replaced by a CoWork takeover. It cannot reclaim the old side.");
     }
-    return this.sides(true).find((side) => side.sessionId === sessionId);
+    const mapping = this.db.prepare("SELECT side_id,released_at FROM handoff_side_sessions WHERE session_id=?").get(sessionId) as { side_id: string; released_at: string | null } | undefined;
+    if (mapping?.released_at) {
+      const released = this.sideById(mapping.side_id, true);
+      return released?.removedAt ? released : undefined;
+    }
+    if (mapping) return this.sideById(mapping.side_id, true);
+    const legacy = this.db.prepare("SELECT id FROM handoff_sides WHERE session_id=?").get(sessionId);
+    return legacy ? this.sideById(String(legacy.id), true) : undefined;
+  }
+
+  historicalSessionSide(sessionId: string): Side | undefined {
+    const mapping = this.db.prepare("SELECT side_id FROM handoff_side_sessions WHERE session_id=?").get(sessionId) as { side_id: string } | undefined;
+    return mapping ? this.sideById(mapping.side_id, true) : undefined;
   }
 
   takeover(actor: Side, targetId: string, expectedSessionId: string, reason: string): Side {
@@ -419,9 +495,8 @@ export class HandoffStore {
     text(expectedSessionId, "Expected session id", 256);
     text(reason, "Takeover reason", 2000);
     return this.transaction(() => {
-      const sides = this.sides();
-      const current = sides.find((side) => side.id === actor.id);
-      const target = sides.find((side) => side.id === targetId);
+      const current = this.currentSides().find((side) => side.id === actor.id);
+      const target = this.sideById(targetId);
       if (!current || current.sessionId !== actor.sessionId) throw new Error("Current side ownership has changed");
       if (!target) throw new Error("Target side not found; use an id from cowork_sides");
       if (target.id === actor.id) return current;
@@ -435,10 +510,15 @@ export class HandoffStore {
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
       }
+      const at = new Date().toISOString();
+      this.db.prepare("UPDATE handoff_side_sessions SET released_at=? WHERE side_id=? AND session_id=?").run(at, actor.id, actor.sessionId);
+      this.db.prepare("INSERT INTO handoff_side_sessions(session_id,side_id,released_at) VALUES(?,?,?) ON CONFLICT(session_id) DO UPDATE SET released_at=excluded.released_at").run(target.sessionId,target.id,at);
+      this.db.prepare("INSERT INTO handoff_side_sessions(session_id,side_id,released_at) VALUES(?,?,NULL) ON CONFLICT(session_id) DO UPDATE SET side_id=excluded.side_id,released_at=NULL").run(actor.sessionId,target.id);
       this.db.prepare("INSERT INTO handoff_side_bindings(side_id,session_id) VALUES(?,NULL) ON CONFLICT(side_id) DO UPDATE SET session_id=NULL").run(actor.id);
       this.db.prepare("INSERT INTO handoff_side_bindings(side_id,session_id) VALUES(?,?) ON CONFLICT(side_id) DO UPDATE SET session_id=excluded.session_id").run(target.id, actor.sessionId);
       this.db.prepare("UPDATE handoff_sides SET session_id=?,pid=?,worktree=?,branch=? WHERE id=?").run(actor.sessionId, actor.pid, actor.worktree, actor.branch, target.id);
-      this.db.prepare("INSERT INTO handoff_side_transfers(side_id,from_session,to_session,actor_side,reason,at) VALUES(?,?,?,?,?,?)").run(target.id, target.sessionId, actor.sessionId, actor.id, reason, new Date().toISOString());
+      this.db.prepare("UPDATE handoff_side_sessions SET released_at=? WHERE side_id=? AND session_id=?").run(at,target.id,target.sessionId);
+      this.db.prepare("INSERT INTO handoff_side_transfers(side_id,from_session,to_session,actor_side,reason,at) VALUES(?,?,?,?,?,?)").run(target.id, target.sessionId, actor.sessionId, actor.id, reason, at);
       return { ...actor, id: target.id, name: target.name };
     });
   }
@@ -446,9 +526,9 @@ export class HandoffStore {
   removeSide(actor: Side, targetId: string, expectedSessionId: string, reason: string): Side {
     text(targetId, 'Side id', 256); text(expectedSessionId, 'Expected session id', 256); text(reason, 'Removal reason', 2000);
     return this.transaction(() => {
-      const current = this.sides().find(side => side.id === actor.id);
+      const current = this.currentSides().find(side => side.id === actor.id);
       if (!current || current.sessionId !== actor.sessionId) throw new Error('Current side ownership has changed');
-      const target = this.sides().find(side => side.id === targetId);
+      const target = this.sideById(targetId);
       if (!target) throw new Error('Side not found; read cowork_sides again');
       if (target.sessionId !== expectedSessionId) throw new Error('Side ownership changed; read cowork_sides again');
       if (this.list(target.id, { activeOnly: true, limit: 1 }).tasks.length) throw new Error('Side still has unclosed sent or received tasks; finish their review first');
@@ -464,23 +544,47 @@ export class HandoffStore {
       if (state?.consumer && Number(state.lease_until) > Date.now()) throw new Error('Side still has a resume consumer; wait for it to stop before removal');
       const at = new Date().toISOString();
       this.db.prepare('INSERT INTO handoff_side_removals(side_id,session_id,actor,reason,at) VALUES(?,?,?,?,?)').run(target.id, target.sessionId, actor.id, reason, at);
+      this.db.prepare("UPDATE handoff_side_bindings SET session_id=NULL WHERE side_id=?").run(target.id);
+      this.db.prepare("UPDATE handoff_side_sessions SET released_at=? WHERE side_id=? AND session_id=?").run(at,target.id,target.sessionId);
       this.db.prepare("INSERT INTO handoff_resume_state(side_id,enabled,reason) VALUES(?,0,?) ON CONFLICT(side_id) DO UPDATE SET enabled=0,consumer=NULL,lease_until=0,reason=excluded.reason").run(target.id, 'Side removed');
       return { ...target, removedAt: at };
     });
   }
 
+  private sideById(id: string, includeRemoved = false): Side | undefined {
+    const row = this.db.prepare(`SELECT s.*,r.at AS removed_at FROM handoff_sides s
+      LEFT JOIN handoff_side_removals r ON r.side_id=s.id WHERE s.id=? AND (? OR r.side_id IS NULL)`).get(id, Number(includeRemoved)) as Record<string, unknown> | undefined;
+    if (!row) return undefined;
+    return { id: String(row.id), name: String(row.name), sessionId: String(row.session_id), pid: Number(row.pid), worktree: String(row.worktree), branch: String(row.branch), ...(row.removed_at ? { removedAt: String(row.removed_at) } : {}) };
+  }
+
+  private currentSides(): Side[] {
+    return this.db.prepare(`SELECT s.* FROM handoff_sides s WHERE EXISTS(
+      SELECT 1 FROM handoff_side_bindings b WHERE b.side_id=s.id AND b.session_id IS NOT NULL
+    ) AND NOT EXISTS(SELECT 1 FROM handoff_side_removals r WHERE r.side_id=s.id) ORDER BY s.name,s.id`).all().map((row) => ({
+      id: String(row.id), name: String(row.name), sessionId: String(row.session_id), pid: Number(row.pid), worktree: String(row.worktree), branch: String(row.branch),
+    }));
+  }
+
+  private allSides(includeRemoved = false): Side[] {
+    return this.db.prepare(`SELECT s.*,r.at AS removed_at FROM handoff_sides s LEFT JOIN handoff_side_removals r ON r.side_id=s.id
+      WHERE (? OR r.side_id IS NULL) ORDER BY name,id`).all(Number(includeRemoved)).map((row) => ({
+        id: String(row.id), name: String(row.name), sessionId: String(row.session_id), pid: Number(row.pid), worktree: String(row.worktree), branch: String(row.branch),
+        ...(row.removed_at ? { removedAt: String(row.removed_at) } : {}),
+      }));
+  }
+
   sides(includeRemoved = false): Side[] {
-    return this.db.prepare(`SELECT s.*,r.at AS removed_at FROM handoff_sides s LEFT JOIN handoff_side_removals r ON r.side_id=s.id WHERE (? OR r.side_id IS NULL) AND NOT EXISTS(
-      SELECT 1 FROM handoff_side_bindings b WHERE b.side_id=s.id AND b.session_id IS NULL
+    return this.db.prepare(`SELECT s.*,r.at AS removed_at FROM handoff_sides s LEFT JOIN handoff_side_removals r ON r.side_id=s.id WHERE (? OR r.side_id IS NULL) AND EXISTS(
+      SELECT 1 FROM handoff_side_bindings b WHERE b.side_id=s.id AND b.session_id IS NOT NULL
     ) ORDER BY name,id`).all(Number(includeRemoved)).map((row) => ({
-      id: String(row.id), name: String(row.name), sessionId: String(row.session_id),
-      pid: Number(row.pid), worktree: String(row.worktree), branch: String(row.branch),
+      id: String(row.id), name: String(row.name), sessionId: String(row.session_id), pid: Number(row.pid), worktree: String(row.worktree), branch: String(row.branch),
       ...(row.removed_at ? { removedAt: String(row.removed_at) } : {}),
     }));
   }
 
   sideForHumanUi(id: string) {
-    const side = this.sides().find(side => side.id === id);
+    const side = this.sideById(id);
     if (!side) throw new Error('Side not found; refresh the side directory');
     const openTasks = Number(this.db.prepare(`SELECT COUNT(*) AS total FROM handoff_tasks t
       WHERE (creator=? OR assignee=?) AND COALESCE((SELECT kind FROM handoff_task_events
@@ -489,30 +593,32 @@ export class HandoffStore {
     return { side, openTasks, workspaces, autoResume: this.resumeStatus(id) };
   }
 
-  sidePage(options: { query?: string; after?: string; limit?: number } = {}): { sides: Side[]; nextAfter: string | null; total: number; matched: number } {
+  sidePage(options: SidePageOptions = {}): SidePage {
     const limit = options.limit === undefined ? 30 : integer(options.limit, 'limit', 1);
     if (limit > 100) throw new Error('Limit must not exceed 100');
     const after = options.after === undefined ? '' : text(options.after, 'after', 256);
     const query = options.query === undefined ? '' : text(options.query, 'query', 256);
-    const rows = this.db.prepare(`SELECT s.* FROM handoff_sides s WHERE s.id>?
+    const scope = options.scope ?? 'current';
+    const scopeSql = scope === 'current'
+      ? 'AND EXISTS(SELECT 1 FROM handoff_side_bindings cb WHERE cb.side_id=s.id AND cb.session_id IS NOT NULL)'
+      : scope === 'history'
+        ? 'AND NOT EXISTS(SELECT 1 FROM handoff_side_bindings hb WHERE hb.side_id=s.id AND hb.session_id IS NOT NULL)'
+        : '';
+    const base = `FROM handoff_sides s WHERE s.id>? ${scopeSql}
       AND NOT EXISTS(SELECT 1 FROM handoff_side_removals r WHERE r.side_id=s.id)
-      AND NOT EXISTS(SELECT 1 FROM handoff_side_bindings b WHERE b.side_id=s.id AND b.session_id IS NULL)
-      AND (instr(lower(s.name),lower(?))>0 OR instr(lower(s.id),lower(?))>0)
-      ORDER BY s.id LIMIT ?`).all(after, query, query, limit + 1);
+      AND (instr(lower(s.name),lower(?))>0 OR instr(lower(s.id),lower(?))>0)`;
+    const rows = this.db.prepare(`SELECT s.* ${base} ORDER BY s.id LIMIT ?`).all(after, query, query, limit + 1);
     const hasMore = rows.length > limit;
     if (hasMore) rows.pop();
-    const sides = rows.map(row => ({ id: String(row.id), name: String(row.name), sessionId: String(row.session_id),
-      pid: Number(row.pid), worktree: String(row.worktree), branch: String(row.branch) }));
-    const counts = this.db.prepare(`SELECT COUNT(*) AS total,
-      COALESCE(SUM(instr(lower(s.name),lower(?))>0 OR instr(lower(s.id),lower(?))>0),0) AS matched
-      FROM handoff_sides s WHERE NOT EXISTS(SELECT 1 FROM handoff_side_removals r WHERE r.side_id=s.id)
-      AND NOT EXISTS(SELECT 1 FROM handoff_side_bindings b WHERE b.side_id=s.id AND b.session_id IS NULL)`).get(query, query)!;
-    return { sides, nextAfter: hasMore ? sides.at(-1)!.id : null, total: Number(counts.total), matched: Number(counts.matched) };
+    const sides = rows.map(row => ({ id: String(row.id), name: String(row.name), sessionId: String(row.session_id), pid: Number(row.pid), worktree: String(row.worktree), branch: String(row.branch) }));
+    const counts = this.db.prepare(`SELECT COUNT(*) AS total ${base}`).get('', query, query)!;
+    return { sides, nextAfter: hasMore ? sides.at(-1)!.id : null, total: Number(counts.total), matched: Number(counts.total) };
   }
 
   create(input: CreateInput, actor: string): HandoffTask {
     const to = text(input.to, "Assignee", 256);
     const subject = text(input.subject, "Subject", 160);
+    const taskPriority = priority(input.priority ?? "normal");
     const body = text(input.body, "Body", 16000);
     if (!Array.isArray(input.items) || !input.items.length || input.items.length > 50) throw new Error("Provide 1-50 checklist items");
     const items = input.items.map((item) => text(item, "Checklist item", 1000));
@@ -522,11 +628,11 @@ export class HandoffStore {
     const requiresIntegration = input.requiresIntegration ?? false;
     const key = input.idempotencyKey === undefined ? null : text(input.idempotencyKey, "Idempotency key", 160);
     return this.transaction(() => {
-      const matches = this.sides().filter((side) => side.id === to || side.name === to);
+      const matches = this.currentSides().filter((side) => side.id === to || side.name === to);
       if (matches.length !== 1) throw new Error("Assignee not found or name is ambiguous; use an id from cowork_sides");
       const assignee = matches[0].id;
       if (assignee === actor) throw new Error("Assign the CoWork task to another side");
-      const hash = createHash("sha256").update(JSON.stringify({ assignee, subject, body, items, refs, ...(requiresIntegration ? { requiresIntegration } : {}) })).digest("hex");
+      const hash = createHash("sha256").update(JSON.stringify({ assignee, subject, ...(taskPriority !== 'normal' ? { priority: taskPriority } : {}), body, items, refs, ...(requiresIntegration ? { requiresIntegration } : {}) })).digest("hex");
       if (key !== null) {
         const existing = this.db.prepare("SELECT id,payload_hash FROM handoff_tasks WHERE creator=? AND idempotency_key=?").get(actor, key);
         if (existing) {
@@ -535,8 +641,8 @@ export class HandoffStore {
         }
       }
       const result = this.db.prepare(`INSERT INTO handoff_tasks(
-        creator,assignee,subject,body,items_json,refs_json,created_at,idempotency_key,payload_hash,requires_integration
-      ) VALUES(?,?,?,?,?,?,?,?,?,?)`).run(actor, assignee, subject, body, JSON.stringify(items), JSON.stringify(refs), new Date().toISOString(), key, hash, Number(requiresIntegration));
+        creator,assignee,subject,priority,body,items_json,refs_json,created_at,idempotency_key,payload_hash,requires_integration
+      ) VALUES(?,?,?,?,?,?,?,?,?,?,?)`).run(actor, assignee, subject, taskPriority, body, JSON.stringify(items), JSON.stringify(refs), new Date().toISOString(), key, hash, Number(requiresIntegration));
       return this.read(Number(result.lastInsertRowid), actor);
     });
   }
@@ -548,10 +654,10 @@ export class HandoffStore {
     return this.taskFromRow(row);
   }
 
-  private taskFromRow(row: Record<string, unknown>, sides = this.sides(true), eventSeq = Number.MAX_SAFE_INTEGER): HandoffTask {
+  private taskFromRow(row: Record<string, unknown>, sides = this.allSides(true), eventSeq = Number.MAX_SAFE_INTEGER): HandoffTask {
     const task: HandoffTask = {
       id: Number(row.id), creator: sides.find((side) => side.id === row.creator)!,
-      assignee: sides.find((side) => side.id === row.assignee)!, subject: String(row.subject), body: String(row.body),
+      assignee: sides.find((side) => side.id === row.assignee)!, subject: String(row.subject), priority: priority(row.priority ?? 'normal'), body: String(row.body),
       refs: JSON.parse(String(row.refs_json)), items: (JSON.parse(String(row.items_json)) as string[]).map((value) => ({ text: value, checked: false })),
       state: "open", block: null, commit: null, summary: null, reviewNote: null, requiresIntegration: !!row.requires_integration, integration: null, createdAt: String(row.created_at),
       events: this.db.prepare("SELECT * FROM handoff_task_events WHERE task_id=? AND seq<=? ORDER BY seq").all(Number(row.id), eventSeq).map((event) => ({
@@ -569,6 +675,7 @@ export class HandoffStore {
           needsReview: false,
         };
       }
+      if (event.kind === "priority") task.priority = priority(event.data.priority);
       if (event.kind === "reply") task.lastReply = { seq: event.seq, actor: event.actor, at: event.at, ...(event.data.inReplyTo ? { inReplyTo: Number(event.data.inReplyTo) } : {}) };
       if (event.kind === "unblock") task.block = null;
       if (event.kind === "complete") {
@@ -628,8 +735,14 @@ export class HandoffStore {
       this.db.exec("BEGIN");
       try {
         const eventSeq = Number(this.db.prepare("SELECT COALESCE(MAX(seq),0) AS seq FROM handoff_task_events").get()!.seq);
-        const order = options.sort === "pending" ? "state_rank ASC,id ASC" : options.sort === "reviewed" ? "state_rank DESC,id ASC" : "id ASC";
-        const rows = this.db.prepare(`SELECT t.id, CASE e.kind
+        const priorityAtSnapshot = "COALESCE((SELECT json_extract(p.data_json,'$.priority') FROM handoff_task_events p WHERE p.task_id=t.id AND p.kind='priority' AND p.seq<=? ORDER BY p.seq DESC LIMIT 1),t.priority)";
+        const priorityRank = `CASE ${priorityAtSnapshot} WHEN 'urgent' THEN 4 WHEN 'high' THEN 3 WHEN 'normal' THEN 2 ELSE 1 END`;
+        const order = options.sort === "pending"
+          ? "state_rank ASC, priority_rank DESC, id ASC"
+          : options.sort === "reviewed"
+            ? "state_rank DESC, priority_rank DESC, id ASC"
+            : "priority_rank DESC, id ASC";
+        const rows = this.db.prepare(`SELECT t.id, ${priorityRank} AS priority_rank, CASE e.kind
           WHEN 'close' THEN 3 WHEN 'complete' THEN 1 WHEN 'block' THEN
             CASE WHEN EXISTS(SELECT 1 FROM handoff_task_dependencies d
               JOIN handoff_task_events changed ON changed.task_id=d.dependency_id
@@ -640,7 +753,7 @@ export class HandoffStore {
           SELECT seq FROM handoff_task_events WHERE task_id=t.id
             AND kind IN ('block','unblock','complete','close','reopen') ORDER BY seq DESC LIMIT 1)
         ${options.actor === undefined ? "" : "WHERE creator=? OR assignee=?"} ORDER BY ${order}`)
-          .all(eventSeq, ...(options.actor === undefined ? [] : [options.actor, options.actor]));
+          .all(eventSeq, eventSeq, ...(options.actor === undefined ? [] : [options.actor, options.actor]));
         snapshot = { ids: rows.map((row) => Number(row.id)), eventSeq, actor: options.actor };
         this.db.exec("COMMIT");
       } catch (error) { this.db.exec("ROLLBACK"); throw error; }
@@ -649,7 +762,7 @@ export class HandoffStore {
     const cursor = after === 0 ? -1 : snapshot.ids.indexOf(after);
     if (after !== 0 && cursor === -1) throw new Error("Unknown task cursor; refresh the panel");
     const ids = snapshot.ids.slice(cursor + 1, cursor + 1 + limit);
-    const sides = ids.length ? this.sides(true) : [];
+    const sides = ids.length ? this.allSides(true) : [];
     const rows = ids.length ? this.db.prepare(`SELECT * FROM handoff_tasks WHERE id IN (${ids.map(() => "?").join(",")})`).all(...ids) : [];
     const byId = new Map(rows.map((row) => [Number(row.id), row]));
     const tasks = ids.map((id) => this.taskFromRow(byId.get(id)!, sides, snapshot.eventSeq));
@@ -666,6 +779,12 @@ export class HandoffStore {
     });
   }
 
+  setPriority(id: number, actor: string, value: TaskPriority): HandoffTask {
+    const next = priority(value);
+    const task = this.read(id, actor);
+    if (task.state === "closed") throw new Error("Cannot change priority of a closed task");
+    return this.update(id, actor, "priority", { priority: next }, current => current.state !== "closed" && current.priority !== next);
+  }
   block(id: number, actor: string, reason: string, waitingFor: string, dependencyIds: number[] = []): HandoffTask {
     text(reason, "Block reason and recovery condition", 2000);
     text(waitingFor, "Waiting for", 160);

@@ -97,7 +97,7 @@ test("first upgrade backfills actionable old records and triggers catch old writ
   try {
     const task = f.create();
     const sql = new DatabaseSync(f.store.dbPath);
-    sql.exec("DROP TRIGGER handoff_resume_created; DROP TRIGGER handoff_resume_changed; DROP TRIGGER handoff_resume_dependency; DROP TRIGGER handoff_resume_integration; DROP TRIGGER handoff_resume_blocked; DROP TRIGGER handoff_resume_reply; DROP TABLE handoff_resume_events; DROP TABLE handoff_resume_state;");
+    sql.exec("DROP TRIGGER handoff_resume_created; DROP TRIGGER handoff_resume_changed; DROP TRIGGER handoff_resume_dependency; DROP TRIGGER handoff_resume_integration; DROP TRIGGER handoff_resume_blocked; DROP TRIGGER handoff_resume_reply; DROP TRIGGER handoff_resume_priority; DROP TABLE handoff_resume_events; DROP TABLE handoff_resume_state;");
     const upgraded = new HandoffStore(f.root);
     try {
       assert(upgraded.acquireResume(f.b.id, f.b.sessionId, "upgraded"));

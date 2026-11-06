@@ -4,7 +4,7 @@
 
 每个 Pi 会话自动成为一“侧”，用户或 Agent 可以给它命名为“前端”“数据”“工具”等角色。侧的数量和名称没有固定限制；同一侧既可以发起任务，也可以承接任务。通信不要求特定分支、worktree 或项目配置文件。
 
-当前版本：**V5.0.6**。项目、GitHub 仓库与扩展统一命名为 **pi-cowork**，唯一命令入口为 `/cowork`，Agent 工具统一为 `cowork_*`。旧命令和工具不提供别名。
+当前版本：**V5.2.0**。项目、GitHub 仓库与扩展统一命名为 **pi-cowork**，唯一命令入口为 `/cowork`，Agent 工具统一为 `cowork_*`。旧命令和工具不提供别名。
 
 ## 设计目标
 
@@ -179,6 +179,8 @@ stateDiagram-v2
 | `open` | 承接方待实施，可勾选或取消勾选清单 |
 | `completed` | 承接方已提交，等待发起方验收；不等于已关闭 |
 | `closed` | 发起方已验收，显示为灰色删除线，历史保留 |
+
+任务优先级分为 `urgent`、`high`、`normal`、`low`，默认是 `normal`。创建任务时设置 `priority`，双方可用 `cowork_priority` 调整未关闭任务的优先级。面板在同一状态组内按紧急程度排序，并显示 P0–P3；优先级仅表达顺序，不改变权限、责任或交付状态。旧任务迁移为 `normal`。
 
 承接方提交前必须勾完全部清单，并填写完成说明。扩展在当前检出中验证 commit 真实存在，把输入的短 hash 解析为完整 hash。发起方关闭时必须引用相同的 commit，并填写审查意见。
 
@@ -382,8 +384,8 @@ Agent 调用工具时，扩展从真实 Pi 会话获取本侧身份。工具不�
 | `handoff_side_bindings` | 接管后的持久会话归属及已退役侧 |
 | `handoff_side_transfers` | 不可修改的接管审计 |
 | `handoff_side_removals` | 侧注销目标、操作者、原因和时间；历史外键保留 |
-| `handoff_tasks` | 任务双方、标题、正文、初始清单和引用 |
-| `handoff_task_events` | 勾选、回应、阻塞、解除、完成、关闭和退回事件 |
+| `handoff_tasks` | 任务双方、标题、正文、初始清单、引用和当前优先级 |
+| `handoff_task_events` | 勾选、回应、阻塞、解除、优先级变更、完成、关闭和退回事件 |
 | `handoff_task_dependencies` | 阻塞事件与依赖编号、已核对事件水位的追加索引 |
 | `handoff_resume_events` | 按参与方路由的持久续跑事件 |
 | `handoff_resume_state` | 每侧消费游标、暂停状态和消费者租约 |
@@ -422,14 +424,14 @@ Agent 的 `cowork_list` 与面板排序不同：工具按编号倒序返回，�
 
 ## 项目侧管理
 
-在任务列表按 `m`，或直接执行 `/cowork sides`，打开独立的侧管理面板。标题显示项目已登记总数；搜索后另列匹配数，不能把已加载条目数当成总数。
+在任务列表按 `m`，或直接执行 `/cowork sides`，打开独立的侧管理面板。默认显示当前绑定侧；标题分别给出当前绑定数、进程存活数和历史登记数。`h` 切换历史视图，历史退出侧不会计入当前数量；搜索后另列匹配数，不能把已加载条目数当成总数。
 
 - `↑↓` 选择，`PgUp/PgDn` 翻页，`End` 自动续载到末侧；`/` 搜索名称或 ID，空搜索恢复全部。可直接 `/cowork sides 名称或ID`。
 - `Enter` 查看名称、侧 ID、会话 ID、PID、分支、工作区、未关闭交接数、活动工作区数及续跑设置。详情内 `↑↓` 滚动，`Enter/Esc` 返回，`r` 刷新。
 - `d` 打开删除确认，明确展示目标 ID 和会话；`y` 确认，`n/Esc` 取消。删除失败显示完整原因，不强停进程、不自动暂停任何侧。删除当前侧仍须先 `/cowork auto off`。
 - 未关闭交接、未退休工作区、其他存活进程和仍持有的续跑消费者都会阻止删除；成功后总数更新，已关闭任务和审计历史保留。不会删除 Git 分支、源码或会话文件。
 
-“已登记”包含历史离线侧，但不包含已注销侧和被接管时释放的临时身份；“进程存活”只按 PID 检查，不保证 Agent 正在执行。面板纯供人使用，不把全项目侧详情或其他侧任务统计送入模型；Agent 的 `cowork_sides` 仍分页返回目录，新增 `total` 与 `matched` 计数。
+“当前绑定”按活动 session ID 统计，“进程存活”按 PID 检查且不保证 Agent 正在执行，“历史登记”保留已退出的会话。注销侧会释放当前绑定但保留审计历史；被明确删除的侧不会出现在历史登记视图。面板纯供人使用，不把全项目侧详情或其他侧任务统计送入模型；Agent 的 `cowork_sides` 仍按 query/nextAfter 分页返回目录，包含 `currentTotal` 与 `historyTotal`。
 
 ## 模型输入与缓存
 
@@ -475,7 +477,8 @@ Agent 的 `cowork_list` 与面板排序不同：工具按编号倒序返回，�
 | `cowork_remove_side` | 经用户明确要求，以目标 ID、expectedSessionId 和原因注销侧，保留历史 |
 | `cowork_takeover` | 经用户明确授权，以旧侧 ID、预期会话和原因接管 |
 | `cowork_auto` | 查询自动续跑状态；用户要求时通过 `enabled` 开启或暂停 |
-| `cowork_create` | 创建定向任务，填写 `to`、`subject`、`body`、`items`；可附 `refs`、`idempotencyKey`；`requiresIntegration` 默认 true，纯审查任务显式 false |
+| `cowork_create` | 创建定向任务，填写 `to`、`subject`、`body`、`items`；可附 `priority`、`refs`、`idempotencyKey`；`requiresIntegration` 默认 true，纯审查任务显式 false |
+| `cowork_priority` | 任务双方调整未关闭任务的 `low`／`normal`／`high`／`urgent` 优先级；不改变权限、责任或状态 |
 | `cowork_list` | 查询本侧参与的任务，支持 `activeOnly`、`before`、`limit` 和返回的 `nextBefore` |
 | `cowork_read` | 读取本侧任务正文及历史，不改变状态 |
 | `cowork_reply` | 双方追加实质补充，按 inReplyTo 对应上一轮；定向通知对侧及相关依赖，不改变交付或批准状态 |
