@@ -113,6 +113,61 @@ test('workspace ownership, switched branches, immutable delivery range and unaut
  }finally{f.close();}
 });
 
+test('the owner can register a new branch in the same clean worktree without losing deliveries or ignored data',async()=>{
+ const f=fixture();try{
+  await f.ledger.configure(f.repo,'a',f.base,f.checks,'reviewed existing main');
+  const p=f.branch('old-task'),t=f.task(),tip=f.commit(p,'old-code'),d=await f.deliver(p,t.id,tip);
+  const job=f.enqueue(t.id,d);await f.consume();assert.equal(f.queue.read(job.jobId).state,'pushed');
+  f.store.closeTask(t.id,'a',tip,'reviewed and integrated');
+  const next=f.task();await f.ledger.register(p,'b',[next.id]);
+  f.store.block(next.id,'b','stale branch registration','workspace tool');
+  f.git(p,'switch','-c','new-task',f.queue.read(job.jobId).mainCommit!);f.git(p,'branch','-d','old-task');
+  writeFileSync(join(f.repo,'.git','info','exclude'),'runtime\n');writeFileSync(join(p,'runtime'),'keep runtime data');
+  const updated=await f.ledger.register(p,'b',[next.id]);
+  assert.equal(updated.id,d.workspaceId);assert.equal(updated.branch,'refs/heads/new-task');assert.equal(updated.base,d.base);
+  assert.deepEqual(updated.tasks,[t.id,next.id]);assert.deepEqual(f.ledger.delivery(d.id),d);
+  assert.equal(f.git(p,'rev-parse',d.ref),tip);assert.equal(readFileSync(join(p,'runtime'),'utf8'),'keep runtime data');
+  assert.ok(f.store.read(next.id,'b').block,'registration cannot waive task review');
+  const raw=new DatabaseSync(f.store.dbPath);try{
+   const events=raw.prepare("SELECT data_json FROM handoff_workspace_events WHERE workspace_id=? AND kind='register' ORDER BY seq").all(updated.id);
+   assert.equal(events.length,2);assert.equal(JSON.parse(String(events[1].data_json)).previousBranch,'refs/heads/old-task');
+  }finally{raw.close();}
+  assert.deepEqual(await f.ledger.register(p,'b',[next.id]),updated,'retry is idempotent');
+  const report=await f.ledger.reconcile(f.repo,'b');assert.ok(!report.workspaces[0].error);assert.ok(report.actualWorktrees.find(w=>w.path===p)!.registered);
+  f.store.unblock(next.id,'b','verified refreshed registration');const nextTip=f.commit(p,'new-code');
+  const nextDelivery=await f.deliver(p,next.id,nextTip);assert.equal(nextDelivery.workspaceId,d.workspaceId);assert.equal(nextDelivery.base,d.base);
+ }finally{f.close();}
+});
+
+test('branch registration refresh refuses other owners, dirty files, lost commits and a checked-out previous branch',async()=>{
+ const f=fixture();try{
+  const p=f.branch('previous'),tip=f.commit(p,'unsubmitted'),w=await f.ledger.register(p,'b');
+  f.git(p,'switch','-c','replacement',f.base);
+  await assert.rejects(f.ledger.register(p,'a'),/another owner/);
+  await assert.rejects(f.ledger.register(p,'b'),/all previous branch commits/);
+  assert.equal(f.ledger.read(w.id).branch,'refs/heads/previous');assert.equal(f.git(p,'rev-parse','previous'),tip);
+  f.git(p,'merge','--ff-only','previous');writeFileSync(join(p,'untracked'),'preserve');
+  await assert.rejects(f.ledger.register(p,'b'),/uncommitted files/);assert.equal(readFileSync(join(p,'untracked'),'utf8'),'preserve');
+  rmSync(join(p,'untracked'));
+  const other=join(f.root,'old-checkout');f.git(f.repo,'worktree','add',other,'previous');
+  await assert.rejects(f.ledger.register(p,'b'),/still checked out/);f.git(f.repo,'worktree','remove',other);
+  const refreshed=await f.ledger.register(p,'b');assert.equal(refreshed.id,w.id);assert.equal(refreshed.base,w.base);
+  assert.equal(f.git(p,'rev-parse','previous'),tip,'old branch is preserved');
+ }finally{f.close();}
+});
+
+test('branch registration refresh preserves missing-branch deliveries and refuses pending integrations',async()=>{
+ const f=fixture();try{
+  await f.ledger.configure(f.repo,'a',f.base,f.checks,'reviewed existing main');
+  const p=f.branch('snapshot-branch'),t=f.task(),tip=f.commit(p,'snapshot'),d=await f.deliver(p,t.id,tip);
+  f.git(p,'switch','-c','replacement',f.base);f.git(p,'branch','-D','snapshot-branch');
+  await assert.rejects(f.ledger.register(p,'b'),/every preserved delivery/);
+  f.git(p,'merge','--ff-only',tip);f.enqueue(t.id,d);
+  await assert.rejects(f.ledger.register(p,'b'),/pending integrations/);
+  assert.equal(f.ledger.read(d.workspaceId).branch,'refs/heads/snapshot-branch');assert.deepEqual(f.ledger.delivery(d.id),d);
+ }finally{f.close();}
+});
+
 test('unregistered, detached and remote-only branches appear, and remote failure never reports a clean project',async()=>{
  const f=fixture();try{
   const p=f.branch('unknown'),tip=f.commit(p,'missing');f.git(p,'push','origin','unknown');

@@ -152,12 +152,28 @@ export class WorkspaceLedger {
     if (branch === 'refs/heads/main' || !branch.startsWith('refs/heads/')) throw new Error('Register an implementation branch, not main or detached HEAD');
     const current = this.all(target.repo).find(w => w.state === 'active' && (w.path === path || w.branch === branch));
     if (current) {
-      if (current.owner !== actor || current.path !== path || current.branch !== branch || current.targetKey !== target.targetKey) throw new Error('Workspace/branch is already registered to another owner or target; reconcile it first');
-      this.transaction(() => {
-        const tasks = [...new Set([...current.tasks, ...taskIds])];
-        this.db.prepare('UPDATE handoff_workspaces SET tasks_json=? WHERE id=?').run(JSON.stringify(tasks), current.id);
+      if (current.owner !== actor || current.path !== path || current.targetKey !== target.targetKey) throw new Error('Workspace/branch is already registered to another owner or target; reconcile it first');
+      return this.transaction(() => {
+        const registered = this.read(current.id, actor);
+        if (registered.state !== 'active' || registered.branch !== current.branch) throw new Error('Workspace registration changed; retry register');
+        const tasks = [...new Set([...registered.tasks, ...taskIds])];
+        if (registered.branch !== branch) {
+          // A side can reuse its own worktree after switching task branches.
+          // Keep the original base and immutable deliveries; only refresh the binding.
+          if (gitSync(path, ['symbolic-ref', '-q', 'HEAD']) !== branch || gitSync(path, ['status', '--porcelain=v1', '-uall'])) throw new Error('Workspace changed or has uncommitted files; preserve them before registering the new branch');
+          if (gitSync(path, ['worktree', 'list', '--porcelain', '-z']).split('\0').includes(`branch ${registered.branch}`)) throw new Error('Previous registered branch is still checked out; preserve its worktree');
+          const tip = gitSync(path, ['rev-parse', 'HEAD']);
+          const oldTip = list(gitSync(path, ['for-each-ref', '--format=%(refname) %(objectname)', registered.branch])).find(ref => ref.startsWith(registered.branch + ' '))?.split(' ')[1];
+          if (!this.contains(path, registered.base, tip) || (oldTip && !this.contains(path, oldTip, tip))) throw new Error('New branch must retain the registered base and all previous branch commits');
+          const deliveries = this.db.prepare('SELECT tip FROM handoff_deliveries WHERE workspace_id=?').all(registered.id);
+          if (deliveries.some(d => !this.contains(path, String(d.tip), tip))) throw new Error('New branch must retain every preserved delivery');
+          if (this.db.prepare("SELECT 1 FROM handoff_integrations j JOIN handoff_deliveries d ON d.id=j.delivery_id WHERE d.workspace_id=? AND j.state IN ('queued','running','blocked')").get(registered.id)) throw new Error('Workspace still has pending integrations; finish them before registering the new branch');
+          if (gitSync(path, ['symbolic-ref', '-q', 'HEAD']) !== branch || gitSync(path, ['rev-parse', 'HEAD']) !== tip) throw new Error('Workspace changed during registration; retry register');
+          this.db.prepare('UPDATE handoff_workspaces SET branch=?,tasks_json=? WHERE id=?').run(branch, JSON.stringify(tasks), registered.id);
+          this.event(registered.id, actor, 'register', { previousBranch: registered.branch, previousTip: oldTip || null, branch, tip, path, base: registered.base });
+        } else this.db.prepare('UPDATE handoff_workspaces SET tasks_json=? WHERE id=?').run(JSON.stringify(tasks), registered.id);
+        return this.read(registered.id, actor);
       });
-      return this.read(current.id, actor);
     }
     const head = await this.remoteHead(path), base = await git(path, ['merge-base', head, 'HEAD']);
     const id = randomUUID();
