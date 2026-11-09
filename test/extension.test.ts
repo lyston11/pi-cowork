@@ -103,7 +103,6 @@ test("tool boundary binds identity to session, never accepts an actor from argum
       title: "CoWork 需要你配合",
       message: `#${userTestId} manual verification：Open the real project, test import and report the exact error`,
       priority: "high",
-      platforms: [],
     });
     assert.match(blockedRequest.content[0].text, /userNotification/);
     const surfaced = (await execute("one", "cowork_read", { id: userTestId })).details.task;

@@ -46,6 +46,7 @@ test("event scope keeps summary safeguards and never equates listed with read", 
   assert.match(COWORK_RULES, /userRequest/);
   assert.match(COWORK_RULES, /承接侧必须立即调用一次/);
   assert.match(COWORK_RULES, /notify_user/);
+  assert.match(COWORK_RULES, /省略 platforms 以使用全部已启用渠道/);
   assert.match(COWORK_RULES, /不发送完整任务正文/);
   assert.match(COWORK_RULES, /最终回复必须明确告诉用户任务编号/);
   assert.match(COWORK_RULES, /不能因收到回复自动解除阻塞/);

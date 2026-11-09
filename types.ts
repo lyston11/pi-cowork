@@ -1,4 +1,4 @@
-export const HANDOFF_EXTENSION_VERSION = "5.3.3";
+export const HANDOFF_EXTENSION_VERSION = "5.3.4";
 
 export interface Side {
   id: string;

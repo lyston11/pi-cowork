@@ -242,7 +242,7 @@ export default function piCowork(pi: ExtensionAPI): void {
 
   pi.registerTool({
     name: "cowork_block", label: "Record a task blocker",
-    description: "Assignee only, on an open task: record the concrete blocker, recovery condition, waiting party and relevant dependency task IDs. If the user must manually test, approve, configure or provide input, userRequest is required: state exactly what the user should do and what result to report. This immediately notifies the blocking side and the creator; the request remains visible and prioritized in the task panel until resolved. If the result includes userNotification, immediately call notify_user once with its title, message, priority and platforms set to an empty array (all enabled channels). Dependency IDs must be readable to this side; omit them for external approvals or inputs. Does not complete or authorize the task. Dependency deliveries trigger a recheck, not automatic unblocking. Further substantive exchanges use cowork_reply.",
+    description: "Assignee only, on an open task: record the concrete blocker, recovery condition, waiting party and relevant dependency task IDs. If the user must manually test, approve, configure or provide input, userRequest is required: state exactly what the user should do and what result to report. This immediately notifies the blocking side and the creator; the request remains visible and prioritized in the task panel until resolved. If the result includes userNotification, immediately call notify_user once with its title, message and priority; omit platforms so notify_user uses all enabled channels. Dependency IDs must be readable to this side; omit them for external approvals or inputs. Does not complete or authorize the task. Dependency deliveries trigger a recheck, not automatic unblocking. Further substantive exchanges use cowork_reply.",
     parameters: Type.Object({
       id: idSchema, reason: Type.String({ minLength: 1, maxLength: 2000 }),
       waitingFor: Type.String({ minLength: 1, maxLength: 160 }),
@@ -269,7 +269,6 @@ export default function piCowork(pi: ExtensionAPI): void {
         title: "CoWork 需要你配合",
         message: `#${task.id} ${task.subject}：${task.block!.userRequest!.trim()}`,
         priority: "high",
-        platforms: [],
       } : undefined;
       return toolResult({ task, ...(userNotification ? { userNotification } : {}) });
     }, renderResult,
