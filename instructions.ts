@@ -1,19 +1,19 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-export const HANDOFF_RULES = `## Pi CoWork · 项目交接约定
+export const COWORK_RULES = `## Pi CoWork · 项目交接约定
 
 - **开工先查：** 每次开始或继续执行项目任务，先用 \`cowork_list\` 查完本侧未关闭交接的摘要分页；用 \`cowork_read\` 阅读本轮事件对象、必要依赖及新增、变化或仍可执行的相关任务。已核对且未变的等待事项不必反复读全文；首次接触、上下文不足或版本不明时补读相关正文。不能用上轮已读代替本轮摘要检查；查询失败须说明未检查，不能宣称没有交接。
 - **任务优先级：** 新任务默认 normal；设为 urgent、high、normal 或 low。在同一状态且条件具备的任务中，优先处理等级更高者；高优先级不解除阻塞、不改变责任、依赖或授权。双方可用 cowork_priority 调整未关闭任务，面板同一状态组内按优先级排序。
 - **本侧与跨侧：** 自己承担的工作可用 cowork_create 省略 to（或显式指定自己）登记为本侧任务，由自己勾清单、完成、核查、集成并关闭，不必为了登记、提交或合并转派。真正需要其他侧实施或提供输入才转交。独立审查有明确要求时另建审查/材料任务，引用本侧交付；本侧核查不能冒充独立审查，也不因此转移实施归属。
 - **转交边界：** 需要其他侧实施、提供依赖或接收交付时，用 \`cowork_sides\` 确认承接方，再用 \`cowork_create\` 写清要求、清单、引用和验收条件。正式 PRD、规范和证据仍放项目原有位置，通过引用关联；动态任务和状态不写进 AGENTS.md。
-- **阻塞回报：** 承接侧先完成授权内不依赖缺失条件的部分，再登记真实阻塞。发起方收到阻塞回报后核对责任、依赖和原授权；内部缺口继续处理，需要人工输入时明确报告，不能双方只登记等待。需要用户亲自测试、配置、输入或批准时，cowork_block 必须附 userRequest，写清操作步骤和要回报的结果；工具立即通知阻塞侧，发起侧收到阻塞回报时也通知，面板持续计数并置顶显示，不能只在 Agent 之间传递。最终回复必须明确告诉用户任务编号、操作和恢复条件。用户回复后用 cowork_reply 留痕并复核，不能因收到回复自动解除阻塞。实质补充或澄清用 \`cowork_reply\` 追加到原交接并通知对方，回应时引用对侧消息序号；不重复发送“仍在等待”。提交前清单不能包含依赖该次提交后才能执行的验收，发现阶段循环由发起方拆清职责，不能口头豁免或伪勾清单。
+- **阻塞回报：** 承接侧先完成授权内不依赖缺失条件的部分，再登记真实阻塞。发起方收到阻塞回报后核对责任、依赖和原授权；内部缺口继续处理，需要人工输入时明确报告，不能双方只登记等待。需要用户亲自测试、配置、输入或批准时，cowork_block 必须附 userRequest，写清操作步骤和要回报的结果；阻塞侧工具返回结构化 userNotification 动作；若会话提供 notify_user，承接侧必须立即调用一次，把任务编号和具体请求发送到已配置渠道，priority 设为 high、platforms 传空数组以使用全部已启用渠道，不发送完整任务正文；同时立即显示 Pi 警告，发起侧收到阻塞回报时显示 Pi 警告，不重复发送外部通知，面板持续计数并置顶显示，不能只在 Agent 之间传递。最终回复必须明确告诉用户任务编号、操作和恢复条件。用户回复后用 cowork_reply 留痕并复核，不能因收到回复自动解除阻塞。实质补充或澄清用 \`cowork_reply\` 追加到原交接并通知对方，回应时引用对侧消息序号；不重复发送“仍在等待”。提交前清单不能包含依赖该次提交后才能执行的验收，发现阶段循环由发起方拆清职责，不能口头豁免或伪勾清单。
 - **完成与验收：** 在用户已有授权内持续处理本侧可执行事项，一项阻塞不影响继续其余待办。承接方用 \`cowork_check\` 勾清单、\`cowork_complete\` 附真实 commit；发起方实际审查后，代码交付须经 \`cowork_integrate\` 串行合入并推送，再附集成提交用 \`cowork_close\` 关闭，审查不通过则 \`cowork_reopen\`。不得以提交或验收代替已授权的集成，不强推、不重置他侧工作区；冲突、检查失败或推送失败须保留交付并说明阻塞。纯审查和材料任务可明确不要求集成。结束回复前重新查询并读取新增或更新事项，有可执行项就继续，不能以单项完成、提交、合并或转交依赖代替全部收口；剩余项须列明任务 ID、阻塞原因、责任方与恢复条件。交接不扩大用户授权。
 - **取消与撤回：** 错派、撤回或被替代的任务由创建方用 cowork_cancel 附具体原因正式取消；文字回复不代替取消。取消后不再属于可执行待办，不重开或继续交付；相关依赖收到事件后复核，不能把取消当成已交付。排队中、运行中、已推送或已关闭的任务不可取消。历史、提交、文件和交付快照保留，取消不代表代码已集成或允许删除工作区。
 - **分支与对账：** 实施前用 cowork_workspace 登记本侧任务工作区，代码交付固定提交范围；项目先审查集成基线和统一检查策略，各侧通过 cowork_integrate 异步入队，不各自合并推送 main，不削弱项目检查。收尾用 cowork_reconcile 对账；交付关闭不代表整个分支收口，新增提交需另交。未交付代码、未提交或 ignored 资料、未关闭任务、占用进程或不完整证据均须保留，由所属侧在已有授权内安全退休。远端已集成、本地 main 同步与工作区退休分别记录；本地同步或旧工作区清理受阻不妨碍其他交付和独立任务，不强推、不强制删除、不重置现场。`;
 
 // Runtime guidance belongs to the extension, not the project's AGENTS.md.
-export const HANDOFF_RUNTIME_RULES = `${HANDOFF_RULES}
+export const COWORK_RUNTIME_RULES = `${COWORK_RULES}
 
 调用 cowork_list 时使用 activeOnly=true，沿 nextBefore 读完分页；代码实施在已有合规任务工作树中 cowork_workspace(action=register,tasks=[...])，不抢占别侧登记。Pi 启动目录与实施工作树不同时，register 指定实际 path，cowork_complete 指定返回的 workspaceId。cowork_complete 固定工作区起点 base、tip、tree、提交列表和文件摘要并保留 Git 引用；审查方先手工 git show/diff 核对整个 delivery，再用同一 base 和精确 tip 入队，不能偷换后续分支 HEAD。cowork_integration_policy 首次配置时审查当前远端基线与项目适用检查；后续入队 checks 必须一致，队列外 main 更新需实际审查后另记基线，不伪造历史凭据。结束前 cowork_reconcile；新增未交付提交、待集成交付、dirty/ignored 资料、未登记分支或远端查询失败需说明并保全。只读对账不自动认领或删除，工作区退休不删除远端分支，也不能删除运行中的检出。审查或材料任务仍可 requiresIntegration=false。本地 main 同步使用 Git 安全快进；MCP/Pi 仅引用主检出、无关未提交文件或 ignored 资料不要求退出或清空，禁止仅为这些情况创建逐侧释放任务。会覆盖的文件、未结束的 Git 操作、本地独有提交和队列外更新仍须保留并明确记录。退休/删除工作区继续严格核对占用与资料。本地同步和旧工作区退休不作为业务交付前置；需要最新代码时可 fetch 并从已确认的远端 main 开任务分支，不等待本地 main 或他侧任务关单，真正缺少的代码/产物才是依赖。
 调用 cowork_list 时使用 activeOnly=true，沿 nextBefore 读完摘要分页；同一轮无需在每个工具前重复查询，但最终回复前必须重新查询。事件续跑先读取消息指定的任务和必要依赖，按事件类型处理：created/reopen 是承接方实施或修正，blocked 是发起方复核阻塞回报，dependency 是承接方验证依赖或输入，reply 是处理对侧本轮补充并按责任推进，complete/integration 是发起方审查交付或集成结果，close 是核对验收及后续工作，cancel 是停止已取消任务并复核相关依赖、不是交付成功，checkpoint 是强制重读指定未收口任务。混合事件须覆盖全部指定任务，不能只做其中一个。其余摘要与本会话最近实际读过的 revision 比对，只对新增、变化、待本侧执行/验收的事项补读全文；不能因出现在列表中，就批量读取未变的稳定阻塞、等待他侧交付或等待验收的任务。没有已知版本、上下文压缩丢失依据或用户要求全面复查时补读所需正文，不猜测已读。摘要不是执行或验收依据；操作前仍须读取该任务。结束摘要发现独立可执行工作仍须继续，不能以定向事件为由遗漏；也不能把“摘要已返回”当作“正文已核对”。
@@ -32,14 +32,14 @@ export const HANDOFF_RUNTIME_RULES = `${HANDOFF_RULES}
 const start = "<!-- PI-COWORK:START -->";
 const end = "<!-- PI-COWORK:END -->";
 
-export function withHandoffRules(original: string): string {
+export function withCoworkRules(original: string): string {
   const legacyStart = '<!-- PI-HANDOFF:START -->', legacyEnd = '<!-- PI-HANDOFF:END -->';
   if (original.includes(legacyStart) || original.includes(legacyEnd)) {
     if (original.split(legacyStart).length !== 2 || original.split(legacyEnd).length !== 2 || original.indexOf(legacyStart) > original.indexOf(legacyEnd) || original.includes(start) || original.includes(end)) throw new Error('Malformed or duplicate managed markers in AGENTS.md; preserved');
     original = original.replace(legacyStart, start).replace(legacyEnd, end);
   }
   const eol = original.includes("\r\n") ? "\r\n" : "\n";
-  const block = [start, HANDOFF_RULES, end].join("\n").replace(/\n/g, eol);
+  const block = [start, COWORK_RULES, end].join("\n").replace(/\n/g, eol);
   const starts = original.split(start).length - 1;
   const ends = original.split(end).length - 1;
   if (starts === 0 && ends === 0) return `${original}${original && !original.endsWith("\n") ? eol : ""}${original ? eol : ""}${block}${eol}`;
@@ -49,7 +49,7 @@ export function withHandoffRules(original: string): string {
   return original.slice(0, original.indexOf(start)) + block + original.slice(original.indexOf(end) + end.length);
 }
 
-export function installHandoffRules(projectRoot: string): { path: string; changed: boolean } {
+export function installCoworkRules(projectRoot: string): { path: string; changed: boolean } {
   const path = join(projectRoot, "AGENTS.md");
   let original: string;
   let exists = true;
@@ -59,7 +59,7 @@ export function installHandoffRules(projectRoot: string): { path: string; change
     original = "";
     exists = false;
   }
-  const updated = withHandoffRules(original);
+  const updated = withCoworkRules(original);
   if (updated !== original) writeFileSync(path, updated, { flag: exists ? "w" : "wx" });
   return { path, changed: updated !== original };
 }

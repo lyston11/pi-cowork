@@ -8,7 +8,7 @@ import piCowork, { resolveChannel } from "../index.ts";
 import { taskLines } from "../ui.ts";
 import { HandoffStore } from "../store.ts";
 import { visibleWidth } from "@earendil-works/pi-tui";
-import { HANDOFF_RULES, HANDOFF_RUNTIME_RULES } from "../instructions.ts";
+import { COWORK_RULES, COWORK_RUNTIME_RULES } from "../instructions.ts";
 
 function initRepo(root: string) {
   execFileSync("git", ["init", "-b", "main"], { cwd: root, stdio: "ignore" });
@@ -93,10 +93,19 @@ test("tool boundary binds identity to session, never accepts an actor from argum
     const userTest = await execute("one", "cowork_create", { to: b.id, subject: "manual verification", body: "Test a real UI path", items: ["report result"], requiresIntegration: false });
     const userTestId = userTest.details.task.id;
     await assert.rejects(execute("two", "cowork_block", { id: userTestId, reason: "Must verify with user data", waitingFor: "user" }), /userRequest is required/);
-    await execute("two", "cowork_block", { id: userTestId, reason: "Must verify with user data", waitingFor: "user", userRequest: "Open the real project, test import and report the exact error" });
+    const blockedRequest = await execute("two", "cowork_block", { id: userTestId, reason: "Must verify with user data", waitingFor: "user", userRequest: "Open the real project, test import and report the exact error" });
     assert.equal(notifications.length, 1);
     assert.match(notifications[0], /manual verification/);
     assert.match(notifications[0], /report the exact error/);
+    assert.deepEqual(blockedRequest.details.userNotification, {
+      required: true,
+      tool: "notify_user",
+      title: "CoWork 需要你配合",
+      message: `#${userTestId} manual verification：Open the real project, test import and report the exact error`,
+      priority: "high",
+      platforms: [],
+    });
+    assert.match(blockedRequest.content[0].text, /userNotification/);
     const surfaced = (await execute("one", "cowork_read", { id: userTestId })).details.task;
     assert.equal(surfaced.block.userRequest, "Open the real project, test import and report the exact error");
     assert.match(taskLines(surfaced, false, { fg: (_color: string, value: string) => value, strikethrough: (value: string) => value } as any, 140).join("\n"), /需要你配合/);
@@ -266,10 +275,10 @@ test("tool boundary binds identity to session, never accepts an actor from argum
     const event = { systemPromptOptions: { sections: {} } };
     handlers.get("before_agent_start")!(event);
     assert.doesNotMatch(JSON.stringify(event), /PRIVATE-TEXT|project lead/);
-    assert.equal((event.systemPromptOptions.sections as any).pi_cowork, HANDOFF_RUNTIME_RULES);
+    assert.equal((event.systemPromptOptions.sections as any).pi_cowork, COWORK_RUNTIME_RULES);
     await commands.get("cowork").handler("init", context("one"));
     const installed = readFileSync(join(root, "AGENTS.md"), "utf8");
-    assert(installed.includes(HANDOFF_RULES));
+    assert(installed.includes(COWORK_RULES));
     await commands.get("cowork").handler("init", context("one"));
     assert.equal(readFileSync(join(root, "AGENTS.md"), "utf8"), installed);
     const third = (await execute('three', 'cowork_identity', {})).details.self;

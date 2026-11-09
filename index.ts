@@ -7,7 +7,7 @@ import { Key, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi } from
 import { HandoffStore, type HumanTaskSnapshot } from "./store.ts";
 import { taskLines } from "./ui.ts";
 import { showSides } from "./side-panel.ts";
-import { HANDOFF_RUNTIME_RULES, installHandoffRules } from "./instructions.ts";
+import { COWORK_RUNTIME_RULES, installCoworkRules } from "./instructions.ts";
 import type { HandoffTask, Side, TaskSummary } from "./types.ts";
 import { resolveChannel } from "./channel.ts";
 import { WorkspaceLedger } from "./workspaces.ts";
@@ -116,7 +116,7 @@ export default function piCowork(pi: ExtensionAPI): void {
   pi.on("ui_prompt_start", () => { resume?.uiWaiting(true); });
   pi.on("ui_prompt_end", () => { resume?.uiWaiting(false); });
   pi.on("before_agent_start", (event) => {
-    event.systemPromptOptions.sections.pi_cowork = HANDOFF_RUNTIME_RULES;
+    event.systemPromptOptions.sections.pi_cowork = COWORK_RUNTIME_RULES;
   });
 
   const idSchema = Type.Integer({ minimum: 1 });
@@ -242,7 +242,7 @@ export default function piCowork(pi: ExtensionAPI): void {
 
   pi.registerTool({
     name: "cowork_block", label: "Record a task blocker",
-    description: "Assignee only, on an open task: record the concrete blocker, recovery condition, waiting party and relevant dependency task IDs. If the user must manually test, approve, configure or provide input, userRequest is required: state exactly what the user should do and what result to report. This immediately notifies the blocking side and the creator; the request remains visible and prioritized in the task panel until resolved. Dependency IDs must be readable to this side; omit them for external approvals or inputs. Does not complete or authorize the task. Dependency deliveries trigger a recheck, not automatic unblocking. Further substantive exchanges use cowork_reply.",
+    description: "Assignee only, on an open task: record the concrete blocker, recovery condition, waiting party and relevant dependency task IDs. If the user must manually test, approve, configure or provide input, userRequest is required: state exactly what the user should do and what result to report. This immediately notifies the blocking side and the creator; the request remains visible and prioritized in the task panel until resolved. If the result includes userNotification, immediately call notify_user once with its title, message, priority and platforms set to an empty array (all enabled channels). Dependency IDs must be readable to this side; omit them for external approvals or inputs. Does not complete or authorize the task. Dependency deliveries trigger a recheck, not automatic unblocking. Further substantive exchanges use cowork_reply.",
     parameters: Type.Object({
       id: idSchema, reason: Type.String({ minLength: 1, maxLength: 2000 }),
       waitingFor: Type.String({ minLength: 1, maxLength: 160 }),
@@ -258,11 +258,20 @@ export default function piCowork(pi: ExtensionAPI): void {
       const previousBlockSeq = before.events.findLast((event) => event.kind === "block")?.seq;
       const task = board().block(input.id, actor, input.reason, input.waitingFor, input.dependencies, input.userRequest);
       const currentBlockSeq = task.events.findLast((event) => event.kind === "block")?.seq;
-      if (task.block?.userRequest && currentBlockSeq !== previousBlockSeq && currentBlockSeq !== undefined
-        && board().claimUserRequestNotification(actor, task.id, currentBlockSeq)) {
-        ctx.ui.notify(`CoWork 需要你配合 · #${task.id} ${task.subject}：${task.block.userRequest.replace(/\s+/g, " ").slice(0, 360)}`, "warning");
+      const notifyUser = !!task.block?.userRequest && currentBlockSeq !== previousBlockSeq && currentBlockSeq !== undefined
+        && board().claimUserRequestNotification(actor, task.id, currentBlockSeq);
+      if (notifyUser) {
+        ctx.ui.notify(`CoWork 需要你配合 · #${task.id} ${task.subject}：${task.block!.userRequest!.replace(/\s+/g, " ").slice(0, 360)}`, "warning");
       }
-      return toolResult({ task });
+      const userNotification = notifyUser ? {
+        required: true,
+        tool: "notify_user",
+        title: "CoWork 需要你配合",
+        message: `#${task.id} ${task.subject}：${task.block!.userRequest!.trim()}`,
+        priority: "high",
+        platforms: [],
+      } : undefined;
+      return toolResult({ task, ...(userNotification ? { userNotification } : {}) });
     }, renderResult,
   });
 
@@ -495,7 +504,7 @@ export default function piCowork(pi: ExtensionAPI): void {
       if (command === "init") {
         let root = cwd;
         try { root = runGit(cwd, ["rev-parse", "--show-toplevel"]); } catch {}
-        const result = installHandoffRules(root);
+        const result = installCoworkRules(root);
         ctx.ui.notify(`${result.changed ? "Installed" : "Already current"}: ${result.path}. Rules are also supplied to every model run by the extension.`, "info");
         return;
       }
