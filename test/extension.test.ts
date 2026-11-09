@@ -105,6 +105,10 @@ test("tool boundary binds identity to session, never accepts an actor from argum
       priority: "high",
     });
     assert.match(blockedRequest.content[0].text, /userNotification/);
+    const repeatedRequest = await execute("two", "cowork_block", { id: userTestId, reason: "Must verify with user data", waitingFor: "user", userRequest: "Open the real project, test import and report the exact error" });
+    assert.equal(repeatedRequest.details.userNotification, undefined);
+    assert.equal(repeatedRequest.details.terminalNotification, undefined);
+    assert.equal(notifications.length, 1);
     const surfaced = (await execute("one", "cowork_read", { id: userTestId })).details.task;
     assert.equal(surfaced.block.userRequest, "Open the real project, test import and report the exact error");
     assert.match(taskLines(surfaced, false, { fg: (_color: string, value: string) => value, strikethrough: (value: string) => value } as any, 140).join("\n"), /需要你配合/);

@@ -15,6 +15,7 @@ import { git } from "./repository.ts";
 import { IntegrationQueue } from "./integration-store.ts";
 import { IntegrationWorker, integrationRepository, verifyPushedIntegration } from "./integration.ts";
 import { EventResume } from "./resume.ts";
+import { userRequestNotification } from "./user-notification.ts";
 export { resolveChannel } from "./channel.ts";
 
 function runGit(cwd: string, args: string[]): string {
@@ -242,7 +243,7 @@ export default function piCowork(pi: ExtensionAPI): void {
 
   pi.registerTool({
     name: "cowork_block", label: "Record a task blocker",
-    description: "Assignee only, on an open task: record the concrete blocker, recovery condition, waiting party and relevant dependency task IDs. If the user must manually test, approve, configure or provide input, userRequest is required: state exactly what the user should do and what result to report. This immediately notifies the blocking side and the creator; the request remains visible and prioritized in the task panel until resolved. If the result includes userNotification, immediately call notify_user once with its title, message and priority; omit platforms so notify_user uses all enabled channels. Dependency IDs must be readable to this side; omit them for external approvals or inputs. Does not complete or authorize the task. Dependency deliveries trigger a recheck, not automatic unblocking. Further substantive exchanges use cowork_reply.",
+    description: "Assignee only, on an open task: record the concrete blocker, recovery condition, waiting party and relevant dependency task IDs. If the user must manually test, approve, configure or provide input, userRequest is required: state exactly what the user should do and what result to report. This immediately notifies the blocking side and the creator; the request remains visible and prioritized in the task panel until resolved. If the result includes userNotification, immediately call notify_user once with its title, message, priority and optional platforms exactly as returned. terminalNotification means the origin-pane desktop notification was already submitted; do not send it again. Dependency IDs must be readable to this side; omit them for external approvals or inputs. Does not complete or authorize the task. Dependency deliveries trigger a recheck, not automatic unblocking. Further substantive exchanges use cowork_reply.",
     parameters: Type.Object({
       id: idSchema, reason: Type.String({ minLength: 1, maxLength: 2000 }),
       waitingFor: Type.String({ minLength: 1, maxLength: 160 }),
@@ -263,14 +264,10 @@ export default function piCowork(pi: ExtensionAPI): void {
       if (notifyUser) {
         ctx.ui.notify(`CoWork 需要你配合 · #${task.id} ${task.subject}：${task.block!.userRequest!.replace(/\s+/g, " ").slice(0, 360)}`, "warning");
       }
-      const userNotification = notifyUser ? {
-        required: true,
-        tool: "notify_user",
-        title: "CoWork 需要你配合",
-        message: `#${task.id} ${task.subject}：${task.block!.userRequest!.trim()}`,
-        priority: "high",
-      } : undefined;
-      return toolResult({ task, ...(userNotification ? { userNotification } : {}) });
+      const notification = notifyUser ? await userRequestNotification(
+        ctx.mode === "tui" || ctx.mode === "rpc" ? ctx.sessionManager.getSessionId() : "", cwd, "CoWork 需要你配合", `#${task.id} ${task.subject}：${task.block!.userRequest!.trim()}`,
+      ) : {};
+      return toolResult({ task, ...notification });
     }, renderResult,
   });
 
