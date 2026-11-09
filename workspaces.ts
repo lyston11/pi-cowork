@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, readdirSync, readlinkSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { existsSync, lstatSync, readdirSync, readlinkSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { dirname, join, resolve, sep } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { git, gitSync, integrationRepository } from "./repository.ts";
@@ -324,9 +324,36 @@ export class WorkspaceLedger {
     return { state: 'synced', main: remote, remote, repo: target.repo };
   }
   private contains(cwd: string, a: string, b: string) { try { gitSync(cwd, ['merge-base', '--is-ancestor', a, b]); return true; } catch { return false; } }
-  async retire(cwd: string, actor: string, id: string, remove = false) {
+  async retire(cwd: string, actor: string, id: string, remove = false, missingTip?: string) {
     const w = this.read(id, actor);
     if (w.state === 'retired') return w;
+    if (missingTip !== undefined) {
+      if (remove || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(missingTip)) throw new Error('Missing-worktree retirement requires an exact former commit and remove=false');
+      const target = integrationRepository(cwd);
+      if (target.repo !== w.repo || target.targetKey !== w.targetKey) throw new Error('Workspace belongs to another repository or target');
+      const tip = await git(cwd, ['rev-parse', '--verify', `${missingTip}^{commit}`]);
+      const remote = await this.remoteHead(cwd);
+      if (!this.contains(cwd, w.base, tip) || !this.contains(cwd, tip, remote)) throw new Error('Former workspace commit must include its base and already be integrated into remote main');
+      return this.transaction(() => {
+        const current = this.read(id, actor);
+        if (current.state === 'retired') return current;
+        // This path only retires metadata. A missing path alone never proves
+        // that its branch, Git worktree registration or task obligations ended.
+        try { lstatSync(w.path); throw new Error('Workspace path still exists; use normal retirement'); }
+        catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+        const trees = gitSync(cwd, ['worktree', 'list', '--porcelain', '-z']).split('\0\0');
+        if (trees.some(block => { const lines = block.split('\0'); return lines.includes(`worktree ${w.path}`) || lines.includes(`branch ${w.branch}`); })) throw new Error('Git still registers this worktree or branch; preserve and reconcile it first');
+        if (list(gitSync(cwd, ['for-each-ref', '--format=%(refname)', w.branch])).includes(w.branch)) throw new Error('Workspace branch still exists; preserve and reconcile it first');
+        if (current.tasks.some(taskId => !['closed', 'cancelled'].includes(this.store.read(taskId, actor).state))) throw new Error('Workspace still has open tasks; retirement refused');
+        const deliveries = this.db.prepare('SELECT tip FROM handoff_deliveries WHERE workspace_id=?').all(id);
+        if (deliveries.some(d => !this.contains(cwd, String(d.tip), tip))) throw new Error('Former workspace commit does not include every preserved delivery');
+        if (this.db.prepare("SELECT 1 FROM handoff_integrations j JOIN handoff_deliveries d ON d.id=j.delivery_id WHERE d.workspace_id=? AND j.state IN ('queued','running','blocked')").get(id)) throw new Error('Workspace still has pending integrations; retirement refused');
+        gitSync(cwd, ['update-ref', `refs/pi-cowork/retired/${id}`, tip, '']);
+        this.db.prepare("UPDATE handoff_workspaces SET state='retired' WHERE id=? AND state='active'").run(id);
+        this.event(id, actor, 'retire', { tip, remote, missing: true, removed: false });
+        return this.read(id, actor);
+      });
+    }
     const report = await this.reconcile(cwd, actor), item = report.workspaces.find(r => r.workspace.id === id);
     if (!report.complete || !item?.eligibleForRetirement || !('tip' in item)) throw new Error('Workspace still has unintegrated code, open tasks, files or incomplete evidence; retirement refused');
     const occupied = workspaceOccupancy(w.path);

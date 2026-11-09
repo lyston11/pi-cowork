@@ -230,3 +230,30 @@ test('retirement preserves a pinned ref and removes only clean fully integrated,
   else { const retired=await f.ledger.retire(f.repo,'b',w.id,true);assert.equal(retired.state,'retired');assert.equal(existsSync(p),false);assert.equal(f.git(f.repo,'rev-parse',`refs/pi-cowork/retired/${w.id}`),tip);assert.throws(()=>f.git(f.repo,'rev-parse','--verify','refs/heads/feature')); }
  }finally{f.close();}
 });
+
+
+test('missing integrated worktrees can retire metadata without deleting unrelated Git state',async()=>{
+ const f=fixture();try{
+  await f.ledger.configure(f.repo,'a',f.base,f.checks,'Reviewed current main and checks');
+  const p=f.branch('missing-integrated'),t=f.task(),tip=f.commit(p,'missing-code'),d=await f.deliver(p,t.id,tip);const job=f.enqueue(t.id,d);await f.consume();assert.equal(f.queue.read(job.jobId).state,'pushed');f.store.closeTask(t.id,'a',tip,'Integrated before worktree removal');
+  const w=f.ledger.read(d.workspaceId,'b');f.git(f.repo,'worktree','remove','--force',p);f.git(f.repo,'branch','-D','missing-integrated');assert.equal(existsSync(p),false);
+  const retired=await f.ledger.retire(f.repo,'b',w.id,false,tip);assert.equal(retired.state,'retired');assert.equal(f.git(f.repo,'rev-parse',`refs/pi-cowork/retired/${w.id}`),tip);assert.throws(()=>f.git(f.repo,'rev-parse','--verify','refs/heads/missing-integrated'));
+ }finally{f.close();}
+});
+
+test('missing worktree retirement refuses an open task even when its commit is integrated',async()=>{
+ const f=fixture();try{
+  const p=f.branch('missing-open-task'),task=f.store.create({subject:'still open',body:'must remain actionable',items:['done'],requiresIntegration:false},'a');
+  const tip=f.commit(p,'open-task-code'),w=await f.ledger.register(p,'a',[task.id]);
+  f.git(f.repo,'push','origin',`${tip}:refs/heads/main`);f.git(f.repo,'fetch','origin');f.git(f.repo,'worktree','remove','--force',p);f.git(f.repo,'branch','-D','missing-open-task');
+  await assert.rejects(f.ledger.retire(f.repo,'a',w.id,false,tip),/open tasks/);assert.equal(f.ledger.read(w.id,'a').state,'active');
+ }finally{f.close();}
+});
+
+
+test('missing worktree retirement refuses a commit that is not integrated',async()=>{
+ const f=fixture();try{
+  const p=f.branch('missing-unintegrated'),t=f.task(),tip=f.commit(p,'unintegrated-code'),d=await f.deliver(p,t.id,tip);const w=f.ledger.read(d.workspaceId,'b');f.git(f.repo,'worktree','remove','--force',p);f.git(f.repo,'branch','-D','missing-unintegrated');
+  await assert.rejects(f.ledger.retire(f.repo,'b',w.id,false,tip),/already be integrated/);assert.equal(f.ledger.read(w.id,'b').state,'active');
+ }finally{f.close();}
+});

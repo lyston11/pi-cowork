@@ -1,6 +1,6 @@
 {
   "name": "@pi/pi-cowork",
-  "version": "5.3.4",
+  "version": "5.3.5",
   "private": true,
   "type": "module",
   "description": "Persistent multi-Pi collaboration, reviewed integration and workspace reconciliation",
