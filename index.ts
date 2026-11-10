@@ -248,7 +248,7 @@ export default function piCowork(pi: ExtensionAPI): void {
       id: idSchema, reason: Type.String({ minLength: 1, maxLength: 2000 }),
       waitingFor: Type.String({ minLength: 1, maxLength: 160 }),
       userRequest: Type.Optional(Type.String({ minLength: 1, maxLength: 1000 })),
-      dependencies: Type.Optional(Type.Array(idSchema, { maxItems: 20, uniqueItems: true })),
+      dependencies: Type.Optional(Type.Array(idSchema, { maxItems: 20 })),
     }),
     async execute(_id, input, _signal, _update, ctx) {
       if (/user|用户|manual test|人工测试|手工测试/i.test(input.waitingFor) && !input.userRequest?.trim()) {
