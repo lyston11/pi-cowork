@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
@@ -12,10 +12,58 @@ import { COWORK_RULES, COWORK_RUNTIME_RULES } from "../instructions.ts";
 
 function initRepo(root: string) {
   execFileSync("git", ["init", "-b", "main"], { cwd: root, stdio: "ignore" });
+  execFileSync("git", ["config", "--local", "pi-cowork.enabled", "true"], { cwd: root, stdio: "ignore" });
   writeFileSync(join(root, "README.md"), "fixture\n");
   execFileSync("git", ["add", "README.md"], { cwd: root, stdio: "ignore" });
   execFileSync("git", ["-c", "user.name=Pi Test", "-c", "user.email=pi@example.invalid", "commit", "-m", "fixture"], { cwd: root, stdio: "ignore" });
 }
+
+test("projects stay inactive without an explicit local opt-in and create no channel or runtime registrations", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-project-disabled-"));
+  const state = mkdtempSync(join(tmpdir(), "pi-project-state-"));
+  const previousCwd = process.cwd(), previousState = process.env.PI_COWORK_STATE_DIR;
+  const registered: string[] = [];
+  const pi = { registerTool: () => registered.push("tool"), registerCommand: () => registered.push("command"), on: () => registered.push("event") };
+  try {
+    process.chdir(root); process.env.PI_COWORK_STATE_DIR = state;
+    piCowork(pi as any); // Non-Git directories such as projects/ are never enabled.
+    initRepo(root);
+    for (const value of [undefined, "false", "invalid"]) {
+      execFileSync("git", value === undefined ? ["config", "--local", "--unset", "pi-cowork.enabled"] : ["config", "--local", "pi-cowork.enabled", value], { cwd: root });
+      piCowork(pi as any);
+    }
+    assert.deepEqual(registered, []);
+    assert.deepEqual(readdirSync(state), [], "disabled projects must not even resolve a channel");
+  } finally {
+    process.chdir(previousCwd);
+    if (previousState === undefined) delete process.env.PI_COWORK_STATE_DIR; else process.env.PI_COWORK_STATE_DIR = previousState;
+    rmSync(root, { recursive: true, force: true }); rmSync(state, { recursive: true, force: true });
+  }
+});
+
+test("repository opt-in covers linked worktrees and subdirectories but does not enable independent clones", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-project-enabled-")), linked = `${root}-linked`, clone = `${root}-clone`, state = `${root}-state`;
+  const previousCwd = process.cwd(), previousState = process.env.PI_COWORK_STATE_DIR;
+  try {
+    initRepo(root);
+    const subdir = join(root, "src"); mkdirSync(subdir);
+    execFileSync("git", ["worktree", "add", "-b", "task/linked", linked], { cwd: root, stdio: "ignore" });
+    execFileSync("git", ["clone", root, clone], { stdio: "ignore" });
+    process.env.PI_COWORK_STATE_DIR = state;
+    for (const directory of [root, subdir, linked, clone]) {
+      process.chdir(directory);
+      const tools: string[] = [], commands: string[] = [], hooks: string[] = [];
+      piCowork({ registerTool: (tool: any) => tools.push(tool.name), registerCommand: (name: string) => commands.push(name), on: (name: string) => hooks.push(name) } as any);
+      assert.equal(tools.includes("cowork_create"), directory !== clone);
+      assert.equal(commands.includes("cowork"), directory !== clone);
+      assert.equal(hooks.includes("before_agent_start"), directory !== clone);
+    }
+  } finally {
+    process.chdir(previousCwd);
+    if (previousState === undefined) delete process.env.PI_COWORK_STATE_DIR; else process.env.PI_COWORK_STATE_DIR = previousState;
+    for (const directory of [linked, clone, root, state]) rmSync(directory, { recursive: true, force: true });
+  }
+});
 
 test("tool boundary binds identity to session, never accepts an actor from arguments, and checks real commits", async () => {
   const root = mkdtempSync(join(tmpdir(), "pi-task-extension-"));

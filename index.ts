@@ -46,6 +46,11 @@ function toolResult(value: Record<string, unknown>, fullTask = false) {
 
 export default function piCowork(pi: ExtensionAPI): void {
   const cwd = resolve(process.cwd());
+  // Installation is global; collaboration requires an explicit repository opt-in.
+  // Check before resolving a channel, registering tools or starting resources.
+  try {
+    if (runGit(cwd, ["config", "--local", "--bool", "--get", "pi-cowork.enabled"]) !== "true") return;
+  } catch { return; }
   const channel = resolveChannel(cwd);
   let store: HandoffStore | undefined;
   let resume: EventResume | undefined;
