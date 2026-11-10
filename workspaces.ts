@@ -94,6 +94,13 @@ function mainGitOperation(path: string): string | null {
   return null;
 }
 
+type BranchStatus = {
+  state: 'unknown' | 'merged' | 'patches-present' | 'materials-preserved' | 'unaccounted';
+  unique: string[] | null;
+  remaining: string[] | null;
+  commits?: { commit: string; state: string; taskId?: number }[];
+};
+
 export class WorkspaceLedger {
   private db: DatabaseSync;
   private store: HandoffStore;
@@ -101,6 +108,7 @@ export class WorkspaceLedger {
     this.store = store;
     this.db = new DatabaseSync(store.dbPath);
     this.db.exec('PRAGMA busy_timeout=30000; PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL;');
+    this.db.exec('CREATE TABLE IF NOT EXISTS handoff_branch_retirements(id TEXT PRIMARY KEY,repo TEXT NOT NULL,actor TEXT NOT NULL,branch TEXT NOT NULL,tip TEXT NOT NULL,ref TEXT NOT NULL,note TEXT NOT NULL,evidence_json TEXT NOT NULL)');
   }
   close() { this.db.close(); }
   private transaction<T>(fn: () => T): T {
@@ -249,6 +257,15 @@ export class WorkspaceLedger {
     const unregistered = heads.map(h => { const [branch, tip] = h.split(' '); return { branch, tip }; })
       .filter(h => h.branch !== 'refs/heads/main' && !registered.some(w => w.branch === h.branch));
     const detached = worktrees.filter(w => !w.branch);
+    const materials = this.materialCommits(cwd, actor);
+    const states = new Map<string, Awaited<ReturnType<WorkspaceLedger['branchStatus']>>>();
+    const describeBranch = async (tip: string) => {
+      if (!states.has(tip)) {
+        try { states.set(tip, await this.branchStatus(cwd, tip, remote, materials)); }
+        catch (error) { errors.push(`Cannot account for branch tip ${tip}: ${error}`); states.set(tip, { state: 'unknown', unique: null, remaining: null }); }
+      }
+      return states.get(tip)!;
+    };
     const reports = [];
     for (const w of workspaces) {
       try {
@@ -259,12 +276,12 @@ export class WorkspaceLedger {
         const delivered = snapshots.filter(d => d.workspace_id === w.id);
         const valid = delivered.filter(d => this.db.prepare("SELECT 1 FROM handoff_task_events e WHERE e.kind='complete' AND json_extract(e.data_json,'$.deliveryId')=? AND NOT EXISTS(SELECT 1 FROM handoff_task_events later WHERE later.task_id=e.task_id AND later.kind IN ('reopen','cancel') AND later.seq>e.seq)").get(String(d.id)));
         const approved = new Set(valid.flatMap(d => JSON.parse(String(d.commits_json)) as string[]));
-        const ahead = remote ? list(await git(w.path, ['rev-list', tip, '--not', remote])) : null;
-        const undelivered = ahead?.filter(c => !approved.has(c)) ?? null;
+        const closeout = await describeBranch(tip);
+        const undelivered = closeout.remaining?.filter(c => !approved.has(c)) ?? null;
         const pending = valid.filter(d => !remote || !this.contains(w.path, String(d.tip), remote)).map(d => String(d.id));
         const tasks = w.tasks.map(id => { const task = this.store.read(id, w.owner); return { id, state: task.state }; });
-        const blockers = [!remote ? 'remote-incomplete' : '', ahead?.length ? 'branch-not-integrated' : '', status ? 'uncommitted-files' : '', ignored.length ? 'ignored-data-needs-preservation' : '', tasks.some(t => t.state !== 'closed' && t.state !== 'cancelled') ? 'open-tasks' : ''].filter(Boolean);
-        reports.push({ workspace: w, tip, status: status ? status.split('\n') : [], ignored, undelivered, pendingDeliveries: pending, tasks, blockers, eligibleForRetirement: blockers.length === 0 });
+        const blockers = [!remote ? 'remote-incomplete' : '', closeout.remaining?.length ? 'branch-not-integrated' : '', pending.length ? 'pending-deliveries' : '', status ? 'uncommitted-files' : '', ignored.length ? 'ignored-data-needs-preservation' : '', tasks.some(t => t.state !== 'closed' && t.state !== 'cancelled') ? 'open-tasks' : ''].filter(Boolean);
+        reports.push({ workspace: w, tip, closeout, status: status ? status.split('\n') : [], ignored, undelivered, pendingDeliveries: pending, tasks, blockers, eligibleForRetirement: blockers.length === 0 });
       } catch (error) { errors.push(`${w.id}: ${error}`); reports.push({ workspace: w, error: String(error), eligibleForRetirement: false }); }
     }
     const localMain = await git(cwd, ['rev-parse', 'refs/heads/main']).catch(() => null);
@@ -289,8 +306,14 @@ export class WorkspaceLedger {
     const remoteRefs = await Promise.all(remoteBranches.map(async row => { const [tip, branch] = row.split(/\s+/); return { tip, branch, unintegrated: await describeRef(tip) }; }));
     const jobs = this.db.prepare(`SELECT j.id,j.task_id,j.delivery_id,j.state,j.main_commit,j.note FROM handoff_integrations j JOIN handoff_tasks t ON t.id=j.task_id
       WHERE j.target_key=? ${actor ? 'AND (t.creator=? OR t.assignee=?)' : ''} ORDER BY j.rowid`).all(target.targetKey, ...(actor ? [actor,actor] : []));
+    const branches = await Promise.all(heads.map(async row => {
+      const [branch, tip] = row.split(' '), status = await describeBranch(tip);
+      return { branch, tip, state: status.state, uniqueCommits: status.unique?.length ?? null, unaccountedCommits: status.remaining?.length ?? null,
+        worktree: worktrees.find(w => w.branch === branch)?.path ?? null };
+    }));
+    const archivedBranches = this.db.prepare(`SELECT branch,tip,ref FROM handoff_branch_retirements WHERE repo=? ${actor ? 'AND actor=?' : ''} ORDER BY rowid`).all(target.repo, ...(actor ? [actor] : []));
     const report = { complete: errors.length === 0, remote, mainDifference, localMainStatus, outsideQueue: outside, policy: this.policy(target.targetKey), workspaces: reports,
-      actualWorktrees, unregistered: unknown, detached: detachedHeads, remoteBranches: remoteRefs, jobs, errors };
+      branches, archivedBranches, actualWorktrees, unregistered: unknown, detached: detachedHeads, remoteBranches: remoteRefs, jobs, errors };
     if (actor) {
       const digest = createHash('sha256').update(JSON.stringify(report)).digest('hex');
       const previous = this.db.prepare('SELECT digest FROM handoff_reconcile_observations WHERE owner=? AND repo=?').get(actor, target.repo);
@@ -340,6 +363,77 @@ export class WorkspaceLedger {
     return { state: 'synced', main: remote, remote, repo: target.repo };
   }
   private contains(cwd: string, a: string, b: string) { try { gitSync(cwd, ['merge-base', '--is-ancestor', a, b]); return true; } catch { return false; } }
+  async preserveMaterial(cwd: string, actor: string, taskId: number, commit: string) {
+    const task = this.store.read(taskId, actor);
+    if (task.requiresIntegration) throw new Error('Code deliveries must be integrated, not archived as materials');
+    const tip = await git(cwd, ['rev-parse', '--verify', `${commit}^{commit}`]);
+    if (task.commit && await git(cwd, ['rev-parse', '--verify', `${task.commit}^{commit}`]) !== tip) throw new Error('Material commit does not match the task delivery');
+    const ref = `refs/pi-cowork/materials/${taskId}/${tip}`;
+    const existing = await git(cwd, ['rev-parse', '--verify', ref]).catch(() => null);
+    if (existing !== tip) await git(cwd, ['update-ref', ref, tip, '']);
+    return { taskId, commit: tip, ref, state: 'preserved-not-integrated' as const };
+  }
+  private materialCommits(cwd: string, actor?: string) {
+    const result = new Map<string, number>();
+    const tasks = this.db.prepare(`SELECT id,assignee FROM handoff_tasks WHERE requires_integration=0 ${actor ? 'AND (creator=? OR assignee=?)' : ''}`).all(...(actor ? [actor, actor] : []));
+    for (const row of tasks) {
+      const task = this.store.read(Number(row.id), actor ?? String(row.assignee));
+      if (task.state !== 'closed' || !task.commit) continue;
+      try {
+        const commit = gitSync(cwd, ['rev-parse', '--verify', `${task.commit}^{commit}`]);
+        const ref = `refs/pi-cowork/materials/${task.id}/${commit}`;
+        if (gitSync(cwd, ['rev-parse', '--verify', ref]) === commit) result.set(commit, task.id);
+      } catch { /* Missing material objects or refs remain unaccounted for. */ }
+    }
+    return result;
+  }
+  async branchStatus(cwd: string, tip: string, remote: string | null, materials: Map<string, number>): Promise<BranchStatus> {
+    if (!remote) return { state: 'unknown', unique: null, remaining: null };
+    const unique = list(await git(cwd, ['rev-list', tip, '--not', remote]));
+    if (!unique.length) return { state: 'merged', unique: [], remaining: [] };
+    const equivalent = new Set(list(await git(cwd, ['cherry', remote, tip])).filter(line => line.startsWith('- ')).map(line => line.slice(2)));
+    const commits = unique.map(commit => ({ commit, state: equivalent.has(commit) ? 'patch-present' : materials.has(commit) ? 'material-preserved' : 'unaccounted', ...(materials.has(commit) ? { taskId: materials.get(commit) } : {}) }));
+    const remaining = commits.filter(c => c.state === 'unaccounted').map(c => c.commit);
+    return { state: remaining.length ? 'unaccounted' : commits.some(c => c.state === 'material-preserved') ? 'materials-preserved' : 'patches-present', unique, remaining, commits };
+  }
+  async retireBranch(cwd: string, actor: string, branch: string, expectedTip: string, note: string, materialTasks: number[] = []) {
+    if (!branch.startsWith('refs/heads/') || branch === 'refs/heads/main') throw new Error('Only an explicit local task branch can be retired; main is protected');
+    await git(cwd, ['check-ref-format', branch]);
+    if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(expectedTip) || !note.trim()) throw new Error('Provide the exact branch tip and a substantive closeout review note');
+    const target = integrationRepository(cwd), remote = await this.remoteHead(cwd);
+    const workspaces = this.all(target.repo).filter(w => w.branch === branch);
+    if (workspaces.some(w => w.owner !== actor)) throw new Error('Another side owns this branch; its owner must close it out');
+    if (await git(cwd, ['rev-parse', '--verify', branch]) !== expectedTip) throw new Error('Branch advanced; review its new tip before retirement');
+    for (const id of materialTasks) {
+      const task = this.store.read(id, actor);
+      if (task.requiresIntegration || task.state !== 'closed' || !task.commit) throw new Error('Only accepted, closed material tasks can preserve unmerged commits');
+      const commit = await git(cwd, ['rev-parse', '--verify', `${task.commit}^{commit}`]);
+      if (!this.contains(cwd, commit, expectedTip)) throw new Error('Material delivery is not part of this branch');
+      await this.preserveMaterial(cwd, actor, id, commit);
+    }
+    const status = await this.branchStatus(cwd, expectedTip, remote, this.materialCommits(cwd, actor));
+    if (status.state === 'unknown' || status.remaining?.length) throw new Error('Branch has unaccounted commits; integrate them or preserve accepted material deliveries first');
+    return this.transaction(() => {
+      if (gitSync(cwd, ['rev-parse', '--verify', branch]) !== expectedTip) throw new Error('Branch advanced; review its new tip before retirement');
+      const trees = gitSync(cwd, ['worktree', 'list', '--porcelain', '-z']).split('\0\0');
+      if (trees.some(block => block.split('\0').includes(`branch ${branch}`))) throw new Error('Branch is still checked out; preserve its worktree and use workspace retirement');
+      for (const w of this.all(target.repo).filter(w => w.branch === branch)) {
+        if (w.owner !== actor || w.state === 'active' && existsSync(w.path)) throw new Error('Active workspace registration must be reconciled by its owner first');
+        if (w.tasks.some(id => !['closed', 'cancelled'].includes(this.store.read(id, actor).state))) throw new Error('Branch still has open tasks');
+        if (this.db.prepare("SELECT 1 FROM handoff_integrations j JOIN handoff_deliveries d ON d.id=j.delivery_id WHERE d.workspace_id=? AND j.state IN ('queued','running','blocked')").get(w.id)) throw new Error('Branch still has pending integrations');
+      }
+      const ref = `refs/pi-cowork/retired/branches/${randomUUID()}`;
+      gitSync(cwd, ['update-ref', ref, expectedTip, '']);
+      // Compare-delete never rewinds a branch that advanced after review.
+      gitSync(cwd, ['update-ref', '-d', branch, expectedTip]);
+      for (const w of workspaces) {
+        if (w.state === 'active') this.db.prepare("UPDATE handoff_workspaces SET state='retired' WHERE id=?").run(w.id);
+        this.event(w.id, actor, 'retire-branch', { branch, tip: expectedTip, remote, ref, note, status: status.state });
+      }
+      this.db.prepare('INSERT INTO handoff_branch_retirements VALUES(?,?,?,?,?,?,?,?)').run(randomUUID(), target.repo, actor, branch, expectedTip, ref, note, JSON.stringify({ remote, ...status }));
+      return { branch, tip: expectedTip, state: 'retired', ref, disposition: status.state, remoteBranchRemoved: false };
+    });
+  }
   async retire(cwd: string, actor: string, id: string, remove = false, missingTip?: string) {
     const w = this.read(id, actor);
     if (w.state === 'retired') return w;

@@ -32,6 +32,72 @@ function fixture() {
     close(){queue.close();ledger.close();store.close();rmSync(root,{recursive:true,force:true});}};
 }
 
+test('closed material commits are preserved separately from main and their idle branch can retire', async () => {
+ const f=fixture();try{
+  const p=f.branch('material'),tip=f.commit(p,'acceptance.md');
+  const t=f.store.create({to:'b',subject:'acceptance evidence',body:'materials only',items:['review'],requiresIntegration:false},'a');
+  f.store.check(t.id,'b',1,true);f.store.complete(t.id,'b',tip,'evidence');f.store.closeTask(t.id,'a',tip,'accepted without code integration');
+  assert.equal((await f.ledger.reconcile(f.repo,'b')).branches.find(b=>b.branch==='refs/heads/material')!.state,'unaccounted');
+  const material=await f.ledger.preserveMaterial(f.repo,'b',t.id,tip);
+  assert.equal(f.git(f.repo,'rev-parse',material.ref),tip);
+  const report=await f.ledger.reconcile(f.repo,'b');assert.equal(report.branches.find(b=>b.branch==='refs/heads/material')!.state,'materials-preserved');
+  assert.equal(f.git(f.repo,'rev-parse','main'),f.base,'material preservation never changes main');
+  await assert.rejects(f.ledger.retireBranch(f.repo,'b','refs/heads/material',tip,'accepted evidence'),/still checked out/);
+  f.git(f.repo,'worktree','remove',p);
+  const retired=await f.ledger.retireBranch(f.repo,'b','refs/heads/material',tip,'Reviewed accepted evidence; preserve its commit');
+  assert.equal(f.git(f.repo,'rev-parse',retired.ref),tip);assert.throws(()=>f.git(f.repo,'rev-parse','--verify','refs/heads/material'));
+  assert.equal(f.git(f.repo,'show',`${retired.ref}:acceptance.md`),'acceptance.md');
+  assert.equal((await f.ledger.reconcile(f.repo,'b')).archivedBranches.length,1);
+ }finally{f.close();}
+});
+
+test('archiving a material tip never covers an unrelated code ancestor or an unaccepted task',async()=>{
+ const f=fixture();try{
+  const p=f.branch('mixed'),code=f.commit(p,'implementation.ts'),tip=f.commit(p,'evidence.md');
+  const t=f.store.create({to:'b',subject:'evidence',body:'only the final evidence commit',items:['review'],requiresIntegration:false},'a');
+  f.store.check(t.id,'b',1,true);f.store.complete(t.id,'b',tip,'evidence');
+  f.git(f.repo,'worktree','remove',p);
+  await assert.rejects(f.ledger.retireBranch(f.repo,'b','refs/heads/mixed',tip,'premature',[t.id]),/accepted, closed/);
+  f.store.closeTask(t.id,'a',tip,'accept just the evidence');
+  await assert.rejects(f.ledger.retireBranch(f.repo,'b','refs/heads/mixed',tip,'must retain code',[t.id]),/unaccounted/);
+  const report=await f.ledger.reconcile(f.repo,'b'),branch=report.branches.find(b=>b.branch==='refs/heads/mixed')!;
+  assert.equal(branch.state,'unaccounted');assert.equal(branch.unaccountedCommits,1);
+  assert.equal(f.git(f.repo,'rev-parse','refs/heads/mixed'),tip);
+  assert.equal(f.git(f.repo,'show',`${code}:implementation.ts`),'implementation.ts');
+  await assert.rejects(f.ledger.preserveMaterial(f.repo,'b',f.task().id,tip),/Code deliveries/);
+ }finally{f.close();}
+});
+
+test('equivalent patches are reported distinctly and retired with the original commits preserved',async()=>{
+ const f=fixture();try{
+  const p=f.branch('old-code'),tip=f.commit(p,'implementation');
+  f.git(f.repo,'cherry-pick','--no-commit',tip);f.git(f.repo,'commit','-m','replacement delivery');
+  const replacement=f.git(f.repo,'rev-parse','HEAD');assert.notEqual(replacement,tip);f.git(f.repo,'push','origin','main');
+  const report=await f.ledger.reconcile(f.repo,'b');assert.equal(report.branches.find(b=>b.branch==='refs/heads/old-code')!.state,'patches-present');
+  f.git(f.repo,'worktree','remove',p);
+  const result=await f.ledger.retireBranch(f.repo,'b','refs/heads/old-code',tip,`Reviewed equivalent patch on main ${replacement}`);
+  assert.equal(result.disposition,'patches-present');assert.equal(f.git(f.repo,'rev-parse',result.ref),tip);
+  assert.equal(f.git(f.repo,'rev-parse','main'),replacement);
+ }finally{f.close();}
+});
+
+test('branch retirement checks ownership, open tasks, exact tips and remote availability',async()=>{
+ const f=fixture();try{
+  const p=f.branch('owned'),t=f.task();await f.ledger.register(p,'b',[t.id]);f.git(f.repo,'worktree','remove',p);
+  await assert.rejects(f.ledger.retireBranch(f.repo,'a','refs/heads/owned',f.base,'another owner'),/Another side owns/);
+  await assert.rejects(f.ledger.retireBranch(f.repo,'b','refs/heads/owned',f.base,'not done'),/open tasks/);
+  f.store.cancel(t.id,'a','unused branch');
+  f.git(f.repo,'remote','set-url','origin','https://127.0.0.1:1/missing.git');
+  await assert.rejects(f.ledger.retireBranch(f.repo,'b','refs/heads/owned',f.base,'remote unavailable'));
+  assert.equal((await f.ledger.reconcile(f.repo,'b')).branches.find(b=>b.branch==='refs/heads/owned')!.state,'unknown');
+  f.git(f.repo,'remote','set-url','origin',f.remote);
+  await assert.rejects(f.ledger.retireBranch(f.repo,'b','refs/heads/owned','f'.repeat(40),'stale tip'),/Branch advanced/);
+  const retired=await f.ledger.retireBranch(f.repo,'b','refs/heads/owned',f.base,'All task obligations cancelled; main covers this tip');
+  assert.equal(retired.state,'retired');assert.equal((await f.ledger.reconcile(f.repo,'b')).workspaces.length,0);
+  await assert.rejects(f.ledger.retireBranch(f.repo,'b','refs/heads/main',f.base,'main protected'),/main is protected/);
+ }finally{f.close();}
+});
+
 test('one owner can freeze its own range, queue, push and close without another implementer', async () => {
  const f=fixture();try{
   const p=f.branch('local-owner'),t=f.store.create({subject:'own implementation',body:'authorized by user',items:['done'],requiresIntegration:true},'a');

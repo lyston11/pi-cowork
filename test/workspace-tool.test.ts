@@ -15,6 +15,7 @@ test('a Pi started on main freezes the explicitly registered implementation work
     const remote = join(root, 'remote.git'), main = join(root, 'main'), implementation = join(root, 'implementation');
     git(root, 'init', '--bare', remote); git(root, 'clone', remote, main);
     git(main, 'switch', '-c', 'main');
+    git(main, 'config', '--local', 'pi-cowork.enabled', 'true');
     writeFileSync(join(main, 'README.md'), 'baseline\n'); git(main, 'add', '.');
     git(main, '-c', 'user.name=Pi Test', '-c', 'user.email=test@example.invalid', 'commit', '-m', 'baseline');
     git(main, 'push', 'origin', 'main');

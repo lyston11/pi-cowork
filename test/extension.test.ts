@@ -77,6 +77,7 @@ test("tool boundary binds identity to session, never accepts an actor from argum
     piCowork({ registerTool: (tool: any) => tools.set(tool.name, tool), registerCommand: (name: string, command: any) => commands.set(name, command), on: (name: string, handler: Function) => handlers.set(name, handler) } as any);
     assert.equal(handlers.has("tool_call"), false);
     assert.equal(commands.has('cowork'), true);
+    assert.equal(tools.has('cowork_branch'), true);
     assert.equal(commands.has('handoff'), false);
     assert.equal([...tools.keys()].some(name => name.startsWith('handoff_')), false);
     assert.doesNotMatch([...tools.values()].map(tool => tool.label).join('\n'), /handoff/i);
@@ -312,7 +313,10 @@ test("tool boundary binds identity to session, never accepts an actor from argum
     await execute("two", "cowork_check", { id, item: 1, checked: true });
     await assert.rejects(execute("two", "cowork_complete", { id, commit: "f".repeat(40), summary: "fake" }), /not available/);
     const commit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" }).trim();
-    const completed = (await execute("two", "cowork_complete", { id, commit, summary: "done" })).details.task;
+    const completion = (await execute("two", "cowork_complete", { id, commit, summary: "done" })).details;
+    assert.equal(completion.material.state, 'preserved-not-integrated');
+    assert.equal(execFileSync('git', ['rev-parse', completion.material.ref], { cwd: root, encoding: 'utf8' }).trim(), commit);
+    const completed = completion.task;
     const theme = { fg: (_color: string, value: string) => value, strikethrough: (value: string) => `\x1b[9m${value}\x1b[29m` };
     assert.equal(taskLines(completed, false, theme as any, 80).some((line) => line.includes("PRIVATE-TEXT")), false);
     const closed = (await execute("one", "cowork_close", { id, commit, note: "reviewed" })).details.task;

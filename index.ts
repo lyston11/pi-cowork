@@ -306,12 +306,16 @@ export default function piCowork(pi: ExtensionAPI): void {
     async execute(_id, input, _signal, _update, ctx) {
       const actor = identity(ctx).id;
       const task = board().read(input.id, actor);
-      if (!task.requiresIntegration) return toolResult({ task: board().complete(input.id, actor, commitHash(input.commit), input.summary) });
       const ledger = new WorkspaceLedger(board());
       try {
         const implementation = input.workspaceId ? ledger.read(input.workspaceId, actor).path : cwd;
-        if (integrationRepository(implementation).targetKey !== integrationRepository(cwd).targetKey) throw new Error('Implementation workspace belongs to another project target');
         const resolved = commitHash(input.commit, implementation);
+        if (!task.requiresIntegration) {
+          const material = await ledger.preserveMaterial(implementation, actor, input.id, resolved);
+          return toolResult({ task: board().complete(input.id, actor, resolved, input.summary), material,
+            branchCloseout: 'Task acceptance and branch retirement are separate; reconcile and retire the branch after review.' });
+        }
+        if (integrationRepository(implementation).targetKey !== integrationRepository(cwd).targetKey) throw new Error('Implementation workspace belongs to another project target');
         const delivery = await ledger.snapshot(implementation, actor, input.id, resolved);
         return toolResult({ task: board().complete(input.id, actor, resolved, input.summary, delivery.id), delivery,
           reconciliation: await ledger.reconcile(cwd, actor) });
@@ -344,6 +348,17 @@ export default function piCowork(pi: ExtensionAPI): void {
       try { return toolResult({ reconciliation: await ledger.reconcile(cwd, actor) }); } finally { ledger.close(); }
     },
   });
+  pi.registerTool({
+    name: "cowork_branch", label: "Retire a reconciled local task branch",
+    description: "Within existing cleanup authorization, retire one reviewed local branch by its full refs/heads name and exact tip. Requires no checkout, no other owner, no open registered tasks or pending integrations. Every unique commit must have its patch on remote main or belong to an accepted, closed material task; materialTasks can preserve historical material deliveries first. Keeps an archive ref and audit receipt before compare-deleting the branch. Never removes worktrees, main or remote branches; use cowork_workspace for checked-out workspaces.",
+    parameters: Type.Object({ branch: Type.String({ minLength: 12, maxLength: 1024 }), expectedTip: Type.String({ minLength: 40, maxLength: 64 }), note: Type.String({ minLength: 1, maxLength: 4000 }), materialTasks: Type.Optional(Type.Array(idSchema, { maxItems: 50 })) }),
+    async execute(_id, input, _signal, _update, ctx) {
+      const actor = identity(ctx).id, ledger = new WorkspaceLedger(board());
+      try { return toolResult({ branch: await ledger.retireBranch(cwd, actor, input.branch, input.expectedTip, input.note, input.materialTasks) }); }
+      finally { ledger.close(); }
+    },
+  });
+
   pi.registerTool({
     name: "cowork_integration_policy", label: "Approve project integration checks",
     description: "Read project checks, or explicitly approve exact current remote main and project checks within user authorization. Append-audited configuration; refuses changes during queued/running jobs. This does not approve any old delivery.",
@@ -400,7 +415,12 @@ export default function piCowork(pi: ExtensionAPI): void {
         const queue = new IntegrationQueue(board());
         try { verifyPushedIntegration(cwd, queue.read(task.integration.jobId)); } finally { queue.close(); }
       }
-      return toolResult({ task: board().closeTask(input.id, actor, commitHash(input.commit), input.note) });
+      const ledger = new WorkspaceLedger(board());
+      try {
+        const material = task.requiresIntegration ? undefined : await ledger.preserveMaterial(cwd, actor, input.id, commitHash(input.commit));
+        return toolResult({ task: board().closeTask(input.id, actor, commitHash(input.commit), input.note), ...(material ? { material } : {}),
+          branchCloseout: 'Task accepted; use cowork_reconcile to account for the whole branch, then cowork_workspace or cowork_branch to retire it within cleanup authorization.' });
+      } finally { ledger.close(); }
     }, renderResult,
   });
 
@@ -469,6 +489,8 @@ export default function piCowork(pi: ExtensionAPI): void {
             `未登记工作区 ${w.path}`,
             ...('error' in w ? [`  不完整: ${w.error}`] : [...(w.status ?? []).map(s => `  文件 ${s}`), ...(w.ignored ?? []).map(s => `  待保全 ignored: ${s}`)]),
           ]),
+          ...report.branches.map(b => `本地分支 ${b.branch} · ${{ merged: '已入主线', 'patches-present': '补丁已在主线出现（原提交保留）', 'materials-preserved': '材料已保全（未合入主线）', unaccounted: '仍有未交付或未保全内容', unknown: '证据不完整' }[b.state]} · HEAD ${b.tip} · ${b.worktree ? `检出中 ${b.worktree}` : '无检出工作树'} · 未覆盖 ${b.unaccountedCommits ?? '未知'}`),
+          ...report.archivedBranches.map(b => `已退休分支 ${b.branch} · ${b.tip} · 保全 ${b.ref}`),
           ...report.unregistered.map(b => `未登记分支 ${b.branch} ${b.tip} · 未集成 ${b.unintegrated?.join(', ') ?? '未知'}`),
           ...report.detached.map(w => `detached 工作区 ${w.path} ${w.head} · 未集成 ${w.unintegrated?.join(', ') ?? '未知'}`),
           ...report.remoteBranches.map(b => `远端分支 ${b.branch} ${b.tip} · 未集成 ${b.unintegrated?.join(', ') ?? '未知'}`),
