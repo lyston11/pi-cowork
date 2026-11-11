@@ -1,6 +1,7 @@
 import type { ExtensionContext } from '@earendil-works/pi-coding-agent';
 import { Key, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi } from '@earendil-works/pi-tui';
 import type { WorkspaceLedger } from './workspaces.ts';
+import { loadWithStatus } from './ui.ts';
 
 const plain = (value: unknown) => String(value).replace(/[\x00-\x1f\x7f-\x9f]/g, ' ');
 const dispositions = {
@@ -14,7 +15,7 @@ const reasons: Record<string, string> = {
 };
 
 export async function showBranches(ctx: ExtensionContext, ledger: WorkspaceLedger, cwd: string, actor: string): Promise<void> {
-  let plan = await ledger.cleanupPlan(cwd, actor);
+  let plan = await loadWithStatus(ctx, 'CoWork：正在加载分支，核对远端与本地…', () => ledger.cleanupPlan(cwd, actor));
   if (ctx.mode !== 'tui') {
     ctx.ui.notify(JSON.stringify({ summary: plan.summary, remote: plan.remote, errors: plan.errors,
       hint: 'Use cowork_cleanup preview with scope=active|archive|remote and follow nextOffset; apply requires exact reviewed branch tips.' }), 'info');

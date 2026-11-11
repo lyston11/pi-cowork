@@ -23,7 +23,7 @@ async function fixture(count = 3) {
   };
   const state = { exited: false, renders: 0 };
   const terminal = { rows: 40 }; let panel: any;
-  await showBranches({ mode: 'tui', ui: { custom: async (factory: Function) => {
+  await showBranches({ mode: 'tui', ui: { setStatus() {}, custom: async (factory: Function) => {
     panel = factory({ terminal, requestRender: () => { state.renders++; } }, { fg: (_c: string, s: string) => s }, null, () => { state.exited = true; });
   } } } as any, ledger, '/repo', 'b');
   return { panel, plan, calls, state, terminal };

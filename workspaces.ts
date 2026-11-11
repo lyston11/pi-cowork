@@ -234,8 +234,17 @@ export class WorkspaceLedger {
   async reconcile(cwd: string, actor?: string) {
     const target = integrationRepository(cwd), workspaces = this.all(target.repo, actor).filter(w => w.state === 'active');
     const errors: string[] = [];
-    let remote: string | null = null, outside: string[] = [];
-    try { remote = await this.remoteHead(cwd); outside = await this.outsideQueue(cwd, remote); } catch (e) { errors.push(String(e)); }
+    let remote: string | null = null, outside: string[] = [], remoteBranches: string[] = [];
+    // One atomic snapshot, not fetch(main) + ls-remote + fetch(all).
+    // Prune only our audit namespace so deleted remote branches cannot linger.
+    try {
+      await git(cwd, ['fetch', '--atomic', '--prune', '--no-tags', '--no-write-fetch-head', '--', target.url, '+refs/heads/*:refs/pi-cowork/audit/heads/*']);
+      remoteBranches = list(await git(cwd, ['for-each-ref', '--format=%(objectname) %(refname)', 'refs/pi-cowork/audit/heads/']))
+        .map(row => row.replace('refs/pi-cowork/audit/heads/', 'refs/heads/'));
+      remote = remoteBranches.find(row => row.endsWith(' refs/heads/main'))?.split(' ')[0] ?? null;
+      if (!remote) throw new Error('Remote main is missing; reconciliation is incomplete');
+      outside = await this.outsideQueue(cwd, remote);
+    } catch (e) { errors.push(String(e)); }
     const registered = this.all(target.repo).filter(w => w.state === 'active');
     const snapshots = this.db.prepare('SELECT d.* FROM handoff_deliveries d JOIN handoff_workspaces w ON w.id=d.workspace_id WHERE w.repo=?').all(target.repo);
     const worktrees = (await git(cwd, ['worktree', 'list', '--porcelain', '-z'])).split('\0\0').map(block => {
@@ -250,37 +259,40 @@ export class WorkspaceLedger {
       } catch (error) { errors.push(`Cannot inspect worktree ${w.path}: ${error}`); return { ...w, error: String(error), registered: false }; }
     }));
     const heads = list(await git(cwd, ['for-each-ref', '--format=%(refname) %(objectname)', 'refs/heads/']));
-    let remoteBranches: string[] = [];
-    try { remoteBranches = list(await git(cwd, ['ls-remote', '--heads', 'origin']));
-      await git(cwd, ['fetch', '--no-tags', '--no-write-fetch-head', '--', target.url, '+refs/heads/*:refs/pi-cowork/audit/heads/*']);
-    } catch (e) { errors.push(String(e)); }
     const unregistered = heads.map(h => { const [branch, tip] = h.split(' '); return { branch, tip }; })
       .filter(h => h.branch !== 'refs/heads/main' && !registered.some(w => w.branch === h.branch));
     const detached = worktrees.filter(w => !w.branch);
-    const materials = this.materialCommits(cwd, actor);
-    const states = new Map<string, Awaited<ReturnType<WorkspaceLedger['branchStatus']>>>();
-    const describeBranch = async (tip: string) => {
-      if (!states.has(tip)) {
-        try { states.set(tip, await this.branchStatus(cwd, tip, remote, materials)); }
-        catch (error) { errors.push(`Cannot account for branch tip ${tip}: ${error}`); states.set(tip, { state: 'unknown', unique: null, remaining: null }); }
-      }
+    const materials = await this.materialCommits(cwd, actor);
+    const states = new Map<string, Promise<BranchStatus>>();
+    const describeBranch = (tip: string) => {
+      if (!states.has(tip)) states.set(tip, this.branchStatus(cwd, tip, remote, materials).catch(error => {
+        errors.push(`Cannot account for branch tip ${tip}: ${error}`);
+        return { state: 'unknown', unique: null, remaining: null };
+      }));
       return states.get(tip)!;
     };
     const reports = [];
+    const integrated = new Map<string, boolean>();
     for (const w of workspaces) {
       try {
         if (!existsSync(w.path) || realpathSync(await git(w.path, ['rev-parse', '--show-toplevel'])) !== w.path || integrationRepository(w.path).repo !== w.repo || await git(w.path, ['symbolic-ref', '-q', 'HEAD']) !== w.branch) throw new Error('Registered worktree is missing, moved or has switched branch; preserve and review its registration');
         const tip = await git(w.path, ['rev-parse', 'HEAD']);
-        const status = await git(w.path, ['status', '--porcelain=v1', '-uall']);
-        const ignored = (await git(w.path, ['ls-files', '--others', '--ignored', '--exclude-standard', '--directory', '-z'])).split('\0').filter(Boolean);
+        const inspected = actualWorktrees.find(tree => tree.path === w.path && tree.branch === w.branch && tree.head === tip);
+        if (!inspected || 'error' in inspected) throw new Error(inspected?.error ?? 'Worktree changed during reconciliation; retry');
+        const status = inspected.status.join('\n'), ignored = inspected.ignored;
         const delivered = snapshots.filter(d => d.workspace_id === w.id);
         const valid = delivered.filter(d => this.db.prepare("SELECT 1 FROM handoff_task_events e WHERE e.kind='complete' AND json_extract(e.data_json,'$.deliveryId')=? AND NOT EXISTS(SELECT 1 FROM handoff_task_events later WHERE later.task_id=e.task_id AND later.kind IN ('reopen','cancel') AND later.seq>e.seq)").get(String(d.id)));
         const approved = new Set(valid.flatMap(d => JSON.parse(String(d.commits_json)) as string[]));
         const closeout = await describeBranch(tip);
         const undelivered = closeout.remaining?.filter(c => !approved.has(c)) ?? null;
-        const pending = valid.filter(d => !remote || !this.contains(w.path, String(d.tip), remote)).map(d => String(d.id));
+        const pending = valid.filter(d => {
+          if (!remote) return true;
+          const tip = String(d.tip);
+          if (!integrated.has(tip)) integrated.set(tip, this.contains(cwd, tip, remote));
+          return !integrated.get(tip);
+        }).map(d => String(d.id));
         const tasks = w.tasks.map(id => { const task = this.store.read(id, w.owner); return { id, state: task.state }; });
-        const blockers = [!remote ? 'remote-incomplete' : '', closeout.remaining?.length ? 'branch-not-integrated' : '', pending.length ? 'pending-deliveries' : '', status ? 'uncommitted-files' : '', ignored.length ? 'ignored-data-needs-preservation' : '', tasks.some(t => t.state !== 'closed' && t.state !== 'cancelled') ? 'open-tasks' : ''].filter(Boolean);
+        const blockers = [!remote || closeout.state === 'unknown' ? 'remote-incomplete' : '', closeout.remaining?.length ? 'branch-not-integrated' : '', pending.length ? 'pending-deliveries' : '', status ? 'uncommitted-files' : '', ignored.length ? 'ignored-data-needs-preservation' : '', tasks.some(t => t.state !== 'closed' && t.state !== 'cancelled') ? 'open-tasks' : ''].filter(Boolean);
         reports.push({ workspace: w, tip, closeout, status: status ? status.split('\n') : [], ignored, undelivered, pendingDeliveries: pending, tasks, blockers, eligibleForRetirement: blockers.length === 0 });
       } catch (error) { errors.push(`${w.id}: ${error}`); reports.push({ workspace: w, error: String(error), eligibleForRetirement: false }); }
     }
@@ -296,10 +308,13 @@ export class WorkspaceLedger {
     const lastSync = lastSyncRow ? { ...JSON.parse(String(lastSyncRow.result_json)), at: String(lastSyncRow.at) } : null;
     if (!mainReason && mainDifference?.[1] && lastSync?.main === localMain && lastSync?.remote === remote && lastSync?.state === 'blocked') mainReason = lastSync.reason;
     const localMainStatus = { head: localMain, remote, difference: mainDifference, state: mainReason ? 'blocked' : mainDifference?.[1] ? 'fast-forward-available' : 'current', reason: mainReason, lastSync };
+    const refCommits = new Map<string, Promise<string[] | null>>();
     const describeRef = async (tip: string | undefined) => {
       if (!tip || !remote) return null;
-      try { return list(await git(cwd, ['rev-list', tip, '--not', remote])); }
-      catch (error) { errors.push(`Cannot inspect referenced commits ${tip}: ${error}`); return null; }
+      if (!refCommits.has(tip)) refCommits.set(tip, git(cwd, ['rev-list', tip, '--not', remote]).then(list).catch(error => {
+        errors.push(`Cannot inspect referenced commits ${tip}: ${error}`); return null;
+      }));
+      return refCommits.get(tip)!;
     };
     const unknown = await Promise.all(unregistered.map(async b => ({ ...b, unintegrated: await describeRef(b.tip) })));
     const detachedHeads = await Promise.all(detached.map(async w => ({ ...w, unintegrated: await describeRef(w.head) })));
@@ -373,17 +388,27 @@ export class WorkspaceLedger {
     if (existing !== tip) await git(cwd, ['update-ref', ref, tip, '']);
     return { taskId, commit: tip, ref, state: 'preserved-not-integrated' as const };
   }
-  private materialCommits(cwd: string, actor?: string) {
+  private async materialCommits(cwd: string, actor?: string) {
     const result = new Map<string, number>();
-    const tasks = this.db.prepare(`SELECT id,assignee FROM handoff_tasks WHERE requires_integration=0 ${actor ? 'AND (creator=? OR assignee=?)' : ''}`).all(...(actor ? [actor, actor] : []));
-    for (const row of tasks) {
-      const task = this.store.read(Number(row.id), actor ?? String(row.assignee));
+    // Check only preserved references. Reading every historical material task
+    // spawned two synchronous Git processes per task, even without a ref.
+    const refs = list(await git(cwd, ['for-each-ref', '--format=%(refname) %(objectname) %(objecttype)', 'refs/pi-cowork/materials/']));
+    const tasks = new Map<number, ReturnType<HandoffStore['read']>>();
+    for (const row of refs) {
+      const [ref, commit, type] = row.split(' ');
+      const match = /^refs\/pi-cowork\/materials\/(\d+)\/([0-9a-f]{40}|[0-9a-f]{64})$/.exec(ref);
+      if (!match || type !== 'commit' || match[2] !== commit) continue;
+      const id = Number(match[1]);
+      const owner = this.db.prepare(`SELECT assignee FROM handoff_tasks WHERE id=? AND requires_integration=0 ${actor ? 'AND (creator=? OR assignee=?)' : ''}`).get(id, ...(actor ? [actor, actor] : []));
+      if (!owner) continue;
+      if (!tasks.has(id)) tasks.set(id, this.store.read(id, actor ?? String(owner.assignee)));
+      const task = tasks.get(id)!;
       if (task.state !== 'closed' || !task.commit) continue;
       try {
-        const commit = gitSync(cwd, ['rev-parse', '--verify', `${task.commit}^{commit}`]);
-        const ref = `refs/pi-cowork/materials/${task.id}/${commit}`;
-        if (gitSync(cwd, ['rev-parse', '--verify', ref]) === commit) result.set(commit, task.id);
-      } catch { /* Missing material objects or refs remain unaccounted for. */ }
+        const delivered = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(task.commit) ? task.commit.toLowerCase()
+          : await git(cwd, ['rev-parse', '--verify', `${task.commit}^{commit}`]);
+        if (delivered === commit) result.set(commit, id);
+      } catch { /* Missing or ambiguous deliveries remain unaccounted for. */ }
     }
     return result;
   }
@@ -411,7 +436,7 @@ export class WorkspaceLedger {
       if (!this.contains(cwd, commit, expectedTip)) throw new Error('Material delivery is not part of this branch');
       await this.preserveMaterial(cwd, actor, id, commit);
     }
-    const status = await this.branchStatus(cwd, expectedTip, remote, this.materialCommits(cwd, actor));
+    const status = await this.branchStatus(cwd, expectedTip, remote, await this.materialCommits(cwd, actor));
     if (status.state === 'unknown' || status.remaining?.length) throw new Error('Branch has unaccounted commits; integrate them or preserve accepted material deliveries first');
     return this.transaction(() => {
       if (gitSync(cwd, ['rev-parse', '--verify', branch]) !== expectedTip) throw new Error('Branch advanced; review its new tip before retirement');
@@ -469,7 +494,7 @@ export class WorkspaceLedger {
       return { ...b, owners: [...new Set(owners.map(w => w.owner))], workspaceId: workspace?.id ?? null,
         action, eligible: reasons.length === 0, reasons: [...new Set(reasons)] };
     });
-    const materials = this.materialCommits(cwd, actor);
+    const materials = await this.materialCommits(cwd, actor);
     const receipts = new Map(report.archivedBranches.map(b => [String(b.ref), String(b.branch)]));
     const archives = list(await git(cwd, ['for-each-ref', '--format=%(refname) %(objectname)',
       'refs/pi-cowork/materials/', 'refs/pi-cowork/retired/', 'refs/pi-cowork/deliveries/'])).map(row => {

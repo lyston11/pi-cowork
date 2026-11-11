@@ -32,6 +32,60 @@ function fixture() {
     close(){queue.close();ledger.close();store.close();rmSync(root,{recursive:true,force:true});}};
 }
 
+test('audit uses one remote snapshot, one file scan per worktree and one material ref enumeration', async () => {
+ const f=fixture(), previous=process.env.GIT_TRACE2_EVENT;try{
+  const path=f.branch('registered');await f.ledger.register(path,'b');
+  for(let i=0;i<8;i++)f.git(f.repo,'branch',`same-tip-${i}`,f.base);
+  for(let i=0;i<40;i++){
+   const t=f.store.create({to:'b',subject:'historic material',body:'evidence',items:['done'],requiresIntegration:false},'a');
+   f.store.check(t.id,'b',1,true);f.store.complete(t.id,'b',f.base,'material');f.store.closeTask(t.id,'a',f.base,'accepted');
+   if(i===0)await f.ledger.preserveMaterial(f.repo,'b',t.id,f.base);
+  }
+  const trace=join(f.root,'trace.jsonl');process.env.GIT_TRACE2_EVENT=trace;
+  const report=await f.ledger.reconcile(f.repo,'b');
+  assert.equal(report.complete,true,JSON.stringify(report.errors));
+  const commands=readFileSync(trace,'utf8').trim().split('\n').map(line=>JSON.parse(line)).filter(e=>e.event==='start').map(e=>e.argv as string[]);
+  assert.equal(commands.filter(a=>a[1]==='fetch').length,1);
+  assert.equal(commands.filter(a=>a[1]==='ls-remote').length,0);
+  assert.equal(commands.filter(a=>a[1]==='status').length,2,'do not rescan registered worktrees');
+  assert.equal(commands.filter(a=>a[1]==='ls-files').length,2);
+  assert.equal(commands.filter(a=>a[1]==='rev-parse'&&a.includes('--verify')).length,0,'full material hashes need no per-task Git');
+  assert.equal(commands.filter(a=>a[1]==='rev-list'&&a[2]===f.base&&a[3]==='--not').length,2,'one shared ref lookup plus one shared branch status');
+ }finally{if(previous===undefined)delete process.env.GIT_TRACE2_EVENT;else process.env.GIT_TRACE2_EVENT=previous;f.close();}
+});
+
+test('atomic audit refresh drops deleted remote heads and refuses absent main or a failed refresh', async () => {
+ const f=fixture();try{
+  f.git(f.repo,'push','origin',`${f.base}:refs/heads/old`);
+  assert.ok((await f.ledger.reconcile(f.repo)).remoteBranches.some(b=>b.branch==='refs/heads/old'));
+  f.git(f.remote,'update-ref','-d','refs/heads/old',f.base);
+  assert.ok(!(await f.ledger.reconcile(f.repo)).remoteBranches.some(b=>b.branch==='refs/heads/old'));
+  f.git(f.remote,'update-ref','-d','refs/heads/main',f.base);
+  const absent=await f.ledger.reconcile(f.repo);assert.equal(absent.complete,false);assert.equal(absent.remote,null);
+  assert.match(absent.errors.join(),/Remote main is missing/);
+  f.git(f.remote,'update-ref','refs/heads/main',f.base);
+  assert.equal((await f.ledger.reconcile(f.repo)).complete,true);
+  f.git(f.repo,'remote','set-url','origin','https://127.0.0.1:1/missing.git');
+  const failed=await f.ledger.reconcile(f.repo);assert.equal(failed.remote,null);assert.equal(failed.complete,false);
+  assert.deepEqual(failed.remoteBranches,[],'never treat cached audit refs as a fresh remote result');
+ }finally{f.close();}
+});
+
+test('batched material lookup still validates task access, acceptance, object type and exact commit', async () => {
+ const f=fixture();try{
+  const p=f.branch('materials'),tip=f.commit(p,'accepted.md');
+  const t=f.store.create({to:'b',subject:'material',body:'private',items:['done'],requiresIntegration:false},'a');
+  f.store.check(t.id,'b',1,true);f.store.complete(t.id,'b',tip,'material');f.store.closeTask(t.id,'a',tip,'accepted');
+  const material=await f.ledger.preserveMaterial(f.repo,'b',t.id,tip);
+  const state=async(actor:string)=>(await f.ledger.reconcile(f.repo,actor)).branches.find(b=>b.branch==='refs/heads/materials')!.state;
+  assert.equal(await state('b'),'materials-preserved');assert.equal(await state('c'),'unaccounted');
+  f.git(f.repo,'update-ref',material.ref,f.base,tip);assert.equal(await state('b'),'unaccounted');
+  const blob=f.git(p,'rev-parse',`${tip}:accepted.md`);f.git(f.repo,'update-ref',material.ref,blob,f.base);assert.equal(await state('b'),'unaccounted');
+  f.git(f.repo,'update-ref',material.ref,tip,blob);assert.equal(await state('b'),'materials-preserved');
+  f.git(f.repo,'update-ref','-d',material.ref,tip);assert.equal(await state('b'),'unaccounted');
+ }finally{f.close();}
+});
+
 test('unified cleanup separates accepted archives, eligible branches and retained obligations', async () => {
  const f=fixture();try{
   const material=f.branch('material'),tip=f.commit(material,'accepted.md');

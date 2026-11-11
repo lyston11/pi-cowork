@@ -1,9 +1,16 @@
-import type { Theme } from "@earendil-works/pi-coding-agent";
+import type { ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import type { HandoffTask, TaskSummary } from "./types.ts";
 
 // Task text is data: remove terminal controls before applying our own styles.
 const plain = (value: string) => value.replace(/[\x00-\x1f\x7f]/g, " ");
+
+// Show feedback before the first network wait; always clear it on failure too.
+export async function loadWithStatus<T>(ctx: ExtensionContext, label: string, load: () => Promise<T>): Promise<T> {
+  ctx.ui.setStatus('cowork-loading', label);
+  try { return await load(); }
+  finally { ctx.ui.setStatus('cowork-loading', undefined); }
+}
 
 export function taskLines(task: HandoffTask | TaskSummary, expanded: boolean, theme: Theme, width: number): string[] {
   const checked = task.items.filter((item) => item.checked).length;

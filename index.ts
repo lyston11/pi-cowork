@@ -5,7 +5,7 @@ import { resolve } from "node:path";
 import { execFileSync } from "node:child_process";
 import { Key, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { HandoffStore, type HumanTaskSnapshot } from "./store.ts";
-import { taskLines } from "./ui.ts";
+import { loadWithStatus, taskLines } from "./ui.ts";
 import { showSides } from "./side-panel.ts";
 import { showBranches } from "./branch-panel.ts";
 import { COWORK_RUNTIME_RULES, installCoworkRules } from "./instructions.ts";
@@ -502,7 +502,7 @@ export default function piCowork(pi: ExtensionAPI): void {
       if (command === 'audit') {
         const ledger = new WorkspaceLedger(board());
         let report;
-        try { report = await ledger.reconcile(cwd); } finally { ledger.close(); }
+        try { report = await loadWithStatus(ctx, 'CoWork：正在加载对账，核对远端与本地…', () => ledger.reconcile(cwd)); } finally { ledger.close(); }
         const lines = [
           `远端 main: ${report.remote ?? '查询失败，结果不完整'}`,
           `本地 main 差异 [本地独有, 远端独有]: ${JSON.stringify(report.mainDifference)}`,
