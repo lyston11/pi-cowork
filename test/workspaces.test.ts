@@ -32,6 +32,78 @@ function fixture() {
     close(){queue.close();ledger.close();store.close();rmSync(root,{recursive:true,force:true});}};
 }
 
+test('unified cleanup separates accepted archives, eligible branches and retained obligations', async () => {
+ const f=fixture();try{
+  const material=f.branch('material'),tip=f.commit(material,'accepted.md');
+  const t=f.store.create({to:'b',subject:'material',body:'private evidence',items:['review'],requiresIntegration:false},'a');
+  await f.ledger.register(material,'b',[t.id]);
+  f.store.check(t.id,'b',1,true);f.store.complete(t.id,'b',tip,'material');f.store.closeTask(t.id,'a',tip,'accepted');
+  const preserved=await f.ledger.preserveMaterial(f.repo,'b',t.id,tip);
+  f.git(f.repo,'worktree','remove',material);
+  const open=f.branch('open'),pending=f.task();await f.ledger.register(open,'b',[pending.id]);f.git(f.repo,'worktree','remove',open);
+  const other=f.branch('other');await f.ledger.register(other,'c');f.git(f.repo,'worktree','remove',other);
+  f.git(f.repo,'branch','unregistered',f.base);
+  f.git(f.repo,'push','origin','refs/heads/material');
+  const plan=await f.ledger.cleanupPlan(f.repo,'b');
+  assert.equal(plan.summary.eligible,1);assert.equal(plan.summary.retained,3);
+  assert.equal(plan.branches.find(b=>b.branch==='refs/heads/material')!.state,'materials-preserved');
+  assert.match(plan.branches.find(b=>b.branch==='refs/heads/open')!.reasons.join(),/尚未关闭/);
+  assert.match(plan.branches.find(b=>b.branch==='refs/heads/other')!.reasons.join(),/归属其他侧/);
+  assert.match(plan.branches.find(b=>b.branch==='refs/heads/unregistered')!.reasons.join(),/未登记归属/);
+  assert.equal(plan.archives.find(a=>a.ref===preserved.ref)!.acceptedMaterial,true);
+  assert.equal(plan.summary.remote,1);
+  const result=await f.ledger.cleanup(f.repo,'b',plan.branches.map(b=>({branch:b.branch,expectedTip:b.tip})),'Reviewed exact tips; retire accepted material only');
+  assert.equal(result.retired,1);assert.equal(result.retained,3);assert.equal(result.remoteBranchesRemoved,false);
+  assert.throws(()=>f.git(f.repo,'rev-parse','--verify','refs/heads/material'));
+  assert.equal(f.git(f.repo,'rev-parse','refs/heads/open'),f.base);
+  assert.equal(f.git(f.remote,'rev-parse','refs/heads/material'),tip,'remote is explicitly retained');
+  const after=await f.ledger.cleanupPlan(f.repo,'b');
+  assert.equal(after.branches.length,3);assert.equal(after.summary.eligible,0);assert.equal(after.archives.length,2);
+  assert.equal(f.git(f.repo,'show',`${preserved.ref}:accepted.md`),'accepted.md');
+  assert.equal(f.git(f.repo,'rev-parse','main'),f.base);
+  assert.doesNotMatch(JSON.stringify(after),/private evidence/);
+ }finally{f.close();}
+});
+
+test('cleanup rechecks exact tips and continues safe items without expanding a reviewed batch',async()=>{
+ const f=fixture();try{
+  for(const name of ['advanced','safe','unselected']){const p=f.branch(name);await f.ledger.register(p,'b');f.git(f.repo,'worktree','remove',p);}
+  const plan=await f.ledger.cleanupPlan(f.repo,'b');
+  const newTip=f.commit(f.repo,'new-main');f.git(f.repo,'push','origin','main');
+  f.git(f.repo,'update-ref','refs/heads/advanced',newTip,f.base);
+  const targets=plan.branches.filter(b=>b.branch!=='refs/heads/unselected').map(b=>({branch:b.branch,expectedTip:b.tip}));
+  const result=await f.ledger.cleanup(f.repo,'b',targets,'Reviewed two tips only');
+  assert.equal(result.retired,1);assert.equal(result.retained,1);assert.match(result.results[0].reason!,/changed/);
+  assert.equal(f.git(f.repo,'rev-parse','refs/heads/advanced'),newTip);
+  assert.equal(f.git(f.repo,'rev-parse','refs/heads/unselected'),f.base);
+  await assert.rejects(f.ledger.cleanup(f.repo,'b',[targets[0],targets[0]],'duplicate'),/unique/);
+  await assert.rejects(f.ledger.cleanup(f.repo,'b',[{branch:'refs/heads/main',expectedTip:newTip}],'protected'),/main is protected/);
+  f.git(f.repo,'remote','set-url','origin','https://127.0.0.1:1/missing.git');
+  const unavailable=await f.ledger.cleanup(f.repo,'b',[{branch:'refs/heads/unselected',expectedTip:f.base}],'remote down');
+  assert.equal(unavailable.retired,0);assert.equal(unavailable.retained,1);
+ }finally{f.close();}
+});
+
+test('checked-out cleanup preserves code, dirty files, occupancy and changed workspace bindings',async()=>{
+ const f=fixture();try{
+  const code=f.branch('code'),tip=f.commit(code,'implementation.ts');await f.ledger.register(code,'b');
+  const dirty=f.branch('dirty');await f.ledger.register(dirty,'b');writeFileSync(join(dirty,'untracked'),'keep');
+  const busy=f.branch('busy'),w=await f.ledger.register(busy,'b');
+  f.store.register({id:'live',name:'live',sessionId:'live',pid:process.pid,worktree:busy,branch:'busy'});
+  const plan=await f.ledger.cleanupPlan(f.repo,'b');
+  assert.match(plan.branches.find(b=>b.branch==='refs/heads/code')!.reasons.join(),/未交付/);
+  assert.match(plan.branches.find(b=>b.branch==='refs/heads/dirty')!.reasons.join(),/uncommitted-files/);
+  assert.match(plan.branches.find(b=>b.branch==='refs/heads/busy')!.reasons.join(),/存活/);
+  const result=await f.ledger.cleanup(f.repo,'b',plan.branches.map(b=>({branch:b.branch,expectedTip:b.tip})),'must preserve these');
+  assert.equal(result.retired,0);assert.equal(result.retained,3);
+  assert.equal(readFileSync(join(dirty,'untracked'),'utf8'),'keep');assert.equal(f.git(code,'rev-parse','HEAD'),tip);
+  f.git(busy,'switch','-c','changed');
+  await f.ledger.register(busy,'b');
+  await assert.rejects(f.ledger.retire(f.repo,'b',w.id,true,undefined,{branch:'refs/heads/busy',tip:f.base}),/changed since cleanup/);
+  assert(existsSync(busy));
+ }finally{f.close();}
+});
+
 test('closed material commits are preserved separately from main and their idle branch can retire', async () => {
  const f=fixture();try{
   const p=f.branch('material'),tip=f.commit(p,'acceptance.md');

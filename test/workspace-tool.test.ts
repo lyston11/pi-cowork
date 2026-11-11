@@ -38,6 +38,13 @@ test('a Pi started on main freezes the explicitly registered implementation work
     assert.equal(done.delivery.workspaceId, workspace.id);
     assert.equal(done.task.state, 'completed');
     assert.notEqual(git(main, 'rev-parse', 'HEAD'), tip);
+    const plan = JSON.parse((await execute('owner', 'cowork_cleanup', { action: 'preview', limit: 1 })).content[0].text);
+    assert.equal(plan.scope, 'active'); assert.equal(plan.entries.length, 1); assert.equal(plan.nextOffset, null);
+    assert.equal(plan.entries[0].branch, 'refs/heads/task/implementation'); assert.equal(plan.entries[0].eligible, false);
+    await assert.rejects(execute('owner', 'cowork_cleanup', { action: 'apply' }), /targets and a cleanup note/);
+    await assert.rejects(execute('owner', 'cowork_cleanup', { action: 'preview', limit: 0 }), /limit must be 1-100/);
+    const archive = JSON.parse((await execute('owner', 'cowork_cleanup', { action: 'preview', scope: 'archive' })).content[0].text);
+    assert.equal(archive.scope, 'archive'); assert.equal(archive.entries[0].kind, 'delivery');
   } finally {
     await handlers.get('session_shutdown')?.();
     process.chdir(cwd);

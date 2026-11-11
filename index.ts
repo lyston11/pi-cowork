@@ -7,6 +7,7 @@ import { Key, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi } from
 import { HandoffStore, type HumanTaskSnapshot } from "./store.ts";
 import { taskLines } from "./ui.ts";
 import { showSides } from "./side-panel.ts";
+import { showBranches } from "./branch-panel.ts";
 import { COWORK_RUNTIME_RULES, installCoworkRules } from "./instructions.ts";
 import type { HandoffTask, Side, TaskSummary } from "./types.ts";
 import { resolveChannel } from "./channel.ts";
@@ -360,6 +361,33 @@ export default function piCowork(pi: ExtensionAPI): void {
   });
 
   pi.registerTool({
+    name: 'cowork_cleanup', label: 'Preview or clean up completed branches',
+    description: 'Unified branch closeout. Preview separates active local branches, archive refs and remote branches, with eligibility and retention reasons. Follow nextOffset (50 rows by default). Within existing cleanup authorization, apply only explicitly reviewed local branch names and exact tips from preview. Rechecks ownership, terminal tasks, integrated/preserved commits, files and process occupancy; removes idle owned worktrees when needed. Reports each retired/retained item independently. Never stops processes or deletes main, remote branches or archive refs. Unregistered ownership requires separate review, not blind batch cleanup.',
+    parameters: Type.Object({ action: Type.Union([Type.Literal('preview'), Type.Literal('apply')]),
+      scope: Type.Optional(Type.Union([Type.Literal('active'), Type.Literal('archive'), Type.Literal('remote')])),
+      offset: Type.Optional(Type.Integer({ minimum: 0 })), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
+      targets: Type.Optional(Type.Array(Type.Object({ branch: Type.String({ minLength: 12, maxLength: 1024 }), expectedTip: Type.String({ minLength: 40, maxLength: 64 }) }), { minItems: 1, maxItems: 50 })),
+      note: Type.Optional(Type.String({ minLength: 1, maxLength: 4000 })) }),
+    async execute(_id, input, _signal, _update, ctx) {
+      const actor = identity(ctx).id, ledger = new WorkspaceLedger(board());
+      try {
+        if (input.action === 'apply') {
+          if (!input.targets || !input.note) throw new Error('Apply requires explicit reviewed targets and a cleanup note');
+          return toolResult({ cleanup: await ledger.cleanup(cwd, actor, input.targets, input.note) });
+        }
+        const scope = input.scope ?? 'active', offset = input.offset ?? 0, limit = input.limit ?? 50;
+        if (input.action !== 'preview' || !['active', 'archive', 'remote'].includes(scope)) throw new Error('Invalid cleanup action or scope');
+        if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isInteger(limit) || limit < 1 || limit > 100) throw new Error('offset must be nonnegative; limit must be 1-100');
+        const plan = await ledger.cleanupPlan(cwd, actor);
+        const rows = scope === 'active' ? plan.branches : scope === 'archive' ? plan.archives : plan.remoteBranches.filter(b => b.branch !== 'refs/heads/main');
+        const end = offset + limit;
+        return toolResult({ scope, remote: plan.remote, summary: plan.summary, entries: rows.slice(offset, end),
+          total: rows.length, nextOffset: end < rows.length ? end : null, errors: plan.errors });
+      } finally { ledger.close(); }
+    },
+  });
+
+  pi.registerTool({
     name: "cowork_integration_policy", label: "Approve project integration checks",
     description: "Read project checks, or explicitly approve exact current remote main and project checks within user authorization. Append-audited configuration; refuses changes during queued/running jobs. This does not approve any old delivery.",
     parameters: Type.Object({ baseline: Type.Optional(Type.String()), checks: Type.Optional(Type.Array(Type.Object({ command: Type.String(), args: Type.Array(Type.String()) }), { minItems: 1, maxItems: 10 })), note: Type.Optional(Type.String()) }),
@@ -419,7 +447,7 @@ export default function piCowork(pi: ExtensionAPI): void {
       try {
         const material = task.requiresIntegration ? undefined : await ledger.preserveMaterial(cwd, actor, input.id, commitHash(input.commit));
         return toolResult({ task: board().closeTask(input.id, actor, commitHash(input.commit), input.note), ...(material ? { material } : {}),
-          branchCloseout: 'Task accepted; use cowork_reconcile to account for the whole branch, then cowork_workspace or cowork_branch to retire it within cleanup authorization.' });
+          branchCloseout: 'Task accepted, branch closeout is still separate. Within existing cleanup authorization, the owning side must use cowork_cleanup preview, then apply eligible exact tips; report retained items and reasons. Do not stop at a read-only audit or transfer own cleanup to another side.' });
       } finally { ledger.close(); }
     }, renderResult,
   });
@@ -449,7 +477,7 @@ export default function piCowork(pi: ExtensionAPI): void {
   });
 
   pi.registerCommand("cowork", {
-    description: "Open the task board; m opens current-side management. /cowork sides opens current sides and h toggles history. /cowork [audit|init|status|auto [on|off]|name <name>|read <id>|cancel <id> <reason>|remove [side-id]|takeover <side-id>]",
+    description: "Open the task board; m manages sides, b opens branch cleanup. /cowork branches separates active branches, archives and remotes; c previews cleanup. /cowork [sides|branches|audit|init|status|auto [on|off]|name <name>|read <id>|cancel <id> <reason>|remove [side-id]|takeover <side-id>]",
     handler: async (args, ctx) => {
       const self = identity(ctx);
       const command = args.trim();
@@ -465,6 +493,11 @@ export default function piCowork(pi: ExtensionAPI): void {
         ctx.ui.notify(`已取消 #${task.id}：${task.cancellation!.reason}。历史和代码保留，相关依赖需复核。`, "info");
         return;
       }
+      const manageBranches = async () => {
+        const ledger = new WorkspaceLedger(board());
+        try { await showBranches(ctx, ledger, cwd, self.id); } finally { ledger.close(); }
+      };
+      if (command === 'branches') { await manageBranches(); return; }
       if (command === 'sides' || command.startsWith('sides ')) { await manageSides(command.slice(5).trim()); return; }
       if (command === 'audit') {
         const ledger = new WorkspaceLedger(board());
@@ -572,7 +605,7 @@ export default function piCowork(pi: ExtensionAPI): void {
         const task = board().read(Number(command.slice(5)), self.id);
         ctx.ui.notify(JSON.stringify({ warning, task }, null, 2), "info"); return;
       }
-      if (command && command !== "list") throw new Error("Usage: /cowork [sides [query]|audit|init|status|auto [on|off]|name <name>|read <id>|cancel <id> <reason>|remove [side-id]|takeover <side-id>]");
+      if (command && command !== "list") throw new Error("Usage: /cowork [sides [query]|branches|audit|init|status|auto [on|off]|name <name>|read <id>|cancel <id> <reason>|remove [side-id]|takeover <side-id>]");
       if (ctx.mode !== "tui") {
         ctx.ui.notify(JSON.stringify({ warning, ...board().list(self.id) }, null, 2), "info"); return;
       }
@@ -663,10 +696,10 @@ export default function piCowork(pi: ExtensionAPI): void {
               "Enter/Esc返回 ↑↓滚动",
               "Enter/Esc返回",
             ] : [
-              "Esc退出 m侧管理 s排序 ↑↓选任务 Enter详情 Tab本侧/全项目 PgUp/PgDn滚动 Home/End首尾 r刷新",
-              "Esc退出 m侧管理 s排序 ↑↓选择 Enter详情 Tab切换 PgUp/PgDn滚动",
-              "Esc退出 m侧管理 s排序 ↑↓ Enter Tab PgUp/PgDn",
-              "Esc退出 m侧管理 s排序 Enter详情",
+              "Esc退出 m侧管理 b分支 s排序 ↑↓选任务 Enter详情 Tab本侧/全项目 PgUp/PgDn滚动 Home/End首尾 r刷新",
+              "Esc退出 m侧管理 b分支 s排序 ↑↓选择 Enter详情 Tab切换 PgUp/PgDn滚动",
+              "Esc退出 m侧管理 b分支 s排序 ↑↓ Enter Tab PgUp/PgDn",
+              "Esc退出 m侧管理 b分支 s排序 Enter详情",
             ];
             const footer = keys.map((keys) => `${position} │ ${keys}`).find((text) => visibleWidth(text) <= innerWidth) ?? (detailTask ? "Esc返回" : "Esc退出");
             const userRequests = snapshot?.userRequestCount ?? 0;
@@ -696,6 +729,12 @@ export default function piCowork(pi: ExtensionAPI): void {
               return;
             }
             if (matchesKey(data, Key.escape)) { done(); return; }
+            if (data === 'b') {
+              if (managingSides) return;
+              managingSides = true;
+              void manageBranches().catch(error => ctx.ui.notify(String(error), 'error')).finally(() => { managingSides = false; tui.requestRender(); });
+              return;
+            }
             if (data === 'm') {
               if (managingSides) return;
               managingSides = true;

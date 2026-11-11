@@ -78,6 +78,8 @@ test("tool boundary binds identity to session, never accepts an actor from argum
     assert.equal(handlers.has("tool_call"), false);
     assert.equal(commands.has('cowork'), true);
     assert.equal(tools.has('cowork_branch'), true);
+    assert.equal(tools.has('cowork_cleanup'), true);
+    assert.match(commands.get('cowork').description, /branches/);
     assert.equal(commands.has('handoff'), false);
     assert.equal([...tools.keys()].some(name => name.startsWith('handoff_')), false);
     assert.doesNotMatch([...tools.values()].map(tool => tool.label).join('\n'), /handoff/i);

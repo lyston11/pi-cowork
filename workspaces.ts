@@ -434,8 +434,83 @@ export class WorkspaceLedger {
       return { branch, tip: expectedTip, state: 'retired', ref, disposition: status.state, remoteBranchRemoved: false };
     });
   }
-  async retire(cwd: string, actor: string, id: string, remove = false, missingTip?: string) {
+  async cleanupPlan(cwd: string, actor: string) {
+    const report = await this.reconcile(cwd, actor), target = integrationRepository(cwd);
+    const registered = this.all(target.repo);
+    const branches = report.branches.filter(b => b.branch !== 'refs/heads/main').map(b => {
+      const owners = registered.filter(w => w.branch === b.branch);
+      const workspace = owners.find(w => w.state === 'active' && w.path === b.worktree);
+      const reasons: string[] = [];
+      if (!owners.length) reasons.push('未登记归属与任务；由 Agent 核实后登记，或经逐条审查使用 cowork_branch，不批量猜测');
+      let action: 'branch' | 'workspace' = 'branch';
+      if (!report.remote || b.state === 'unknown') reasons.push('远端或提交证据不完整');
+      if (b.unaccountedCommits) reasons.push(`仍有 ${b.unaccountedCommits} 笔未交付或未保全提交`);
+      if (owners.some(w => w.owner !== actor)) reasons.push('归属其他侧，须由所属侧收口');
+      else for (const w of owners) {
+        if (w.tasks.some(id => !['closed', 'cancelled'].includes(this.store.read(id, actor).state))) reasons.push('关联任务尚未关闭');
+        if (this.db.prepare("SELECT 1 FROM handoff_integrations j JOIN handoff_deliveries d ON d.id=j.delivery_id WHERE d.workspace_id=? AND j.state IN ('queued','running','blocked')").get(w.id)) reasons.push('仍有待集成交付');
+        if (!b.worktree && w.state === 'active' && existsSync(w.path)) reasons.push('原工作树仍存在，须先核对登记');
+      }
+      if (b.worktree) {
+        action = 'workspace';
+        if (!workspace || workspace.owner !== actor) reasons.push('检出工作树未登记为本侧所有');
+        else {
+          const item = report.workspaces.find(w => w.workspace.id === workspace.id);
+          if (!report.complete || !item || 'error' in item) reasons.push('工作树对账不完整，保留现场');
+          else if (!item.eligibleForRetirement) reasons.push(...(item.blockers ?? []));
+          if (b.worktree === dirname(target.repo)) reasons.push('主检出不能删除');
+          if (!reasons.length) {
+            const occupied = workspaceOccupancy(b.worktree);
+            if (occupied) reasons.push(occupied);
+            if (this.store.sides().some(s => s.worktree === b.worktree && alive(s.pid))) reasons.push('仍有存活的 Pi 使用工作树');
+          }
+        }
+      }
+      return { ...b, owners: [...new Set(owners.map(w => w.owner))], workspaceId: workspace?.id ?? null,
+        action, eligible: reasons.length === 0, reasons: [...new Set(reasons)] };
+    });
+    const materials = this.materialCommits(cwd, actor);
+    const receipts = new Map(report.archivedBranches.map(b => [String(b.ref), String(b.branch)]));
+    const archives = list(await git(cwd, ['for-each-ref', '--format=%(refname) %(objectname)',
+      'refs/pi-cowork/materials/', 'refs/pi-cowork/retired/', 'refs/pi-cowork/deliveries/'])).map(row => {
+      const [ref, tip] = row.split(' ');
+      const kind = ref.startsWith('refs/pi-cowork/materials/') ? 'material' : ref.startsWith('refs/pi-cowork/retired/') ? 'retired' : 'delivery';
+      return { ref, tip, kind, branch: receipts.get(ref) ?? null, acceptedMaterial: kind === 'material' && materials.has(tip) };
+    });
+    return { remote: report.remote, branches, archives, remoteBranches: report.remoteBranches,
+      errors: report.errors, summary: { active: branches.length, eligible: branches.filter(b => b.eligible).length,
+        retained: branches.filter(b => !b.eligible).length, archived: archives.length, remote: report.remoteBranches.filter(b => b.branch !== 'refs/heads/main').length } };
+  }
+  async cleanup(cwd: string, actor: string, targets: { branch: string; expectedTip: string }[], note: string) {
+    if (!note.trim() || note.length > 4000 || !targets.length || targets.length > 50 || new Set(targets.map(t => t.branch)).size !== targets.length ||
+      targets.some(t => !t.branch.startsWith('refs/heads/') || t.branch === 'refs/heads/main' || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(t.expectedTip))) {
+      throw new Error('Provide 1-50 unique local task branches, exact reviewed tips and a cleanup review note; main is protected');
+    }
+    const plan = await this.cleanupPlan(cwd, actor);
+    const results: { branch: string; tip: string; state: 'retired' | 'retained'; reason?: string; ref?: string }[] = [];
+    for (const target of targets) {
+      try {
+        const item = plan.branches.find(b => b.branch === target.branch);
+        if (!item || item.tip !== target.expectedTip) throw new Error('Branch changed or disappeared since preview; review again');
+        if (!item.eligible) throw new Error(item.reasons.join('; '));
+        let ref: string;
+        if (item.action === 'workspace') {
+          await this.retire(cwd, actor, item.workspaceId!, true, undefined, { branch: item.branch, tip: item.tip });
+          ref = `refs/pi-cowork/retired/${item.workspaceId}`;
+        } else {
+          ref = (await this.retireBranch(cwd, actor, item.branch, item.tip, note)).ref;
+        }
+        results.push({ branch: item.branch, tip: item.tip, state: 'retired', ref });
+      } catch (error) {
+        results.push({ branch: target.branch, tip: target.expectedTip, state: 'retained', reason: String(error) });
+      }
+    }
+    return { results, retired: results.filter(r => r.state === 'retired').length,
+      retained: results.filter(r => r.state === 'retained').length, remoteBranchesRemoved: false };
+  }
+  async retire(cwd: string, actor: string, id: string, remove = false, missingTip?: string, reviewed?: { branch: string; tip: string }) {
     const w = this.read(id, actor);
+    if (reviewed && (w.state !== 'active' || w.branch !== reviewed.branch || await git(w.path, ['rev-parse', 'HEAD']) !== reviewed.tip)) throw new Error('Workspace changed since cleanup preview; nothing removed');
     if (w.state === 'retired') return w;
     if (missingTip !== undefined) {
       if (remove || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(missingTip)) throw new Error('Missing-worktree retirement requires an exact former commit and remove=false');
@@ -471,6 +546,7 @@ export class WorkspaceLedger {
     const sides = this.store.sides().filter(s => s.worktree === w.path && alive(s.pid));
     if (sides.length) throw new Error('A registered live Pi still owns this worktree; retire from another idle location');
     const tip = item.tip!;
+    if (reviewed && tip !== reviewed.tip) throw new Error('Workspace advanced since cleanup preview; nothing removed');
     await git(cwd, ['update-ref', `refs/pi-cowork/retired/${w.id}`, tip]);
     if (await git(w.path, ['rev-parse', 'HEAD']) !== tip || await git(w.path, ['status', '--porcelain=v1', '-uall', '--ignored']) || await git(w.path, ['symbolic-ref', '-q', 'HEAD']) !== w.branch) throw new Error('Workspace changed during retirement; nothing removed');
     if (remove) {
