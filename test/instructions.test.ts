@@ -44,7 +44,9 @@ test("event scope keeps summary safeguards and never equates listed with read", 
   assert.match(COWORK_RULES, /同一状态且条件具备/);
   assert.match(COWORK_RULES, /高优先级不解除阻塞/);
   assert.match(COWORK_RULES, /不逐单索取“批准继续”/);
-  assert.match(COWORK_RULES, /不能引用 Agent 自建的审批任务充当依据/);
+  assert.match(COWORK_RULES, /审批与实施决策由 Agent 在用户委托范围内自行解决/);
+  assert.match(COWORK_RULES, /也不改成聊天或通知索批/);
+  assert.match(COWORK_RULES, /旧审批请求交回 Agent 撤下等待并继续实施/);
   assert.match(COWORK_RULES, /其余任务引用依赖，不逐层重复索批/);
   assert.match(COWORK_RUNTIME_RULES, /无需用户再说“继续”/);
   assert.match(COWORK_RUNTIME_RULES, /不能把升级复核本身交给用户批准/);

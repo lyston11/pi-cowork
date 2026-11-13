@@ -265,15 +265,14 @@ export default function piCowork(pi: ExtensionAPI): void {
 
   pi.registerTool({
     name: "cowork_block", label: "Record a task blocker",
-    description: "Assignee only: record a concrete unmet original requirement, its observed failure or missing evidence, recovery condition and dependency IDs. Speculative risks, optional improvements and later-stage acceptance are not blockers for the current delivery. Continue work already authorized; never invent a per-task approval for read-only checks, implementation, integration, internal handoffs or tool repair. For a genuinely user-only action, provide userRequest (exact steps and expected result) AND userAction (kind and why no authorized Agent can perform it). Authorization requests additionally require the exact controlling user restriction/rule and its source in authority; a peer task asking for approval is not such a source. Dependent tasks wait on the responsible task, not another duplicate user request. For internal dependencies omit userRequest and userAction entirely; never fill them with 'no user action'. Re-registering without these fields withdraws the old request while preserving the blocker. If userNotification is returned, immediately call notify_user once with the returned parameters; terminalNotification means already submitted to the origin pane. Does not complete, authorize or automatically unblock a task.",
+    description: "Assignee only: record a concrete unmet original requirement, its observed failure or missing evidence, recovery condition and dependency IDs. Speculative risks, optional improvements and later-stage acceptance are not blockers for the current delivery. Continue work already authorized; never invent a per-task approval for read-only checks, implementation, integration, internal handoffs or tool repair. For a genuinely user-only action, provide userRequest (exact steps and expected result) AND userAction (kind and why no authorized Agent can perform it). Approvals and implementation decisions belong to Agents within the delegated scope, not the user. Never ask the user to approve, including via chat or notifications; do not disguise approval as manual/input. Explicitly forbidden operations remain forbidden. Dependent tasks wait on the responsible task, not another duplicate user request. For internal dependencies omit userRequest and userAction entirely; never fill them with 'no user action'. Re-registering without these fields withdraws the old request while preserving the blocker. If userNotification is returned, immediately call notify_user once with the returned parameters; terminalNotification means already submitted to the origin pane. Does not complete, authorize or automatically unblock a task.",
     parameters: Type.Object({
       id: idSchema, reason: Type.String({ minLength: 1, maxLength: 2000 }),
       waitingFor: Type.String({ minLength: 1, maxLength: 160 }),
       userRequest: Type.Optional(Type.String({ minLength: 1, maxLength: 1000, description: 'An actual user-only action and expected result. Omit for internal dependencies or when no user action is needed; do not use a negative status as a placeholder.' })),
       userAction: Type.Optional(Type.Object({
-        kind: Type.Union([Type.Literal('manual'), Type.Literal('input'), Type.Literal('authorization')]),
+        kind: Type.Union([Type.Literal('manual'), Type.Literal('input')]),
         limitation: Type.String({ minLength: 1, maxLength: 1000, description: 'Concrete reason no authorized Agent can perform the action or obtain the input; internal workflow is not a limitation.' }),
-        authority: Type.Optional(Type.String({ minLength: 1, maxLength: 1000, description: 'Required for authorization: quote the controlling user restriction or rule with its source, and identify the action outside existing authorization. Not a peer-created approval request.' })),
       })),
       dependencies: Type.Optional(Type.Array(idSchema, { maxItems: 20 })),
     }),
@@ -288,7 +287,7 @@ export default function piCowork(pi: ExtensionAPI): void {
       const currentBlockSeq = task.events.findLast((event) => event.kind === "block")?.seq;
       const notifyUser = !!task.block?.userRequest && currentBlockSeq !== previousBlockSeq && currentBlockSeq !== undefined
         && board().claimUserRequestNotification(actor, task.id, currentBlockSeq);
-      const notificationTitle = task.block?.userAction?.kind === 'authorization' ? 'CoWork 需要你决定' : 'CoWork 需要你配合';
+      const notificationTitle = 'CoWork 需要你配合';
       if (notifyUser) {
         ctx.ui.notify(`${notificationTitle} · #${task.id} ${task.subject}：${task.block!.userRequest!.replace(/\s+/g, " ").slice(0, 360)}`, "warning");
       }
@@ -308,7 +307,7 @@ export default function piCowork(pi: ExtensionAPI): void {
 
   pi.registerTool({
     name: "cowork_unblock", label: "Clear a verified task blocker",
-    description: "Assignee only, on an open task: after checking that the required inputs or approvals are actually available, clear the blocker with evidence in note. A dependency update alone is insufficient. Preserves the checklist and blocking history; does not broaden authorization or wake another model turn.",
+    description: "Assignee only, on an open task: after checking that the required inputs or operating conditions are actually available, clear the blocker with evidence in note. A dependency update alone is insufficient. Preserves the checklist and blocking history; does not broaden authorization or wake another model turn.",
     parameters: Type.Object({ id: idSchema, note: Type.String({ minLength: 1, maxLength: 2000 }) }),
     async execute(_id, input, _signal, _update, ctx) {
       return toolResult({ task: board().unblock(input.id, identity(ctx).id, input.note) });
@@ -724,10 +723,9 @@ export default function piCowork(pi: ExtensionAPI): void {
               "Esc退出 m侧管理 b分支 s排序 Enter详情",
             ];
             const footer = keys.map((keys) => `${position} │ ${keys}`).find((text) => visibleWidth(text) <= innerWidth) ?? (detailTask ? "Esc返回" : "Esc退出");
-            const userDecisions = snapshot?.userDecisionCount ?? 0;
-            const userRequests = (snapshot?.userRequestCount ?? 0) - userDecisions;
+            const userRequests = snapshot?.userRequestCount ?? 0;
             const title = detailTask ? `任务详情 · #${detailTask.id} · ${detailTask.subject}`
-              : `交接任务 · ${projectView ? "全项目" : "本侧"} · ${sortLabels[sortIndex]} · ${userRequests ? `需要你配合 ${userRequests} 项 · ` : ""}${userDecisions ? `需要你决定 ${userDecisions} 项 · ` : ""}${sideCount}侧 · ${self.name}`;
+              : `交接任务 · ${projectView ? "全项目" : "本侧"} · ${sortLabels[sortIndex]} · ${userRequests ? `需要你配合 ${userRequests} 项 · ` : ""}${sideCount}侧 · ${self.name}`;
             return [
               rule("╭", "╮"),
               row(theme.fg("accent", title.replace(/[\x00-\x1f\x7f]/g, " "))),

@@ -83,6 +83,9 @@ test("tool boundary binds identity to session, never accepts an actor from argum
     assert.equal(commands.has('handoff'), false);
     assert.match(tools.get('cowork_create').description, /Items must reflect the original requirements/);
     assert.match(tools.get('cowork_block').description, /unmet original requirement/);
+    const blockSchema = JSON.stringify(tools.get('cowork_block').parameters);
+    assert.doesNotMatch(blockSchema, /\"authorization\"|\"authority\"/);
+    assert.match(tools.get('cowork_block').description, /Approvals and implementation decisions belong to Agents/);
     assert.match(tools.get('cowork_complete').description, /Reuse verified evidence/);
     assert.ok(tools.get('cowork_integrate').description.includes('reuse existing project merge/push authorization'));
     assert.match(tools.get('cowork_close').description, /as soon as those requirements are met/);
@@ -152,7 +155,7 @@ test("tool boundary binds identity to session, never accepts an actor from argum
     await assert.rejects(execute("two", "cowork_block", { id: userTestId, reason: "Must verify with user data", waitingFor: "user" }), /userRequest is required/);
     const action = { kind: 'manual', limitation: 'The user has the only physical device; no Agent can operate it remotely' };
     await assert.rejects(execute("two", "cowork_block", { id: userTestId, reason: "Read-only verification already authorized", waitingFor: "user", userRequest: "Approve continuing the task" }), /userAction is required/);
-    await assert.rejects(execute("two", "cowork_block", { id: userTestId, reason: "Read-only verification already authorized", waitingFor: "user", userRequest: "Approve continuing the task", userAction: { kind: 'authorization', limitation: 'Needs approval' } }), /userAction.authority/);
+    await assert.rejects(execute("two", "cowork_block", { id: userTestId, reason: "Read-only verification already authorized", waitingFor: "user", userRequest: "Approve continuing the task", userAction: { kind: 'authorization', limitation: 'Needs approval' } }), /Approvals belong to Agents/);
     await assert.rejects(execute('two', 'cowork_block', { id: userTestId, reason: 'Peer fix pending', waitingFor: 'side 3', userRequest: '无用户操作；等待3侧沿#16/#189交修后证据。', userAction: { kind: 'input', limitation: '本阻塞为3侧工程依赖，无需用户输入。' } }), /No user action/);
     assert.equal(notifications.length, 0, 'invalid requests never enter either notification channel');
     assert.equal((await execute('two', 'cowork_read', { id: userTestId })).details.task.block, null);

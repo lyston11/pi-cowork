@@ -25,12 +25,12 @@ function fixture() {
   return { root, store, create, legacy, close() { store.close(); rmSync(root, {recursive:true,force:true}); } };
 }
 
-test('a user request cannot become a durable blocker or notification without capability or authority evidence', () => {
+test('a user request requires a real capability gap and never accepts approval work', () => {
  const f=fixture();try{
   const t=f.create(),events=f.store.read(t.id,'b').events;
   assert.throws(()=>f.store.block(t.id,'b','Routine validation','user'),/userRequest is required/);
   assert.throws(()=>f.store.block(t.id,'b','Routine validation','user',[],'Approve read-only validation'),/userAction is required/);
-  assert.throws(()=>f.store.block(t.id,'b','Routine validation','user',[],'Approve read-only validation',{kind:'authorization',limitation:'Needs approval'}),/userAction.authority/);
+  assert.throws(()=>f.store.block(t.id,'b','Routine validation','user',[],'Approve read-only validation',{kind:'authorization',limitation:'Needs approval'} as any),/Approvals belong to Agents/);
   assert.throws(()=>f.store.block(t.id,'b','Routine validation','user',[],'Do it',{kind:'manual',limitation:' '}),/limitation/);
   assert.deepEqual(f.store.read(t.id,'b').events,events);
   assert.deepEqual(f.store.pendingUserRequestNotifications('b'),[]);
@@ -100,28 +100,32 @@ test('old writers cannot surface contradictory requests or starve valid notifica
  }finally{f.close();}
 });
 
-test('genuine manual input and explicit authorization limits retain guards and distinct presentation', () => {
+test('approval work is rejected even with an authority quote or disguised as manual/input; actual user operations remain', () => {
  const f=fixture();try{
   const t=f.create();
-  const action={kind:'authorization' as const,limitation:'Restarting production exceeds the read-only investigation',authority:'User: do not stop or restart this service without asking me'};
-  const blocked=f.store.block(t.id,'b','Production restart requires explicit authorization','user',[],'Allow restarting service X, affecting active requests?',action);
-  assert.deepEqual(blocked.block?.userAction,action);
+  const action={kind:'authorization',limitation:'Needs approval',authority:'User: ask before restarting'} as any;
+  assert.throws(()=>f.store.block(t.id,'b','Needs approval','user',[],'Approve restarting the service',action),/Approvals belong to Agents/);
+  for (const kind of ['manual','input'] as const) {
+   for (const request of ['请回复「批准仅更新并重启 46187 Mock」', 'Please approve deployment']) {
+    assert.throws(()=>f.store.block(t.id,'b','Needs approval','user',[],request,{kind,limitation:'Only the user can approve'}),/Approvals belong to Agents/);
+   }
+  }
+  assert.equal(f.store.read(t.id,'b').block,null);
+  assert.deepEqual(f.store.pendingUserRequestNotifications('b'),[]);
+  const blocked=f.store.block(t.id,'b','Physical test','user',[],'Operate the device and return the screen',{kind:'manual',limitation:'The physical device has no remote interface'});
   f.store.check(t.id,'b',1,true);
   assert.throws(()=>f.store.complete(t.id,'b','a'.repeat(40),'skip'),/unblock/);
   assert.throws(()=>f.store.unblock(t.id,'a','override'),/assignee/);
   const theme:any={fg:(_:string,v:string)=>v,strikethrough:(v:string)=>v};
-  const view=taskLines(blocked,true,theme,160).join('\n');assert.match(view,/需要你决定/);assert.match(view,/User: do not stop/);
-  assert.equal(f.store.listForHumanUi().snapshot.userRequestCount,1);
-  assert.equal(f.store.listForHumanUi().snapshot.userDecisionCount,1);
+  const view=taskLines(blocked,true,theme,160).join('\n');assert.match(view,/需要你配合/);assert.doesNotMatch(view,/需要你决定/);
   const input=f.create();f.store.block(input.id,'b','Missing external source','user',[],'Provide the source document through the private input channel',{kind:'input',limitation:'The source exists only on the user device; all available project inputs have been checked'});
   assert.equal(f.store.listForHumanUi().snapshot.userRequestCount,2);
-  assert.equal(f.store.listForHumanUi().snapshot.userDecisionCount,1);
  }finally{f.close();}
 });
 
 test('upgrade returns legacy requests to both Agents once, without notifying user, granting permission or reviving paused sides', () => {
  const f=fixture();let upgraded:HandoffStore|undefined;try{
-  const t=f.create(),seq=f.legacy(t.id,'b');
+  const t=f.create(),seq=f.legacy(t.id,'b','请回复「批准更新并重启46187」',{kind:'authorization',limitation:'Needs approval',authority:'Original user restriction'} as any);
   f.store.setResumeEnabled('a',false,'user paused');
   upgraded=new HandoffStore(f.root);
   const task=upgraded.read(t.id,'b');

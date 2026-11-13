@@ -22,16 +22,20 @@ function isUserWaiting(value: string): boolean {
 const userActionEvidenceSql = 'cowork_valid_user_request(e.data_json)=1';
 
 function validateUserAction(action: UserAction | undefined): asserts action is UserAction {
-  if (!action || !['manual', 'input', 'authorization'].includes(action.kind)) {
-    throw new Error('userAction is required: identify manual operation, unavailable input, or a genuine authorization boundary. Routine work within existing authorization must continue without asking the user to approve again.');
+  if (!action || !['manual', 'input'].includes(action.kind)) {
+    throw new Error('userAction is required and only accepts manual or input. Approvals belong to Agents, not the user; do not turn them into user requests or relabel them as manual/input.');
   }
   text(action.limitation, 'userAction.limitation: why no authorized Agent can do this', 1000);
-  if (action.kind === 'authorization') text(action.authority, 'userAction.authority: exact user restriction or governing rule and its source; a task asking for approval is not authority', 1000);
 }
 
 function validateUserRequest(value: unknown, action: UserAction | undefined): void {
   const request = text(value, 'User action request', 1000);
   validateUserAction(action);
+  const approval = /^\s*(?:(?:请|麻烦)(?:你|您)?\s*)?(?:(?:回复|答复)\s*)?[“"'「]?(?:批准|授权|同意)(?:仅|本次|继续|执行|实施|更新|发布|部署|重启|合并|推进)/;
+  const approvalEnglish = /^\s*(?:please\s+)?(?:(?:reply|respond)\s+(?:with\s+)?["']?)?(?:approve|authori[sz]e|decide whether to|give (?:your )?(?:approval|permission))\b/i;
+  if (approval.test(request) || approvalEnglish.test(request)) {
+    throw new Error('Approvals belong to Agents, not the user. Continue the delegated work; userRequest is only for an actual user-only operation or unavailable input.');
+  }
   const content = `${request.trim()}\n${action.limitation.trim()}`;
   // Reject explicit denials, not incidental words such as “无需重装” or
   // “没有用户操作权限”. This is a contradiction guard, not an authorization judge.
@@ -65,7 +69,6 @@ export interface HumanTaskSnapshot {
   eventSeq: number;
   actor?: string;
   userRequestCount?: number;
-  userDecisionCount?: number;
 }
 
 export interface ResumeEvent {
@@ -887,12 +890,11 @@ export class HandoffStore {
         ${options.actor === undefined ? "" : "WHERE creator=? OR assignee=?"} ORDER BY ${order}`)
           .all(eventSeq, eventSeq, eventSeq, ...(options.actor === undefined ? [] : [options.actor, options.actor]));
         const userRequestScope = options.actor === undefined ? "" : " AND (t.creator=? OR t.assignee=?)";
-        const userCounts = this.db.prepare(`SELECT COUNT(*) AS count,
-          COALESCE(SUM(CASE WHEN json_extract(e.data_json,'$.userAction.kind')='authorization' THEN 1 ELSE 0 END),0) AS decisions FROM handoff_tasks t
+        const userCounts = this.db.prepare(`SELECT COUNT(*) AS count FROM handoff_tasks t
           JOIN handoff_task_events e ON e.seq=(SELECT seq FROM handoff_task_events WHERE task_id=t.id AND seq<=?
             AND kind IN ('block','unblock','complete','close','reopen','cancel') ORDER BY seq DESC LIMIT 1)
           WHERE e.kind='block' AND ${userRequestAtSnapshot}${userRequestScope}`).get(eventSeq, ...(options.actor === undefined ? [] : [options.actor, options.actor]))!;
-        snapshot = { ids: rows.map((row) => Number(row.id)), eventSeq, actor: options.actor, userRequestCount: Number(userCounts.count), userDecisionCount: Number(userCounts.decisions) };
+        snapshot = { ids: rows.map((row) => Number(row.id)), eventSeq, actor: options.actor, userRequestCount: Number(userCounts.count) };
         this.db.exec("COMMIT");
       } catch (error) { this.db.exec("ROLLBACK"); throw error; }
     }
@@ -951,7 +953,7 @@ export class HandoffStore {
           WHERE task_id=? AND kind IN ('complete','close','reopen','cancel','reply')`).get(dependency)!;
         return { id: dependency, seq: Number(latest.seq) };
       }).sort((a, b) => a.id - b.id);
-      const data = { reason, waitingFor, dependencies, ...(effectiveUserRequest ? { userRequest: effectiveUserRequest, userAction: { kind: userAction!.kind, limitation: userAction!.limitation, ...(userAction!.kind === 'authorization' ? { authority: userAction!.authority } : {}) } } : {}) };
+      const data = { reason, waitingFor, dependencies, ...(effectiveUserRequest ? { userRequest: effectiveUserRequest, userAction: { kind: userAction!.kind, limitation: userAction!.limitation } } : {}) };
       const previous = task.events.findLast((event) => event.kind === "block");
       if (task.block && JSON.stringify(previous?.data) === JSON.stringify(data)) return task;
       const event = this.db.prepare("INSERT INTO handoff_task_events(task_id,actor,kind,data_json,at) VALUES(?,?,'block',?,?)")

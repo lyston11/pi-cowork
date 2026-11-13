@@ -8,7 +8,6 @@ import { HandoffStore } from "../store.ts";
 import { EventResume } from "../resume.ts";
 
 const manualAction = { kind: 'manual' as const, limitation: 'Only the user can operate the physical Windows test device; no remote interface exists' };
-const approvalAction = { kind: 'authorization' as const, limitation: 'Production restart is outside the authorized read-only work', authority: 'User instruction: do not restart any service without my explicit approval' };
 
 function fixture() {
   const root = mkdtempSync(join(tmpdir(), "pi-cowork-resume-"));
@@ -237,7 +236,7 @@ test('blocked and dependency signals retain their specific safety reminders', ()
   const f = fixture(), d = dispatcher(f);
   try {
     const dependency = f.create(f.b.id, f.a.id);
-    f.peer.block(dependency.id, f.a.id, 'needs user approval', 'user', [], 'Decide whether to restart the production service', approvalAction);
+    f.peer.block(dependency.id, f.a.id, 'needs physical device result', 'user', [], 'Run the device test and report the result', manualAction);
     d.resume.tick();
     assert.match(d.sent[0].content, /blocked：发起方复核/);
     assert.match(d.sent[0].content, /其余只读新增、变化或仍可执行项/);
@@ -246,7 +245,7 @@ test('blocked and dependency signals retain their specific safety reminders', ()
     d.persist(d.sent[0]); d.resume.tick();
     const own = f.create();
     f.peer.block(own.id, f.b.id, 'needs input', f.a.name, [dependency.id]);
-    f.peer.unblock(dependency.id, f.a.id, 'approval verified');
+    f.peer.unblock(dependency.id, f.a.id, 'device result verified');
     f.complete(dependency.id, f.a.id);
     d.resume.tick();
     assert.match(d.sent.at(-1).content, /依赖变化先验证材料和授权/);
@@ -278,7 +277,7 @@ test('blocked report targets only that report, not stable blocked or waiting tas
   const f = fixture(), d = dispatcher(f);
   try {
     const stable = f.create();
-    f.peer.block(stable.id, f.b.id, 'approval unchanged', 'user', [], 'Decide whether to restart the production service', approvalAction);
+    f.peer.block(stable.id, f.b.id, 'device result still missing', 'user', [], 'Run the device test and report the result', manualAction);
     const waiting = f.create(); f.complete(waiting.id);
     f.create(f.b.id, f.a.id); // Sent work is not this side's implementation duty.
     const target = f.create(f.b.id, f.a.id);
@@ -397,7 +396,7 @@ test("checkpoints leave recorded blockers alone and recheck changed dependencies
     assert.deepEqual(f.store.reconcileResume(f.b.id, "b"), { queued: [], stalled: [] });
     f.complete(dependency.id, f.a.id);
     assert(f.store.reconcileResume(f.b.id, "b").queued.includes(task.id));
-    f.store.block(task.id, f.b.id, "Delivered input still lacks approval", "user", [], 'Decide whether to restart the production service', approvalAction);
+    f.store.block(task.id, f.b.id, "Delivered input still lacks device result", "user", [], 'Run the device test and report the result', manualAction);
     assert(!f.store.pendingResume(f.b.id, "b")!.events.some(e => e.taskId === task.id));
     assert(!f.store.reconcileResume(f.b.id, "b").stalled.includes(task.id));
   } finally { f.cleanup(); }
@@ -428,7 +427,7 @@ test("startup and settled checkpoints resume once, warn without looping, and sur
       restored.resume.runStarted(); restored.resume.settled(false);
       assert.equal(restored.sent.length, 1, "real progress permits a new completion checkpoint");
       restored.persist(restored.sent[0]); restored.resume.tick();
-      f.peer.block(task.id, f.b.id, "Need explicit approval", "user", [], 'Decide whether to restart the production service', approvalAction);
+      f.peer.block(task.id, f.b.id, "Need physical device result", "user", [], 'Run the device test and report the result', manualAction);
       restored.resume.runStarted(); restored.resume.settled(false);
       assert.equal(restored.sent.length, 1, "a genuine recorded blocker stops cleanly");
     } finally { restored.resume.stop(); }

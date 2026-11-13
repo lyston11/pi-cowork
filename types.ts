@@ -1,4 +1,4 @@
-export const HANDOFF_EXTENSION_VERSION = "5.4.5";
+export const HANDOFF_EXTENSION_VERSION = "5.4.6";
 
 export interface Side {
   id: string;
@@ -14,9 +14,8 @@ export type TaskPriority = "urgent" | "high" | "normal" | "low";
 export type TaskState = "open" | "completed" | "closed" | "cancelled";
 export type TaskKind = "local" | "handoff";
 export interface UserAction {
-  kind: "manual" | "input" | "authorization";
+  kind: "manual" | "input";
   limitation: string;
-  authority?: string;
 }
 export interface TaskBlock {
   reason: string;
