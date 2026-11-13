@@ -32,6 +32,71 @@ function fixture() {
     close(){queue.close();ledger.close();store.close();rmSync(root,{recursive:true,force:true});}};
 }
 
+async function replacedDelivery(f: ReturnType<typeof fixture>) {
+  await f.ledger.configure(f.repo, 'a', f.base, f.checks, 'Review test baseline');
+  const old = f.branch('old'), task = f.task();
+  f.commit(old, 'operations.md');
+  const tip = f.commit(old, 'implementation.ts'), previous = await f.deliver(old, task.id, tip);
+  f.git(f.repo, 'branch', 'task/returned', tip);
+  f.store.reopen(task.id, 'a', 'Replay implementation only; preserve the old material history');
+  const clean = f.branch('clean'); f.git(clean, 'cherry-pick', tip);
+  const current = await f.deliver(clean, task.id, f.git(clean, 'rev-parse', 'HEAD'));
+  f.enqueue(task.id, current); await f.consume();
+  return { task, tip, previous, current, old, clean,
+    accept: () => f.store.closeTask(task.id, 'a', current.tip, 'Reviewed replacement on remote main') };
+}
+
+test('automatic closeout archives exact superseded task aliases and retires accepted idle workspaces', async () => {
+  const f = fixture(); try {
+    const d = await replacedDelivery(f);
+    assert.equal((await f.ledger.cleanupPlan(f.repo, 'b')).branches.find(b => b.branch === 'refs/heads/task/returned')!.eligible, false, 'pushed is not accepted');
+    d.accept();
+    const plan = await f.ledger.cleanupPlan(f.repo, 'b'), alias = plan.branches.find(b => b.branch === 'refs/heads/task/returned')!;
+    assert.equal(alias.state, 'superseded-delivery'); assert.equal(alias.eligible, true);
+    const occupied = workspaceOccupancy(d.clean);
+    assert.equal(plan.branches.find(b => b.branch === 'refs/heads/clean')!.eligible, !occupied, JSON.stringify(plan.branches));
+    assert.equal(alias.delivery!.deliveries[0].replacement, d.current.tip);
+    assert.equal(alias.unaccountedCommits, 1, 'unintegrated operations are archived, never called integrated');
+    assert.equal((await f.ledger.cleanupPlan(f.repo, 'c')).branches.find(b => b.branch === alias.branch)!.eligible, false);
+    const before = f.git(f.remote, 'rev-parse', 'main');
+    const result = await f.ledger.automaticCleanup(f.repo, 'b', await f.ledger.reconcile(f.repo, 'b'));
+    assert.equal(result.retired, occupied ? 1 : 2, JSON.stringify(result));
+    assert.throws(() => f.git(f.repo, 'rev-parse', '--verify', alias.branch));
+    assert.equal(existsSync(d.clean), !!occupied, 'incomplete occupancy evidence preserves the worktree');
+    assert.equal(existsSync(d.old), true, 'unintegrated checked-out history remains untouched');
+    assert.equal(f.git(f.repo, 'show', `${d.previous.ref}:operations.md`), 'operations.md');
+    assert.equal(f.git(f.remote, 'rev-parse', 'main'), before);
+    const after = await f.ledger.cleanupPlan(f.repo, 'b');
+    assert.equal(after.archives.find(a => a.ref === d.previous.ref)!.disposition, 'superseded-delivery');
+    assert.equal((await f.ledger.automaticCleanup(f.repo, 'b')).retired, 0, 'repeat ticks are idempotent');
+  } finally { f.close(); }
+});
+
+test('automatic closeout retains modified aliases, missing evidence, unrelated refs, other owners and live worktrees', async () => {
+  const f = fixture(); try {
+    const d = await replacedDelivery(f); d.accept();
+    f.store.register({ id: 'live', name: 'live', sessionId: 'live', pid: process.pid, worktree: d.clean, branch: 'clean' });
+    f.git(f.repo, 'branch', 'release/keep', d.tip);
+    const advanced = f.commit(d.old, 'undelivered.ts');
+    f.git(f.repo, 'update-ref', 'refs/heads/task/returned', advanced, d.tip);
+    assert.equal((await f.ledger.automaticCleanup(f.repo, 'b')).retired, 0, 'exact tip, not ancestor or branch name');
+    f.git(f.repo, 'update-ref', 'refs/heads/task/returned', d.tip, advanced);
+    f.git(f.repo, 'update-ref', '-d', d.previous.ref, d.tip);
+    assert.equal((await f.ledger.automaticCleanup(f.repo, 'b')).retired, 0, 'frozen snapshot ref must still exist');
+    f.git(f.repo, 'update-ref', d.previous.ref, d.tip);
+    assert.equal((await f.ledger.automaticCleanup(f.repo, 'a')).retired, 0, 'creator cannot delete assignee branches');
+    const preview = await f.ledger.cleanupPlan(f.repo, 'b');
+    f.git(f.repo, 'update-ref', 'refs/heads/task/returned', advanced, d.tip);
+    const stale = await f.ledger.cleanup(f.repo, 'b', [{ branch: 'refs/heads/task/returned', expectedTip: d.tip }], 'stale preview', preview);
+    assert.equal(stale.retired, 0); assert.match(stale.results[0].reason!, /advanced/);
+    assert.equal(f.git(f.repo, 'rev-parse', 'refs/heads/release/keep'), d.tip);
+    assert.equal(existsSync(d.clean), true);
+    f.git(f.repo, 'update-ref', 'refs/heads/task/returned', d.tip, advanced);
+    f.git(f.repo, 'remote', 'set-url', 'origin', 'https://127.0.0.1:1/missing.git');
+    assert.equal((await f.ledger.automaticCleanup(f.repo, 'b')).retired, 0, 'no stale remote proof');
+  } finally { f.close(); }
+});
+
 test('audit uses one remote snapshot, one file scan per worktree and one material ref enumeration', async () => {
  const f=fixture(), previous=process.env.GIT_TRACE2_EVENT;try{
   const path=f.branch('registered');await f.ledger.register(path,'b');

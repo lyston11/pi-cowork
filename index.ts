@@ -58,6 +58,7 @@ export default function piCowork(pi: ExtensionAPI): void {
   let activeSide: Side | undefined;
   let integrationWorker: IntegrationWorker | undefined;
   let auditRun: Promise<void> | undefined;
+  let auditTimer: ReturnType<typeof setInterval> | undefined;
   const audit = (ctx: ExtensionContext) => {
     if (auditRun || ctx.mode !== 'tui' && ctx.mode !== 'rpc') return;
     auditRun = (async () => {
@@ -68,6 +69,11 @@ export default function piCowork(pi: ExtensionAPI): void {
           const mainSync = await ledger.syncMain(cwd);
           if (mainSync.state === 'synced' || mainSync.state === 'current') { report.mainDifference = [0, 0]; report.localMainStatus = { ...report.localMainStatus, state: 'current', head: report.remote, difference: [0, 0], reason: null }; }
         }
+        const cleanup = board().resumeStatus(actor).enabled ? await ledger.automaticCleanup(cwd, actor, report) : null;
+        const retired = new Set(cleanup?.results.filter(r => r.state === 'retired').map(r => r.branch));
+        if (cleanup?.retired) ctx.ui.notify(`CoWork 已自动清理 ${cleanup.retired} 个本侧已完成分支；原提交与归档引用保留。`, 'info');
+        report.unregistered = report.unregistered.filter(b => !retired.has(b.branch));
+        report.workspaces = report.workspaces.filter(w => !retired.has(w.workspace.branch));
         if (report.changed && (!report.complete || report.outsideQueue.length || report.mainDifference?.some(n => n > 0) || report.unregistered.some(b => b.unintegrated === null || b.unintegrated.length) || report.detached.some(w => w.unintegrated === null || w.unintegrated.length) || report.remoteBranches.some(b => b.branch !== 'refs/heads/main' && (b.unintegrated === null || b.unintegrated.length)) || report.workspaces.some(w => 'blockers' in w && w.blockers?.length))) ctx.ui.notify('CoWork 工作区对账有未收口项；用 cowork_reconcile 或 /cowork audit 查看。关单不代表分支可删除。', 'warning');
       } catch { /* No Git origin: task handoffs remain available. Explicit audits report errors. */ }
       finally { ledger.close(); }
@@ -115,8 +121,18 @@ export default function piCowork(pi: ExtensionAPI): void {
       resume.start();
     }
   };
-  pi.on("session_start", (_event, ctx) => { startResume(ctx); try { startIntegration(); } catch { /* No origin: handoffs still work without integration. */ } audit(ctx); });
-  pi.on("session_shutdown", async () => { const self = activeSide; resume?.stop(); resume = undefined; if (self) store?.release(self); activeSide = undefined; await integrationWorker?.stop(); integrationWorker = undefined; await auditRun; store?.close(); store = undefined; });
+  pi.on("session_start", (_event, ctx) => {
+    startResume(ctx); try { startIntegration(); } catch { /* No origin: handoffs still work without integration. */ }
+    audit(ctx);
+    if (auditTimer) clearInterval(auditTimer);
+    if (ctx.mode === 'tui' || ctx.mode === 'rpc') {
+      // Closing a task on another side or releasing a worktree must not require
+      // a new model turn. Reuse the serialized audit; never wake a paused Agent.
+      auditTimer = setInterval(() => { if (ctx.isIdle() && activeSide && board().resumeStatus(activeSide.id).enabled) audit(ctx); }, 60_000);
+      auditTimer.unref();
+    }
+  });
+  pi.on("session_shutdown", async () => { if (auditTimer) clearInterval(auditTimer); auditTimer = undefined; const self = activeSide; resume?.stop(); resume = undefined; if (self) store?.release(self); activeSide = undefined; await integrationWorker?.stop(); integrationWorker = undefined; await auditRun; store?.close(); store = undefined; });
   pi.on("agent_start", () => { resume?.runStarted(); });
   pi.on("message_end", (event) => { resume?.observeMessage(event.message); });
   pi.on("agent_settled", (event, ctx) => { resume?.settled(event.aborted); audit(ctx); });
@@ -357,7 +373,7 @@ export default function piCowork(pi: ExtensionAPI): void {
   });
   pi.registerTool({
     name: "cowork_branch", label: "Retire a reconciled local task branch",
-    description: "Within existing cleanup authorization, retire one reviewed local branch by its full refs/heads name and exact tip. Requires no checkout, no other owner, no open registered tasks or pending integrations. Every unique commit must have its patch on remote main or belong to an accepted, closed material task; materialTasks can preserve historical material deliveries first. Keeps an archive ref and audit receipt before compare-deleting the branch. Never removes worktrees, main or remote branches; use cowork_workspace for checked-out workspaces.",
+    description: "Within existing cleanup authorization, retire one reviewed local branch by its full refs/heads name and exact tip. Requires no checkout, no other owner, no open registered tasks or pending integrations. Exact task/ aliases of a frozen delivery may be archived as superseded after its replacement is closed and integrated; the original snapshot must remain intact. Otherwise every unique commit must have its patch on remote main or belong to an accepted, closed material task; materialTasks can preserve historical material deliveries first. Keeps an archive ref and audit receipt before compare-deleting the branch. Never removes worktrees, main or remote branches; use cowork_workspace for checked-out workspaces.",
     parameters: Type.Object({ branch: Type.String({ minLength: 12, maxLength: 1024 }), expectedTip: Type.String({ minLength: 40, maxLength: 64 }), note: Type.String({ minLength: 1, maxLength: 4000 }), materialTasks: Type.Optional(Type.Array(idSchema, { maxItems: 50 })) }),
     async execute(_id, input, _signal, _update, ctx) {
       const actor = identity(ctx).id, ledger = new WorkspaceLedger(board());
@@ -453,7 +469,7 @@ export default function piCowork(pi: ExtensionAPI): void {
       try {
         const material = task.requiresIntegration ? undefined : await ledger.preserveMaterial(cwd, actor, input.id, commitHash(input.commit));
         return toolResult({ task: board().closeTask(input.id, actor, commitHash(input.commit), input.note), ...(material ? { material } : {}),
-          branchCloseout: 'Task accepted, branch closeout is still separate. Within existing cleanup authorization, the owning side must use cowork_cleanup preview, then apply eligible exact tips; report retained items and reasons. Do not stop at a read-only audit or transfer own cleanup to another side.' });
+          branchCloseout: 'Task accepted. The owning side automatically retires eligible completed branches on startup, settle and idle checks. Exact frozen task/ aliases of superseded deliveries are archived once their replacement is accepted on remote main. Use cowork_cleanup preview for retained reasons; never delete occupied worktrees or transfer own cleanup to another side.' });
       } finally { ledger.close(); }
     }, renderResult,
   });

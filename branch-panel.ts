@@ -6,6 +6,7 @@ import { loadWithStatus } from './ui.ts';
 const plain = (value: unknown) => String(value).replace(/[\x00-\x1f\x7f-\x9f]/g, ' ');
 const dispositions = {
   merged: '已入主线', 'patches-present': '补丁已在主线', 'materials-preserved': '已验收材料，无需合并',
+  'superseded-delivery': '旧交付已被验收版本替代，可归档',
   unaccounted: '仍有未交付内容', unknown: '证据不完整',
 };
 const reasons: Record<string, string> = {
@@ -30,13 +31,14 @@ export async function showBranches(ctx: ExtensionContext, ledger: WorkspaceLedge
       title: `${b.eligible ? '待清理' : '保留'} · ${b.branch.replace('refs/heads/', '')}`,
       summary: `${dispositions[b.state]} · ${b.tip.slice(0, 10)}`,
       detail: [`分支: ${b.branch}`, `提交: ${b.tip}`, `判定: ${dispositions[b.state]}`,
-        `远端 main: ${plan.remote ?? '未知'}`, `未覆盖提交: ${b.unaccountedCommits ?? '未知'}`,
+        `远端 main: ${plan.remote ?? '未知'}`, `${b.state === 'superseded-delivery' ? '旧历史未入主线（保全在原快照）' : '未覆盖提交'}: ${b.unaccountedCommits ?? '未知'}`,
         `所属侧: ${b.owners.join(', ') || '未登记'}`, `工作树: ${b.worktree ?? '无检出工作树'}`,
+        ...(b.delivery ? b.delivery.deliveries.map(d => `任务 #${d.taskId}: 原快照 ${d.ref} → 已验收 ${d.replacement}`) : []),
         ...(b.eligible ? [`可清理：${b.action === 'workspace' ? '移除空闲工作树与本地分支' : '移除本地分支'}，保留提交引用。`]
           : b.reasons.map(r => `保留原因: ${reasons[r] ?? r}`)),
         '不会停止进程、删除远端分支或清除归档。'],
     })) : scope === 'archive' ? plan.archives.map(a => ({
-      title: a.kind === 'material' ? a.acceptedMaterial ? '已验收材料 · 无需合并' : '材料保全 · 不代表已验收'
+      title: a.disposition === 'superseded-delivery' ? '已替代旧交付 · 无需再次合并' : a.kind === 'material' ? a.acceptedMaterial ? '已验收材料 · 无需合并' : '材料保全 · 不代表已验收'
         : a.kind === 'retired' ? '已退休 · 提交保留' : '交付快照 · 不代表已集成',
       summary: `${a.branch ?? a.ref} · ${a.tip.slice(0, 10)}`,
       detail: [`保全引用: ${a.ref}`, `提交: ${a.tip}`, ...(a.branch ? [`原分支: ${a.branch}`] : []),

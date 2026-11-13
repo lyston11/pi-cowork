@@ -326,7 +326,7 @@ export class WorkspaceLedger {
       return { branch, tip, state: status.state, uniqueCommits: status.unique?.length ?? null, unaccountedCommits: status.remaining?.length ?? null,
         worktree: worktrees.find(w => w.branch === branch)?.path ?? null };
     }));
-    const archivedBranches = this.db.prepare(`SELECT branch,tip,ref FROM handoff_branch_retirements WHERE repo=? ${actor ? 'AND actor=?' : ''} ORDER BY rowid`).all(target.repo, ...(actor ? [actor] : []));
+    const archivedBranches = this.db.prepare(`SELECT branch,tip,ref,evidence_json FROM handoff_branch_retirements WHERE repo=? ${actor ? 'AND actor=?' : ''} ORDER BY rowid`).all(target.repo, ...(actor ? [actor] : []));
     const report = { complete: errors.length === 0, remote, mainDifference, localMainStatus, outsideQueue: outside, policy: this.policy(target.targetKey), workspaces: reports,
       branches, archivedBranches, actualWorktrees, unregistered: unknown, detached: detachedHeads, remoteBranches: remoteRefs, jobs, errors };
     if (actor) {
@@ -421,6 +421,31 @@ export class WorkspaceLedger {
     const remaining = commits.filter(c => c.state === 'unaccounted').map(c => c.commit);
     return { state: remaining.length ? 'unaccounted' : commits.some(c => c.state === 'material-preserved') ? 'materials-preserved' : 'patches-present', unique, remaining, commits };
   }
+  // A task/ alias need not own the currently reused worktree. Its exact frozen
+  // delivery, not a side number in the branch name, proves its origin. A returned
+  // version is archived as superseded, never claimed to have been integrated.
+  private deliveryCloseout(cwd: string, actor: string, branch: string, tip: string, remote: string | null, target: { repo: string; targetKey: string }) {
+    if (!remote || !branch.startsWith('refs/heads/task/')) return null;
+    const rows = this.db.prepare(`SELECT DISTINCT d.id,d.ref,w.owner,e.task_id FROM handoff_deliveries d
+      JOIN handoff_workspaces w ON w.id=d.workspace_id
+      JOIN handoff_task_events e ON e.kind='complete' AND json_extract(e.data_json,'$.deliveryId')=d.id
+      WHERE w.repo=? AND w.target_key=? AND d.tip=?`).all(target.repo, target.targetKey, tip);
+    if (!rows.length || rows.some(r => r.owner !== actor)) return null;
+    const deliveries = [];
+    for (const row of rows) {
+      const task = this.store.read(Number(row.task_id), actor), receipt = task.integration;
+      if (task.assignee.id !== actor || task.state !== 'closed' || !task.requiresIntegration || !task.commit || !task.deliveryId ||
+        receipt?.state !== 'pushed' || receipt.commit !== task.commit || !receipt.mainCommit) return null;
+      if (!this.db.prepare("SELECT 1 FROM handoff_integrations WHERE id=? AND task_id=? AND target_key=? AND delivery_id=? AND commit_hash=? AND state='pushed' AND main_commit=?")
+        .get(receipt.jobId, task.id, target.targetKey, task.deliveryId, task.commit, receipt.mainCommit)) return null;
+      try {
+        if (gitSync(cwd, ['rev-parse', '--verify', String(row.ref)]) !== tip ||
+          !this.contains(cwd, task.commit, remote) || !this.contains(cwd, receipt.mainCommit, remote)) return null;
+      } catch { return null; }
+      deliveries.push({ taskId: task.id, deliveryId: String(row.id), ref: String(row.ref), replacement: task.commit, mainCommit: receipt.mainCommit });
+    }
+    return { state: deliveries.some(d => d.replacement !== tip) ? 'superseded-delivery' as const : 'merged' as const, deliveries };
+  }
   async retireBranch(cwd: string, actor: string, branch: string, expectedTip: string, note: string, materialTasks: number[] = []) {
     if (!branch.startsWith('refs/heads/') || branch === 'refs/heads/main') throw new Error('Only an explicit local task branch can be retired; main is protected');
     await git(cwd, ['check-ref-format', branch]);
@@ -437,8 +462,10 @@ export class WorkspaceLedger {
       await this.preserveMaterial(cwd, actor, id, commit);
     }
     const status = await this.branchStatus(cwd, expectedTip, remote, await this.materialCommits(cwd, actor));
-    if (status.state === 'unknown' || status.remaining?.length) throw new Error('Branch has unaccounted commits; integrate them or preserve accepted material deliveries first');
+    const delivery = !workspaces.length ? this.deliveryCloseout(cwd, actor, branch, expectedTip, remote, target) : null;
+    if (!delivery && (status.state === 'unknown' || status.remaining?.length)) throw new Error('Branch has unaccounted commits; integrate them or preserve accepted material deliveries first');
     return this.transaction(() => {
+      if (delivery && JSON.stringify(this.deliveryCloseout(cwd, actor, branch, expectedTip, remote, target)) !== JSON.stringify(delivery)) throw new Error('Delivery evidence changed; preserve the branch');
       if (gitSync(cwd, ['rev-parse', '--verify', branch]) !== expectedTip) throw new Error('Branch advanced; review its new tip before retirement');
       const trees = gitSync(cwd, ['worktree', 'list', '--porcelain', '-z']).split('\0\0');
       if (trees.some(block => block.split('\0').includes(`branch ${branch}`))) throw new Error('Branch is still checked out; preserve its worktree and use workspace retirement');
@@ -455,21 +482,22 @@ export class WorkspaceLedger {
         if (w.state === 'active') this.db.prepare("UPDATE handoff_workspaces SET state='retired' WHERE id=?").run(w.id);
         this.event(w.id, actor, 'retire-branch', { branch, tip: expectedTip, remote, ref, note, status: status.state });
       }
-      this.db.prepare('INSERT INTO handoff_branch_retirements VALUES(?,?,?,?,?,?,?,?)').run(randomUUID(), target.repo, actor, branch, expectedTip, ref, note, JSON.stringify({ remote, ...status }));
-      return { branch, tip: expectedTip, state: 'retired', ref, disposition: status.state, remoteBranchRemoved: false };
+      this.db.prepare('INSERT INTO handoff_branch_retirements VALUES(?,?,?,?,?,?,?,?)').run(randomUUID(), target.repo, actor, branch, expectedTip, ref, note, JSON.stringify({ remote, ...status, ...delivery }));
+      return { branch, tip: expectedTip, state: 'retired', ref, disposition: delivery?.state ?? status.state, remoteBranchRemoved: false };
     });
   }
-  async cleanupPlan(cwd: string, actor: string) {
-    const report = await this.reconcile(cwd, actor), target = integrationRepository(cwd);
+  async cleanupPlan(cwd: string, actor: string, observed?: Awaited<ReturnType<WorkspaceLedger['reconcile']>>) {
+    const report = observed ?? await this.reconcile(cwd, actor), target = integrationRepository(cwd);
     const registered = this.all(target.repo);
     const branches = report.branches.filter(b => b.branch !== 'refs/heads/main').map(b => {
       const owners = registered.filter(w => w.branch === b.branch);
       const workspace = owners.find(w => w.state === 'active' && w.path === b.worktree);
+      const delivery = !owners.length && !b.worktree ? this.deliveryCloseout(cwd, actor, b.branch, b.tip, report.remote, target) : null;
       const reasons: string[] = [];
-      if (!owners.length) reasons.push('未登记归属与任务；由 Agent 核实后登记，或经逐条审查使用 cowork_branch，不批量猜测');
+      if (!owners.length && !delivery) reasons.push('未登记归属与任务；由 Agent 核实后登记，或经逐条审查使用 cowork_branch，不批量猜测');
       let action: 'branch' | 'workspace' = 'branch';
       if (!report.remote || b.state === 'unknown') reasons.push('远端或提交证据不完整');
-      if (b.unaccountedCommits) reasons.push(`仍有 ${b.unaccountedCommits} 笔未交付或未保全提交`);
+      if (b.unaccountedCommits && !delivery) reasons.push(`仍有 ${b.unaccountedCommits} 笔未交付或未保全提交`);
       if (owners.some(w => w.owner !== actor)) reasons.push('归属其他侧，须由所属侧收口');
       else for (const w of owners) {
         if (w.tasks.some(id => !['closed', 'cancelled'].includes(this.store.read(id, actor).state))) reasons.push('关联任务尚未关闭');
@@ -491,8 +519,8 @@ export class WorkspaceLedger {
           }
         }
       }
-      return { ...b, owners: [...new Set(owners.map(w => w.owner))], workspaceId: workspace?.id ?? null,
-        action, eligible: reasons.length === 0, reasons: [...new Set(reasons)] };
+      return { ...b, state: delivery?.state ?? b.state, delivery, owners: delivery ? [actor] : [...new Set(owners.map(w => w.owner))], workspaceId: workspace?.id ?? null,
+        action, eligible: reasons.length === 0, automatic: reasons.length === 0 && (!!delivery || owners.some(w => w.tasks.length > 0)), reasons: [...new Set(reasons)] };
     });
     const materials = await this.materialCommits(cwd, actor);
     const receipts = new Map(report.archivedBranches.map(b => [String(b.ref), String(b.branch)]));
@@ -500,18 +528,28 @@ export class WorkspaceLedger {
       'refs/pi-cowork/materials/', 'refs/pi-cowork/retired/', 'refs/pi-cowork/deliveries/'])).map(row => {
       const [ref, tip] = row.split(' ');
       const kind = ref.startsWith('refs/pi-cowork/materials/') ? 'material' : ref.startsWith('refs/pi-cowork/retired/') ? 'retired' : 'delivery';
-      return { ref, tip, kind, branch: receipts.get(ref) ?? null, acceptedMaterial: kind === 'material' && materials.has(tip) };
+      const retired = report.archivedBranches.find(b => b.tip === tip);
+      const disposition: string | null = retired ? JSON.parse(String(retired.evidence_json)).state ?? null : null;
+      return { ref, tip, kind, disposition, branch: receipts.get(ref) ?? null, acceptedMaterial: kind === 'material' && materials.has(tip) };
     });
     return { remote: report.remote, branches, archives, remoteBranches: report.remoteBranches,
       errors: report.errors, summary: { active: branches.length, eligible: branches.filter(b => b.eligible).length,
         retained: branches.filter(b => !b.eligible).length, archived: archives.length, remote: report.remoteBranches.filter(b => b.branch !== 'refs/heads/main').length } };
   }
-  async cleanup(cwd: string, actor: string, targets: { branch: string; expectedTip: string }[], note: string) {
+  async automaticCleanup(cwd: string, actor: string, observed?: Awaited<ReturnType<WorkspaceLedger['reconcile']>>) {
+    const plan = await this.cleanupPlan(cwd, actor, observed);
+    const targets = plan.branches.filter(b => b.automatic).slice(0, 50).map(b => ({ branch: b.branch, expectedTip: b.tip }));
+    // Empty ticks never invoke cleanup or create receipts. Each non-empty item
+    // still goes through retirement's fresh remote, task, file and CAS checks.
+    return targets.length ? this.cleanup(cwd, actor, targets, 'Automatic closeout of accepted owned tasks; preserve original commits', plan)
+      : { results: [], retired: 0, retained: 0, remoteBranchesRemoved: false };
+  }
+  async cleanup(cwd: string, actor: string, targets: { branch: string; expectedTip: string }[], note: string, observed?: Awaited<ReturnType<WorkspaceLedger['cleanupPlan']>>) {
     if (!note.trim() || note.length > 4000 || !targets.length || targets.length > 50 || new Set(targets.map(t => t.branch)).size !== targets.length ||
       targets.some(t => !t.branch.startsWith('refs/heads/') || t.branch === 'refs/heads/main' || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(t.expectedTip))) {
       throw new Error('Provide 1-50 unique local task branches, exact reviewed tips and a cleanup review note; main is protected');
     }
-    const plan = await this.cleanupPlan(cwd, actor);
+    const plan = observed ?? await this.cleanupPlan(cwd, actor);
     const results: { branch: string; tip: string; state: 'retired' | 'retained'; reason?: string; ref?: string }[] = [];
     for (const target of targets) {
       try {

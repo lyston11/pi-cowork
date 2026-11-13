@@ -61,7 +61,10 @@ test("event scope keeps summary safeguards and never equates listed with read", 
   assert.match(COWORK_RULES, /本轮事件对象、必要依赖/);
   assert.match(COWORK_RULES, /首次接触、上下文不足或版本不明/);
   assert.match(COWORK_RULES, /不能用上轮已读代替本轮摘要检查/);
-  assert.match(COWORK_RULES, /cowork_cleanup 预览活动分支/);
+  assert.match(COWORK_RULES, /cowork_cleanup 查看保留原因/);
+  assert.match(COWORK_RULES, /自动收口满足保护条件/);
+  assert.match(COWORK_RULES, /暂停续跑的侧不自动清理/);
+  assert.match(COWORK_RULES, /已替代归档/);
   assert.match(COWORK_RULES, /不停在只读对账/);
   assert.match(COWORK_RULES, /精确末次提交（missingTip）办理元数据退休/);
   assert.match(COWORK_RUNTIME_RULES, /missingTip/);
