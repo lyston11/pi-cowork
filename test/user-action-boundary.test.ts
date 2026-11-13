@@ -6,17 +6,18 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { HandoffStore } from '../store.ts';
 import { taskLines } from '../ui.ts';
+import type { UserAction } from '../types.ts';
 
 function fixture() {
   const root = mkdtempSync(join(tmpdir(), 'cowork-user-boundary-'));
   const store = new HandoffStore(root);
   for (const id of ['a','b','c']) store.register({ id, name: id, sessionId: id, pid: process.pid, worktree: root, branch: 'main' });
   const create = (to = 'b') => store.create({ to, subject: 'existing authorized work', body: 'read local input and validate it', items: ['validated'], requiresIntegration: false }, 'a');
-  const legacy = (id: number, actor: string, request = 'Please approve continuing read-only validation') => {
+  const legacy = (id: number, actor: string, request = 'Please approve continuing read-only validation', userAction?: UserAction) => {
     const db = new DatabaseSync(store.dbPath);
     try {
       const seq = Number(db.prepare("INSERT INTO handoff_task_events(task_id,actor,kind,data_json,at) VALUES(?,?,'block',?,?)")
-        .run(id, actor, JSON.stringify({ reason:'Waiting for approval', waitingFor:'user', userRequest:request, dependencies:[] }), new Date().toISOString()).lastInsertRowid);
+        .run(id, actor, JSON.stringify({ reason:'Waiting for approval', waitingFor:'user', userRequest:request, userAction, dependencies:[] }), new Date().toISOString()).lastInsertRowid);
       for (const side of new Set(['a',actor])) db.prepare('INSERT INTO handoff_user_request_notifications(task_id,block_seq,side_id) VALUES(?,?,?)').run(id,seq,side);
       return seq;
     } finally { db.close(); }
@@ -36,6 +37,66 @@ test('a user request cannot become a durable blocker or notification without cap
   assert.equal(f.store.listForHumanUi().snapshot.userRequestCount,0);
   f.store.check(t.id,'b',1,true);f.store.complete(t.id,'b','a'.repeat(40),'Validated within original authorization');
   assert.equal(f.store.read(t.id,'b').state,'completed');
+ }finally{f.close();}
+});
+
+test('explicitly unnecessary user actions cannot create a blocker or notification', () => {
+ const f=fixture();try{
+  const t=f.create(),before=f.store.read(t.id,'b');
+  const action:UserAction={kind:'input',limitation:'Missing an input not available to any Agent'};
+  for(const request of ['无用户操作；等待3侧沿#16/#189交修后证据。','无需用户配合。','不需要你协作；等待交付。','No user action is required. Waiting for another Agent.']) {
+   assert.throws(()=>f.store.block(t.id,'b','Internal dependency','side 3',[],request,action),/No user action/);
+  }
+  assert.throws(()=>f.store.block(t.id,'b','Internal dependency','side 3',[],'Provide input',{kind:'input',limitation:'本阻塞为3侧工程依赖，无需用户输入。'}),/No user action/);
+  assert.deepEqual(f.store.read(t.id,'b').events,before.events);
+  assert.deepEqual(f.store.pendingUserRequestNotifications('a'),[]);
+  assert.deepEqual(f.store.pendingUserRequestNotifications('b'),[]);
+  assert.equal(f.store.listForHumanUi().snapshot.userRequestCount,0);
+  const legitimate=f.store.block(t.id,'b','User device inaccessible','user',[],'无需重装或重启；请在设备上扫码并回传结果。',{kind:'manual',limitation:'Agent没有用户操作权限，设备仅在本人手中且无远程接口。'});
+  assert.equal(legitimate.block?.userRequestNeedsReview,undefined);
+  assert.equal(f.store.pendingUserRequestNotifications('b').length,1);
+ }finally{f.close();}
+});
+
+test('replacing a user request with an internal dependency withdraws queued notifications without unblocking', () => {
+ const f=fixture();try{
+  const t=f.create(),dep=f.create();
+  const requested=f.store.block(t.id,'b','Need physical test','user',[],'Use the physical device and return the result',{kind:'manual',limitation:'The device has no remote interface'});
+  const seq=requested.events.at(-1)!.seq, snapshot=f.store.listForHumanUi().snapshot;
+  const updated=f.store.block(t.id,'b','User result received; waiting for peer fix','side 3',[dep.id]);
+  assert(updated.block); assert.equal(updated.block.userRequest,undefined);
+  assert.deepEqual(updated.block.dependencies,[dep.id]);assert.equal(updated.state,'open');
+  for(const side of ['a','b']) {
+   assert.deepEqual(f.store.pendingUserRequestNotifications(side),[]);
+   assert.equal(f.store.claimUserRequestNotification(side,t.id,seq),undefined);
+  }
+  assert.equal(f.store.listForHumanUi().snapshot.userRequestCount,0);
+  assert.equal(f.store.listForHumanUi({snapshot}).snapshot.userRequestCount,1);
+  assert.equal(updated.events.find(e=>e.seq===seq)?.data.userRequest,requested.block?.userRequest);
+  f.store.check(t.id,'b',1,true);
+  assert.throws(()=>f.store.complete(t.id,'b','a'.repeat(40),'skip internal dependency'),/unblock/);
+ }finally{f.close();}
+});
+
+test('old writers cannot surface contradictory requests or starve valid notifications', () => {
+ const f=fixture();try{
+  let first=0,seq=0;
+  for(let i=0;i<51;i++) {
+   const t=f.create(); const inserted=f.legacy(t.id,'b','无用户操作；等待3侧交证。',{kind:'input',limitation:'本阻塞为工程依赖，无需用户输入。'});
+   if(!i){first=t.id;seq=inserted;}
+  }
+  const original=f.store.read(first,'b');
+  assert.equal(original.block?.userRequestNeedsReview,true);
+  assert.equal(f.store.claimUserRequestNotification('b',first,seq),undefined);
+  const theme:any={fg:(_:string,v:string)=>v,strikethrough:(v:string)=>v};
+  assert.match(taskLines(original,true,theme,160).join('\n'),/用户请求待 Agent 复核/);
+  const valid=f.create();f.store.block(valid.id,'b','Physical test needed','user',[],'Operate the device and return the screen',{kind:'manual',limitation:'Only the user has the device; no remote interface'});
+  const pending=f.store.pendingUserRequestNotifications('b',1);
+  assert.equal(pending.length,1);assert.equal(pending[0].taskId,valid.id);
+  assert.equal(f.store.listForHumanUi().snapshot.userRequestCount,1);
+  assert(f.store.acquireResume('b','b','reviewer'));
+  assert(f.store.reconcileResume('b','reviewer').queued.includes(first));
+  assert.equal(f.store.read(first,'b').block?.userRequest,original.block?.userRequest,'history is not rewritten');
  }finally{f.close();}
 });
 

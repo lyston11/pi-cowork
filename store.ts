@@ -17,16 +17,9 @@ function isUserWaiting(value: string): boolean {
   return /user|用户|manual test|人工测试|手工测试/i.test(value);
 }
 
-const userActionEvidenceSql = `(
-  json_type(e.data_json,'$.userRequest')='text'
-  AND length(trim(COALESCE(json_extract(e.data_json,'$.userRequest'),''))) BETWEEN 1 AND 1000
-  AND json_extract(e.data_json,'$.userAction.kind') IN ('manual','input','authorization')
-  AND json_type(e.data_json,'$.userAction.limitation')='text'
-  AND length(trim(COALESCE(json_extract(e.data_json,'$.userAction.limitation'),''))) BETWEEN 1 AND 1000
-  AND (json_extract(e.data_json,'$.userAction.kind')<>'authorization'
-    OR (json_type(e.data_json,'$.userAction.authority')='text'
-      AND length(trim(COALESCE(json_extract(e.data_json,'$.userAction.authority'),''))) BETWEEN 1 AND 1000))
-)`;
+// Read queries use the same validator as writes. Never persist this connection-
+// local function in triggers: older Pi processes must still be able to write.
+const userActionEvidenceSql = 'cowork_valid_user_request(e.data_json)=1';
 
 function validateUserAction(action: UserAction | undefined): asserts action is UserAction {
   if (!action || !['manual', 'input', 'authorization'].includes(action.kind)) {
@@ -34,6 +27,19 @@ function validateUserAction(action: UserAction | undefined): asserts action is U
   }
   text(action.limitation, 'userAction.limitation: why no authorized Agent can do this', 1000);
   if (action.kind === 'authorization') text(action.authority, 'userAction.authority: exact user restriction or governing rule and its source; a task asking for approval is not authority', 1000);
+}
+
+function validateUserRequest(value: unknown, action: UserAction | undefined): void {
+  const request = text(value, 'User action request', 1000);
+  validateUserAction(action);
+  const content = `${request.trim()}\n${action.limitation.trim()}`;
+  // Reject explicit denials, not incidental words such as “无需重装” or
+  // “没有用户操作权限”. This is a contradiction guard, not an authorization judge.
+  const denied = /(?:(?:无需|无须|不需(?:要)?|不用)(?:用户|你|您)(?:进行)?(?:操作|输入|配合|协作|批准|授权)|(?:用户|你|您)(?:无需|无须|不需(?:要)?|不用)(?:操作|输入|配合|协作)|无(?:新增)?用户(?:操作(?:条件)?|输入|配合(?:项)?|协作(?:项)?))(?=$|[，。；、,.!?！？;:\n])/m;
+  const deniedEnglish = /\b(?:no (?:user|human) (?:action|input|assistance|approval)(?: (?:is )?(?:needed|required|necessary))?|(?:user|human) (?:action|input|assistance|approval) (?:is )?not (?:needed|required|necessary))\s*(?=$|[.;,!?\n])/im;
+  if (denied.test(content) || deniedEnglish.test(content)) {
+    throw new Error('No user action is requested. For internal dependencies omit userRequest and userAction; re-register the actual waitingFor and dependencies to withdraw a previous request without unblocking the task.');
+  }
 }
 
 function integer(value: number, name: string, minimum: number): number {
@@ -101,6 +107,13 @@ export class HandoffStore {
     mkdirSync(this.rootDir, { recursive: true, mode: 0o700 });
     this.db = new DatabaseSync(this.dbPath);
     try {
+      this.db.function('cowork_valid_user_request', (value) => {
+        try {
+          const data = JSON.parse(String(value));
+          validateUserRequest(data.userRequest, data.userAction);
+          return 1;
+        } catch { return 0; }
+      });
       this.db.exec("PRAGMA busy_timeout=30000; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;");
       // New tables preserve all V3 messages and any earlier board records unchanged.
       this.db.exec(`
@@ -777,7 +790,7 @@ export class HandoffStore {
           ? event.data.userRequest : isUserWaiting(waitingFor) ? String(event.data.reason) : undefined;
         let userAction: UserAction | undefined;
         if (userRequest) {
-          try { validateUserAction(event.data.userAction as UserAction | undefined); userAction = event.data.userAction as UserAction; }
+          try { validateUserRequest(event.data.userRequest, event.data.userAction as UserAction | undefined); userAction = event.data.userAction as UserAction; }
           catch { /* Keep legacy evidence, send it back to Agents for review. */ }
         }
         task.block = {
@@ -916,7 +929,7 @@ export class HandoffStore {
     text(waitingFor, "Waiting for", 160);
     if (userRequest !== undefined) { text(userRequest, "User action request", 1000); userRequest = userRequest.trim(); }
     if (isUserWaiting(waitingFor) && !userRequest) throw new Error('userRequest is required when waiting for user action; do not turn routine work into approval requests');
-    if (userRequest) validateUserAction(userAction);
+    if (userRequest) validateUserRequest(userRequest, userAction);
     else if (userAction) throw new Error('userAction requires an explicit userRequest');
     const effectiveUserRequest = userRequest;
     if (!Array.isArray(dependencyIds) || dependencyIds.length > 20) throw new Error("At most 20 dependencies are allowed");
