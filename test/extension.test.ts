@@ -81,6 +81,12 @@ test("tool boundary binds identity to session, never accepts an actor from argum
     assert.equal(tools.has('cowork_cleanup'), true);
     assert.match(commands.get('cowork').description, /branches/);
     assert.equal(commands.has('handoff'), false);
+    assert.match(tools.get('cowork_create').description, /Items must reflect the original requirements/);
+    assert.match(tools.get('cowork_block').description, /unmet original requirement/);
+    assert.match(tools.get('cowork_complete').description, /Reuse verified evidence/);
+    assert.ok(tools.get('cowork_integrate').description.includes('reuse existing project merge/push authorization'));
+    assert.match(tools.get('cowork_close').description, /as soon as those requirements are met/);
+    assert.match(tools.get('cowork_reopen').description, /minimum correction/);
     assert.equal([...tools.keys()].some(name => name.startsWith('handoff_')), false);
     assert.doesNotMatch([...tools.values()].map(tool => tool.label).join('\n'), /handoff/i);
     const notifications: string[] = [];

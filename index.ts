@@ -221,7 +221,7 @@ export default function piCowork(pi: ExtensionAPI): void {
 
   pi.registerTool({
     name: "cowork_create", label: "Create a local task or delegation",
-    description: "Create an authorized task. Omit to (or use your own side ID) for your own work: you may implement, complete, verify, integrate and close it yourself. Set to another exact side ID only for real delegation; never transfer your implementation merely to satisfy the workflow. Independent review, when required, is a separate review/material task and is not replaced by self-verification. Priority urgent/high/normal/low defaults to normal. Items are pre-delivery acceptance conditions only: do not require integration, push or closure before complete. Code tasks require integration/push by default; set requiresIntegration=false only when no merge is needed.",
+    description: "Create an authorized task. Omit to (or use your own side ID) for your own work: you may implement, complete, verify, integrate and close it yourself. Set to another exact side ID only for real delegation; never transfer your implementation merely to satisfy the workflow. Independent review, when required, is a separate review/material task and is not replaced by self-verification. Priority urgent/high/normal/low defaults to normal. Items must reflect the original requirements, not speculative risks or extra review stages. They are pre-delivery acceptance conditions only: do not require integration, push or closure before complete. Do not delegate your own executable checks merely to create another preparation or approval stage. Code tasks require integration/push by default; set requiresIntegration=false only when no merge is needed.",
     parameters: Type.Object({
       to: Type.Optional(Type.String({ minLength: 1, maxLength: 256 })), subject: Type.String({ minLength: 1, maxLength: 160 }),
       body: Type.String({ minLength: 1, maxLength: 16000 }),
@@ -265,7 +265,7 @@ export default function piCowork(pi: ExtensionAPI): void {
 
   pi.registerTool({
     name: "cowork_block", label: "Record a task blocker",
-    description: "Assignee only: record a concrete blocker, recovery condition and dependency IDs. Continue work already authorized; never invent a per-task approval for read-only checks, implementation, integration, internal handoffs or tool repair. For a genuinely user-only action, provide userRequest (exact steps and expected result) AND userAction (kind and why no authorized Agent can perform it). Authorization requests additionally require the exact controlling user restriction/rule and its source in authority; a peer task asking for approval is not such a source. Dependent tasks wait on the responsible task, not another duplicate user request. For internal dependencies omit userRequest and userAction entirely; never fill them with 'no user action'. Re-registering without these fields withdraws the old request while preserving the blocker. If userNotification is returned, immediately call notify_user once with the returned parameters; terminalNotification means already submitted to the origin pane. Does not complete, authorize or automatically unblock a task.",
+    description: "Assignee only: record a concrete unmet original requirement, its observed failure or missing evidence, recovery condition and dependency IDs. Speculative risks, optional improvements and later-stage acceptance are not blockers for the current delivery. Continue work already authorized; never invent a per-task approval for read-only checks, implementation, integration, internal handoffs or tool repair. For a genuinely user-only action, provide userRequest (exact steps and expected result) AND userAction (kind and why no authorized Agent can perform it). Authorization requests additionally require the exact controlling user restriction/rule and its source in authority; a peer task asking for approval is not such a source. Dependent tasks wait on the responsible task, not another duplicate user request. For internal dependencies omit userRequest and userAction entirely; never fill them with 'no user action'. Re-registering without these fields withdraws the old request while preserving the blocker. If userNotification is returned, immediately call notify_user once with the returned parameters; terminalNotification means already submitted to the origin pane. Does not complete, authorize or automatically unblock a task.",
     parameters: Type.Object({
       id: idSchema, reason: Type.String({ minLength: 1, maxLength: 2000 }),
       waitingFor: Type.String({ minLength: 1, maxLength: 160 }),
@@ -324,7 +324,7 @@ export default function piCowork(pi: ExtensionAPI): void {
 
   pi.registerTool({
     name: "cowork_complete", label: "Submit a completed CoWork task",
-    description: "Assignee only: submit a real completed commit and freeze its delivery range. Use workspaceId from cowork_workspace when the implementation worktree differs from this Pi's startup directory. Does not close the task.",
+    description: "Assignee only: once the original acceptance conditions are met, submit the real completed commit and freeze its delivery range without adding more review stages. Reuse verified evidence for unchanged code, inputs and environment; only check affected gaps or contradictions. Use workspaceId from cowork_workspace when the implementation worktree differs from this Pi's startup directory. Does not close the task.",
     parameters: Type.Object({ id: idSchema, commit: Type.String({ minLength: 7, maxLength: 64 }), summary: Type.String({ minLength: 1, maxLength: 4000 }), workspaceId: Type.Optional(Type.String()) }),
     async execute(_id, input, _signal, _update, ctx) {
       const actor = identity(ctx).id;
@@ -425,7 +425,7 @@ export default function piCowork(pi: ExtensionAPI): void {
 
   pi.registerTool({
     name: "cowork_integrate", label: "Queue reviewed code for main integration",
-    description: "Creator/owner only, including local tasks: self-verification is recorded as self, not independent peer review. Satisfy explicitly required independent review separately. After actually reviewing the entire delivered range and obtaining project merge/push authorization, queue the exact completed commit for serial integration into origin/main. Provide the reviewed base and real integration checks. Runs asynchronously in an isolated worktree. Conflict/check/push failures are recorded; never force pushes. It does not close the task. Use cowork_read for result; explicitly retry only after resolving a blocker.",
+    description: "Creator/owner only, including local tasks: self-verification is recorded as self, not independent peer review. Satisfy explicitly required independent review separately. After actually reviewing the entire delivered range, reuse existing project merge/push authorization and queue the exact completed commit for serial integration into origin/main. Provide the reviewed base and real integration checks. Runs asynchronously in an isolated worktree. Conflict/check/push failures are recorded; never force pushes. It does not close the task. Use cowork_read for result; explicitly retry only after resolving a blocker.",
     parameters: Type.Object({ id: idSchema, commit: Type.String({ minLength: 7, maxLength: 64 }),
       reviewedBase: Type.String({ minLength: 7, maxLength: 64 }), note: Type.String({ minLength: 1, maxLength: 4000 }),
       checks: Type.Array(Type.Object({ command: Type.String({ minLength: 1, maxLength: 512 }), args: Type.Array(Type.String({ maxLength: 4096 }), { maxItems: 100 }) }), { minItems: 1, maxItems: 10 }),
@@ -454,7 +454,7 @@ export default function piCowork(pi: ExtensionAPI): void {
 
   pi.registerTool({
     name: "cowork_close", label: "Accept and close a CoWork task",
-    description: "Creator/owner only, including local tasks: after verification, close with the delivered commit and note. Local closure records self-verification, not independent review. Code tasks must first finish cowork_integrate; this tool rechecks origin/main and records mainCommit automatically. Queued, running or blocked integrations cannot close. Closed tasks remain in history, dim and struck through.",
+    description: "Creator/owner only, including local tasks: verify against the original requirements, reuse applicable verified evidence, and close with the delivered commit and note as soon as those requirements are met. Do not add speculative hardening, repeated tests or later-stage acceptance to delay closure. Local closure records self-verification, not independent review. Code tasks must first finish cowork_integrate; this tool rechecks origin/main and records mainCommit automatically. Queued, running or blocked integrations cannot close. Closed tasks remain in history, dim and struck through.",
     parameters: Type.Object({ id: idSchema, commit: Type.String({ minLength: 7, maxLength: 64 }), note: Type.String({ minLength: 1, maxLength: 4000 }) }),
     async execute(_id, input, _signal, _update, ctx) {
       const actor = identity(ctx).id;
@@ -483,7 +483,7 @@ export default function piCowork(pi: ExtensionAPI): void {
 
   pi.registerTool({
     name: "cowork_reopen", label: "Return a CoWork task for changes",
-    description: "Creator only: return a completed task with a reason. Cannot return queued/running or pushed integrations; wait for queued work, and correct already merged code with a new task. The checklist resets for the next attempt; previous commits and review events stay in history.",
+    description: "Creator only: return a completed task only for a concrete unmet original requirement; identify the observed failure or missing evidence and the minimum correction. Do not return it for optional improvements or hypothetical risks. Cannot return queued/running or pushed integrations; wait for queued work, and correct already merged code with a new task. The checklist resets for the next attempt; previous commits and review events stay in history.",
     parameters: Type.Object({ id: idSchema, note: Type.String({ minLength: 1, maxLength: 4000 }) }),
     async execute(_id, input, _signal, _update, ctx) { return toolResult({ task: board().reopen(input.id, identity(ctx).id, input.note) }); }, renderResult,
   });

@@ -76,6 +76,25 @@ test("event scope keeps summary safeguards and never equates listed with read", 
   assert.doesNotMatch(COWORK_RULES, /阅读分配给本侧的待办、待本侧验收的交付/);
 });
 
+test("acceptance stays bounded and reuses applicable evidence without weakening real requirements", () => {
+  assert.ok(COWORK_RUNTIME_RULES.startsWith(COWORK_RULES));
+  for (const rule of [
+    '不为假想风险添加兼容层、兜底路径、配置、抽象或测试矩阵',
+    '真实输入校验、安全、数据保全和明确要求的兼容性仍须保留',
+    '不自行缩成只读准备',
+    '任务清单不得自行扩大原始要求',
+    '已核实且对应当前提交、输入和环境的证据直接复用',
+    '仅在相关变更、证据缺失或实际矛盾时补查受影响部分',
+    '退回或阻塞必须指出哪条原定要求未满足',
+    '后续阶段的验收不阻止当前交付',
+    '用户已完成的操作不重复索取',
+    '原定条件满足后，按职责立即提交、验收、集成和关闭',
+    '真实失败不得冒充通过，明确禁止的操作不得越权',
+  ]) assert.ok(COWORK_RULES.includes(rule), rule);
+  assert.match(COWORK_RUNTIME_RULES, /重读任务状态不等于重做验收/);
+  assert.match(COWORK_RUNTIME_RULES, /沿用已有合入并推送授权/);
+});
+
 test("malformed managed blocks fail without overwriting AGENTS", () => {
   const root = mkdtempSync(join(tmpdir(), "pi-handoff-markers-"));
   try {
