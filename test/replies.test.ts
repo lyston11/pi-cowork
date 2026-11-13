@@ -83,7 +83,8 @@ test('new input on a dependency wakes affected blockers without completing or un
   try {
     const parent = f.create(), code = f.create('b', 'a'), stable = f.create();
     f.store.block(parent.id, 'b', 'need input from this code task', 'a', [code.id]);
-    f.store.block(stable.id, 'b', 'approval unchanged', 'user');
+    const approval = { kind: 'authorization' as const, limitation: 'Service restart exceeds read-only authorization', authority: 'User instruction: do not restart services without approval' };
+    f.store.block(stable.id, 'b', 'approval unchanged', 'user', [], 'Allow restarting service X?', approval);
     f.drain('a'); f.drain('b');
     const snapshot = f.store.listForHumanUi({ actor: 'a', limit: 100 }).snapshot;
     f.peer.reply(code.id, 'a', 'replacement delivery is ready, see authorized code receipt', 'delivery');
@@ -94,7 +95,7 @@ test('new input on a dependency wakes affected blockers without completing or un
     const frozen = f.store.listForHumanUi({ actor: 'a', snapshot, limit: 100 }).tasks.find(t => t.id === parent.id)!;
     assert.equal(frozen.block?.needsReview, false, 'list snapshots do not absorb later replies');
     assert.throws(() => f.store.complete(parent.id, 'b', 'a'.repeat(40), 'not actually done'), /Check every item/);
-    f.store.block(parent.id, 'b', 'new input inspected; still missing approval', 'user', [code.id]);
+    f.store.block(parent.id, 'b', 'new input inspected; still missing approval', 'user', [code.id], 'Allow restarting service X?', approval);
     assert.equal(f.store.read(parent.id, 'b').block?.needsReview, false);
     f.drain('b');
     f.peer.reply(code.id, 'a', 'approval now attached to the same code task', 'approval');

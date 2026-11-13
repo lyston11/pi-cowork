@@ -115,10 +115,11 @@ test("user action requests are explicit, recoverable, surfaced first, and remove
     const ready = f.create(A.id, B.id, "ready work");
     const userAction = f.create(A.id, B.id, "manual user test");
     const waiting = f.create(A.id, C.id, "external dependency");
-    f.store.block(userAction.id, B.id, "Need a real UI test before proceeding", "user", [], "Open the exported project, test import and report the displayed error");
+    const manual = { kind: 'manual' as const, limitation: 'Only the user can interact with the hardware test device; no remote control interface is available' };
+    f.store.block(userAction.id, B.id, "Need a real UI test before proceeding", "user", [], "Open the exported project, test import and report the displayed error", manual);
     f.store.block(waiting.id, C.id, "Awaiting data artifact", "data team");
     const anotherSideRequest = f.create(C.id, B.id, "other side manual test");
-    f.store.block(anotherSideRequest.id, B.id, "Waiting for their test", "user", [], "Run the sample on another side");
+    f.store.block(anotherSideRequest.id, B.id, "Waiting for their test", "user", [], "Run the sample on another side", manual);
     let page = f.store.listForHumanUi({ actor: A.id, sort: "pending" });
     assert.equal(page.snapshot.userRequestCount, 1, "local view counts only requests visible to this side");
     assert.equal(f.store.listForHumanUi().snapshot.userRequestCount, 2, "project view counts all active user requests");
@@ -139,10 +140,16 @@ test("user action requests are explicit, recoverable, surfaced first, and remove
     assert.equal(page.snapshot.userRequestCount, 0);
     assert.notEqual(page.snapshot.ids[0], userAction.id);
     const legacy = f.create(A.id, B.id, "legacy request");
-    f.store.block(legacy.id, B.id, "Run the package manually and report the result", "user");
+    const db = new DatabaseSync(f.store.dbPath);
+    db.prepare("INSERT INTO handoff_task_events(task_id,actor,kind,data_json,at) VALUES(?,?,'block',?,?)")
+      .run(legacy.id, B.id, JSON.stringify({reason:'Run the package manually and report the result',waitingFor:'user',dependencies:[]}),new Date().toISOString());
+    db.close();
     const migrated = f.store.read(legacy.id, A.id);
     assert.equal(migrated.block?.userRequest, "Run the package manually and report the result");
-    assert.equal(f.store.listForHumanUi({ actor: A.id }).snapshot.userRequestCount, 1);
+    assert.equal(migrated.block?.userRequestNeedsReview, true);
+    assert.equal(migrated.block?.needsReview, true);
+    assert.equal(f.store.listForHumanUi({ actor: A.id }).snapshot.userRequestCount, 0);
+    assert.match(taskLines(migrated, true, theme, 140).join('\n'), /用户请求待 Agent 复核/);
     assert.equal(f.store.read(ready.id, A.id).block, null);
   } finally { f.close(); }
 });

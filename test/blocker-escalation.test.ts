@@ -6,6 +6,9 @@ import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { HandoffStore } from "../store.ts";
 
+const inputAction = { kind: 'input' as const, limitation: 'The missing credential is held only by the user; project inputs do not contain it' };
+const request = 'Provide the missing test credential using the private input channel';
+
 function fixture() {
   const root = mkdtempSync(join(tmpdir(), "pi-blocked-report-"));
   const store = new HandoffStore(root);
@@ -23,18 +26,18 @@ test("each ongoing blocker wakes only the creator once and delivers the latest r
   try {
     const task = f.create();
     f.store.acknowledgeResume("b", "b", f.store.pendingResume("b", "b")!.throughSeq);
-    f.peer.block(task.id, "b", "missing approval", "user");
+    f.peer.block(task.id, "b", "missing approval", "user", [], request, inputAction);
     const first = f.store.pendingResume("a", "a")!;
     assert.deepEqual(first.events.map(e => [e.taskId, e.kind]), [[task.id, "blocked"]]);
     assert.equal(f.store.pendingResume("b", "b"), null);
     assert.equal(f.store.pendingResume("c", "c"), null);
     assert.throws(() => f.store.read(task.id, "c"), /not visible/);
     f.peer.check(task.id, "b", 1, true);
-    f.peer.block(task.id, "b", "updated missing configuration", "user and operations");
+    f.peer.block(task.id, "b", "updated missing configuration", "user and operations", [], request, inputAction);
     assert.equal(f.store.pendingResume("a", "a")!.throughSeq, first.throughSeq);
     assert.match(f.store.read(task.id, "a").block!.reason, /updated/);
     f.store.acknowledgeResume("a", "a", first.throughSeq);
-    f.peer.block(task.id, "b", "another review, still missing input", "user");
+    f.peer.block(task.id, "b", "another review, still missing input", "user", [], request, inputAction);
     assert.equal(f.store.pendingResume("a", "a"), null);
     f.peer.unblock(task.id, "b", "approval received");
     f.peer.block(task.id, "b", "new external outage", "operations");
@@ -52,11 +55,11 @@ test("upgrade backfills existing active blockers once without enabling paused cr
   try {
     sql.exec("DROP TRIGGER handoff_resume_blocked");
     const active = f.create(), resolved = f.create(), completed = f.create();
-    f.peer.block(active.id, "b", "old missing configuration", "user");
-    f.peer.block(active.id, "b", "old reason clarified", "user");
-    f.peer.block(resolved.id, "b", "old resolved blocker", "user");
+    f.peer.block(active.id, "b", "old missing configuration", "user", [], request, inputAction);
+    f.peer.block(active.id, "b", "old reason clarified", "user", [], request, inputAction);
+    f.peer.block(resolved.id, "b", "old resolved blocker", "user", [], request, inputAction);
     f.peer.unblock(resolved.id, "b", "already resolved");
-    f.peer.block(completed.id, "b", "old blocker", "user");
+    f.peer.block(completed.id, "b", "old blocker", "user", [], request, inputAction);
     f.peer.unblock(completed.id, "b", "ready");
     f.peer.check(completed.id, "b", 1, true);
     f.peer.complete(completed.id, "b", "a".repeat(40), "finished");

@@ -15,7 +15,7 @@ const actions: Record<ResumeEvent["kind"], string> = {
   integration: "发起方读取集成结果和检查；已推送则核对并关闭，受阻则处理原因，排队或运行中等待事件。",
   close: "读取验收结果，继续因此可推进的相关待办，不重做已关闭交付。",
   cancel: "任务已正式取消：停止该任务的后续实施，不重开、不继续交付；代码和历史保留。相关依赖重新核对，不能把取消当成产物已交付。",
-  checkpoint: "必须重读指定未收口任务，即使摘要未变；核对相关依赖、授权和实际阻塞。",
+  checkpoint: "必须重读指定未收口任务，即使摘要未变；核对相关依赖、授权和实际阻塞。userRequestNeedsReview 表示旧用户请求须由 Agent 复核：已有授权内自行继续，内部依赖由责任侧处理；确需用户操作或越过明确授权边界时补全依据，不让用户重复批准。",
 };
 
 // One consumer per side. Peer events and bounded task checkpoints are durable;
@@ -112,7 +112,8 @@ export class EventResume {
       for (const pending of this.store.pendingUserRequestNotifications(this.self.id)) {
         const task = this.store.claimUserRequestNotification(this.self.id, pending.taskId, pending.blockSeq);
         if (task?.block?.userRequest) {
-          this.ctx.ui.notify(`CoWork 需要你配合 · #${task.id} ${task.subject}：${task.block.userRequest.replace(/\s+/g, " ").slice(0, 360)}`, "warning");
+          const title = task.block.userAction?.kind === 'authorization' ? 'CoWork 需要你决定' : 'CoWork 需要你配合';
+          this.ctx.ui.notify(`${title} · #${task.id} ${task.subject}：${task.block.userRequest.replace(/\s+/g, " ").slice(0, 360)}`, "warning");
         }
       }
       if (!this.store.acquireResume(this.self.id, this.self.sessionId, this.consumer)) return;

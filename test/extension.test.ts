@@ -144,7 +144,12 @@ test("tool boundary binds identity to session, never accepts an actor from argum
     const userTest = await execute("one", "cowork_create", { to: b.id, subject: "manual verification", body: "Test a real UI path", items: ["report result"], requiresIntegration: false });
     const userTestId = userTest.details.task.id;
     await assert.rejects(execute("two", "cowork_block", { id: userTestId, reason: "Must verify with user data", waitingFor: "user" }), /userRequest is required/);
-    const blockedRequest = await execute("two", "cowork_block", { id: userTestId, reason: "Must verify with user data", waitingFor: "user", userRequest: "Open the real project, test import and report the exact error" });
+    const action = { kind: 'manual', limitation: 'The user has the only physical device; no Agent can operate it remotely' };
+    await assert.rejects(execute("two", "cowork_block", { id: userTestId, reason: "Read-only verification already authorized", waitingFor: "user", userRequest: "Approve continuing the task" }), /userAction is required/);
+    await assert.rejects(execute("two", "cowork_block", { id: userTestId, reason: "Read-only verification already authorized", waitingFor: "user", userRequest: "Approve continuing the task", userAction: { kind: 'authorization', limitation: 'Needs approval' } }), /userAction.authority/);
+    assert.equal(notifications.length, 0, 'invalid approval requests never enter the notification path');
+    assert.equal((await execute('two', 'cowork_read', { id: userTestId })).details.task.block, null);
+    const blockedRequest = await execute("two", "cowork_block", { id: userTestId, reason: "Must verify with user data", waitingFor: "user", userRequest: "Open the real project, test import and report the exact error", userAction: action });
     assert.equal(notifications.length, 1);
     assert.match(notifications[0], /manual verification/);
     assert.match(notifications[0], /report the exact error/);
@@ -156,7 +161,7 @@ test("tool boundary binds identity to session, never accepts an actor from argum
       priority: "high",
     });
     assert.match(blockedRequest.content[0].text, /userNotification/);
-    const repeatedRequest = await execute("two", "cowork_block", { id: userTestId, reason: "Must verify with user data", waitingFor: "user", userRequest: "Open the real project, test import and report the exact error" });
+    const repeatedRequest = await execute("two", "cowork_block", { id: userTestId, reason: "Must verify with user data", waitingFor: "user", userRequest: "Open the real project, test import and report the exact error", userAction: action });
     assert.equal(repeatedRequest.details.userNotification, undefined);
     assert.equal(repeatedRequest.details.terminalNotification, undefined);
     assert.equal(notifications.length, 1);

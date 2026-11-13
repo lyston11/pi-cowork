@@ -4,7 +4,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { HANDOFF_EXTENSION_VERSION, type CreateInput, type HandoffTask, type Side, type TaskEvent, type TaskPriority, type TaskSummary } from "./types.ts";
+import { HANDOFF_EXTENSION_VERSION, type CreateInput, type HandoffTask, type Side, type TaskEvent, type TaskPriority, type TaskSummary, type UserAction } from "./types.ts";
 
 function text(value: unknown, name: string, max: number): string {
   if (typeof value !== "string" || !value.trim() || value.length > max) {
@@ -15,6 +15,25 @@ function text(value: unknown, name: string, max: number): string {
 
 function isUserWaiting(value: string): boolean {
   return /user|用户|manual test|人工测试|手工测试/i.test(value);
+}
+
+const userActionEvidenceSql = `(
+  json_type(e.data_json,'$.userRequest')='text'
+  AND length(trim(COALESCE(json_extract(e.data_json,'$.userRequest'),''))) BETWEEN 1 AND 1000
+  AND json_extract(e.data_json,'$.userAction.kind') IN ('manual','input','authorization')
+  AND json_type(e.data_json,'$.userAction.limitation')='text'
+  AND length(trim(COALESCE(json_extract(e.data_json,'$.userAction.limitation'),''))) BETWEEN 1 AND 1000
+  AND (json_extract(e.data_json,'$.userAction.kind')<>'authorization'
+    OR (json_type(e.data_json,'$.userAction.authority')='text'
+      AND length(trim(COALESCE(json_extract(e.data_json,'$.userAction.authority'),''))) BETWEEN 1 AND 1000))
+)`;
+
+function validateUserAction(action: UserAction | undefined): asserts action is UserAction {
+  if (!action || !['manual', 'input', 'authorization'].includes(action.kind)) {
+    throw new Error('userAction is required: identify manual operation, unavailable input, or a genuine authorization boundary. Routine work within existing authorization must continue without asking the user to approve again.');
+  }
+  text(action.limitation, 'userAction.limitation: why no authorized Agent can do this', 1000);
+  if (action.kind === 'authorization') text(action.authority, 'userAction.authority: exact user restriction or governing rule and its source; a task asking for approval is not authority', 1000);
 }
 
 function integer(value: number, name: string, minimum: number): number {
@@ -40,6 +59,7 @@ export interface HumanTaskSnapshot {
   eventSeq: number;
   actor?: string;
   userRequestCount?: number;
+  userDecisionCount?: number;
 }
 
 export interface ResumeEvent {
@@ -329,13 +349,14 @@ export class HandoffStore {
                 AND kind IN ('block','unblock','complete','close','reopen','cancel') ORDER BY seq DESC LIMIT 1);
         `);
       }
+
     });
   }
 
   claimUserRequestNotification(sideId: string, taskId: number, blockSeq: number): HandoffTask | undefined {
     return this.transaction(() => {
       const task = this.read(taskId, sideId);
-      if (task.state !== 'open' || !task.block?.userRequest || task.events.findLast((event) => event.kind === 'block')?.seq !== blockSeq) return undefined;
+      if (task.state !== 'open' || !task.block?.userRequest || task.block.userRequestNeedsReview || task.events.findLast((event) => event.kind === 'block')?.seq !== blockSeq) return undefined;
       const delivered = this.db.prepare(`UPDATE handoff_user_request_notifications SET delivered_at=?
         WHERE task_id=? AND block_seq=? AND side_id=? AND delivered_at IS NULL`).run(Date.now(), taskId, blockSeq, sideId);
       return delivered.changes === 1 ? task : undefined;
@@ -346,7 +367,8 @@ export class HandoffStore {
     integer(limit, 'notification limit', 1);
     return this.db.prepare(`SELECT n.task_id,n.block_seq FROM handoff_user_request_notifications n
       JOIN handoff_tasks t ON t.id=n.task_id
-      WHERE n.side_id=? AND n.delivered_at IS NULL
+      JOIN handoff_task_events e ON e.seq=n.block_seq
+      WHERE n.side_id=? AND n.delivered_at IS NULL AND ${userActionEvidenceSql}
         AND n.block_seq=(SELECT seq FROM handoff_task_events WHERE task_id=t.id
           AND kind IN ('block','unblock','complete','close','reopen','cancel') ORDER BY seq DESC LIMIT 1)
       ORDER BY n.block_seq,n.task_id LIMIT ?`).all(sideId, limit).map((row) => ({ taskId: Number(row.task_id), blockSeq: Number(row.block_seq) }));
@@ -380,13 +402,18 @@ export class HandoffStore {
         for (const task of page.tasks) {
           const needsWork = task.assignee.id === actor && task.state === "open" && (!task.block || task.block.needsReview)
             || task.creator.id === actor && task.state === "completed" && task.integration?.state !== "queued" && task.integration?.state !== "running"
+            || task.creator.id === actor && task.state === 'open' && !!task.block?.userRequestNeedsReview
             || !!task.lastReply && this.replyNeedsAction(task.id, actor);
           if (!needsWork) continue;
           const ids = [task.id, ...(task.block?.dependencies ?? [])];
           const version = Number(this.db.prepare(
             "SELECT COALESCE(MAX(seq),0) AS seq FROM handoff_task_events WHERE task_id IN (" + ids.map(() => "?").join(",") + ")",
           ).get(...ids)!.seq);
-          const source = "checkpoint:" + actor + ":" + task.id + ":" + version;
+          // Queue only from the upgraded side's own consumer. An older peer
+          // must not consume/discard this review before it has loaded the rule.
+          const source = task.block?.userRequestNeedsReview
+            ? `user-action-review:${this.db.prepare("SELECT MAX(seq) AS seq FROM handoff_task_events WHERE task_id=? AND kind='block'").get(task.id)!.seq}:${actor}`
+            : "checkpoint:" + actor + ":" + task.id + ":" + version;
           const added = this.db.prepare("INSERT OR IGNORE INTO handoff_resume_events(recipient,task_id,kind,source) VALUES(?,?,'checkpoint',?)")
             .run(actor, task.id, source).changes;
           (added ? queued : stalled).push(task.id);
@@ -436,7 +463,10 @@ export class HandoffStore {
       }
       if (kind === "checkpoint") {
         const task = this.read(Number(row.task_id), actor);
-        relevant = task.assignee.id === actor && task.state === "open" && (!task.block || task.block.needsReview)
+        relevant = String(row.source).startsWith('user-action-review:')
+          ? task.state === 'open' && !!task.block?.userRequestNeedsReview
+            && row.source === `user-action-review:${task.events.findLast(e => e.kind === 'block')?.seq}:${actor}`
+          : task.assignee.id === actor && task.state === "open" && (!task.block || task.block.needsReview)
           || task.creator.id === actor && task.state === "completed" && task.integration?.state !== "queued" && task.integration?.state !== "running"
           || (task.state !== "closed" && task.state !== "cancelled") && !!task.lastReply && this.replyNeedsAction(task.id, actor);
       }
@@ -745,8 +775,13 @@ export class HandoffStore {
         const waitingFor = String(event.data.waitingFor);
         const userRequest = typeof event.data.userRequest === "string" && event.data.userRequest.trim()
           ? event.data.userRequest : isUserWaiting(waitingFor) ? String(event.data.reason) : undefined;
+        let userAction: UserAction | undefined;
+        if (userRequest) {
+          try { validateUserAction(event.data.userAction as UserAction | undefined); userAction = event.data.userAction as UserAction; }
+          catch { /* Keep legacy evidence, send it back to Agents for review. */ }
+        }
         task.block = {
-          reason: String(event.data.reason), waitingFor, ...(userRequest ? { userRequest } : {}),
+          reason: String(event.data.reason), waitingFor, ...(userRequest ? { userRequest, ...(userAction ? { userAction } : { userRequestNeedsReview: true }) } : {}),
           dependencies: (event.data.dependencies as { id: number }[]).map((dependency) => dependency.id),
           needsReview: false,
         };
@@ -773,7 +808,7 @@ export class HandoffStore {
       if (!d) throw new Error('Delivery snapshot is missing; preserve the task for reconciliation');
       task.delivery = { id: String(d.id), workspaceId: String(d.workspace_id), base: String(d.base), tip: String(d.tip), tree: String(d.tree), commits: JSON.parse(String(d.commits_json)), files: JSON.parse(String(d.files_json)), digest: String(d.digest) };
     }
-    if (task.block) task.block.needsReview = !!this.db.prepare(`SELECT 1 FROM handoff_task_dependencies d
+    if (task.block) task.block.needsReview = !!task.block.userRequestNeedsReview || !!this.db.prepare(`SELECT 1 FROM handoff_task_dependencies d
       JOIN handoff_task_events e ON e.task_id=d.dependency_id
       WHERE d.block_seq=? AND e.seq>d.observed_seq AND e.seq<=?
         AND e.kind IN ('complete','close','reopen','cancel','reply') LIMIT 1`).get(blockSeq, eventSeq)
@@ -814,14 +849,7 @@ export class HandoffStore {
         const eventSeq = Number(this.db.prepare("SELECT COALESCE(MAX(seq),0) AS seq FROM handoff_task_events").get()!.seq);
         const priorityAtSnapshot = "COALESCE((SELECT json_extract(p.data_json,'$.priority') FROM handoff_task_events p WHERE p.task_id=t.id AND p.kind='priority' AND p.seq<=? ORDER BY p.seq DESC LIMIT 1),t.priority)";
         const priorityRank = `CASE ${priorityAtSnapshot} WHEN 'urgent' THEN 4 WHEN 'high' THEN 3 WHEN 'normal' THEN 2 ELSE 1 END`;
-        const userRequestAtSnapshot = `CASE WHEN e.kind='block' AND (
-          length(trim(COALESCE(json_extract(e.data_json,'$.userRequest'),''))) > 0
-          OR instr(lower(COALESCE(json_extract(e.data_json,'$.waitingFor'),'')),'user') > 0
-          OR instr(COALESCE(json_extract(e.data_json,'$.waitingFor'),''),'用户') > 0
-          OR instr(lower(COALESCE(json_extract(e.data_json,'$.waitingFor'),'')),'manual test') > 0
-          OR instr(COALESCE(json_extract(e.data_json,'$.waitingFor'),''),'人工测试') > 0
-          OR instr(COALESCE(json_extract(e.data_json,'$.waitingFor'),''),'手工测试') > 0
-        ) THEN 1 ELSE 0 END`;
+        const userRequestAtSnapshot = `CASE WHEN e.kind='block' AND ${userActionEvidenceSql} THEN 1 ELSE 0 END`;
         const order = options.sort === "pending"
           ? "user_request_rank DESC, state_rank ASC, priority_rank DESC, id ASC"
           : options.sort === "reviewed"
@@ -829,7 +857,13 @@ export class HandoffStore {
             : "user_request_rank DESC, priority_rank DESC, id ASC";
         const rows = this.db.prepare(`SELECT t.id, ${priorityRank} AS priority_rank, ${userRequestAtSnapshot} AS user_request_rank, CASE e.kind
           WHEN 'close' THEN 3 WHEN 'cancel' THEN 3 WHEN 'complete' THEN 1 WHEN 'block' THEN
-            CASE WHEN EXISTS(SELECT 1 FROM handoff_task_dependencies d
+            CASE WHEN (NOT COALESCE(${userActionEvidenceSql},0) AND (
+              length(trim(COALESCE(json_extract(e.data_json,'$.userRequest'),'')))>0
+              OR lower(COALESCE(json_extract(e.data_json,'$.waitingFor'),'')) LIKE '%user%'
+              OR COALESCE(json_extract(e.data_json,'$.waitingFor'),'') LIKE '%用户%'
+              OR lower(COALESCE(json_extract(e.data_json,'$.waitingFor'),'')) LIKE '%manual test%'
+              OR COALESCE(json_extract(e.data_json,'$.waitingFor'),'') LIKE '%人工测试%'
+              OR COALESCE(json_extract(e.data_json,'$.waitingFor'),'') LIKE '%手工测试%')) OR EXISTS(SELECT 1 FROM handoff_task_dependencies d
               JOIN handoff_task_events changed ON changed.task_id=d.dependency_id
               WHERE d.block_seq=e.seq AND changed.seq>d.observed_seq AND changed.seq<=?
                 AND changed.kind IN ('complete','close','reopen','cancel')) THEN 0 ELSE 2 END
@@ -840,11 +874,12 @@ export class HandoffStore {
         ${options.actor === undefined ? "" : "WHERE creator=? OR assignee=?"} ORDER BY ${order}`)
           .all(eventSeq, eventSeq, eventSeq, ...(options.actor === undefined ? [] : [options.actor, options.actor]));
         const userRequestScope = options.actor === undefined ? "" : " AND (t.creator=? OR t.assignee=?)";
-        const userRequestCount = Number(this.db.prepare(`SELECT COUNT(*) AS count FROM handoff_tasks t
+        const userCounts = this.db.prepare(`SELECT COUNT(*) AS count,
+          COALESCE(SUM(CASE WHEN json_extract(e.data_json,'$.userAction.kind')='authorization' THEN 1 ELSE 0 END),0) AS decisions FROM handoff_tasks t
           JOIN handoff_task_events e ON e.seq=(SELECT seq FROM handoff_task_events WHERE task_id=t.id AND seq<=?
             AND kind IN ('block','unblock','complete','close','reopen','cancel') ORDER BY seq DESC LIMIT 1)
-          WHERE e.kind='block' AND ${userRequestAtSnapshot}${userRequestScope}`).get(eventSeq, ...(options.actor === undefined ? [] : [options.actor, options.actor]))!.count);
-        snapshot = { ids: rows.map((row) => Number(row.id)), eventSeq, actor: options.actor, userRequestCount };
+          WHERE e.kind='block' AND ${userRequestAtSnapshot}${userRequestScope}`).get(eventSeq, ...(options.actor === undefined ? [] : [options.actor, options.actor]))!;
+        snapshot = { ids: rows.map((row) => Number(row.id)), eventSeq, actor: options.actor, userRequestCount: Number(userCounts.count), userDecisionCount: Number(userCounts.decisions) };
         this.db.exec("COMMIT");
       } catch (error) { this.db.exec("ROLLBACK"); throw error; }
     }
@@ -876,11 +911,14 @@ export class HandoffStore {
       return task.priority !== next;
     });
   }
-  block(id: number, actor: string, reason: string, waitingFor: string, dependencyIds: number[] = [], userRequest?: string): HandoffTask {
+  block(id: number, actor: string, reason: string, waitingFor: string, dependencyIds: number[] = [], userRequest?: string, userAction?: UserAction): HandoffTask {
     text(reason, "Block reason and recovery condition", 2000);
     text(waitingFor, "Waiting for", 160);
     if (userRequest !== undefined) { text(userRequest, "User action request", 1000); userRequest = userRequest.trim(); }
-    const effectiveUserRequest = userRequest || (isUserWaiting(waitingFor) ? reason : undefined);
+    if (isUserWaiting(waitingFor) && !userRequest) throw new Error('userRequest is required when waiting for user action; do not turn routine work into approval requests');
+    if (userRequest) validateUserAction(userAction);
+    else if (userAction) throw new Error('userAction requires an explicit userRequest');
+    const effectiveUserRequest = userRequest;
     if (!Array.isArray(dependencyIds) || dependencyIds.length > 20) throw new Error("At most 20 dependencies are allowed");
     dependencyIds.forEach((dependency) => integer(dependency, "dependency id", 1));
     if (new Set(dependencyIds).size !== dependencyIds.length) throw new Error("Dependency ids must be unique");
@@ -900,7 +938,7 @@ export class HandoffStore {
           WHERE task_id=? AND kind IN ('complete','close','reopen','cancel','reply')`).get(dependency)!;
         return { id: dependency, seq: Number(latest.seq) };
       }).sort((a, b) => a.id - b.id);
-      const data = { reason, waitingFor, dependencies, ...(effectiveUserRequest ? { userRequest: effectiveUserRequest } : {}) };
+      const data = { reason, waitingFor, dependencies, ...(effectiveUserRequest ? { userRequest: effectiveUserRequest, userAction: { kind: userAction!.kind, limitation: userAction!.limitation, ...(userAction!.kind === 'authorization' ? { authority: userAction!.authority } : {}) } } : {}) };
       const previous = task.events.findLast((event) => event.kind === "block");
       if (task.block && JSON.stringify(previous?.data) === JSON.stringify(data)) return task;
       const event = this.db.prepare("INSERT INTO handoff_task_events(task_id,actor,kind,data_json,at) VALUES(?,?,'block',?,?)")

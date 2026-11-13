@@ -43,6 +43,12 @@ test("event scope keeps summary safeguards and never equates listed with read", 
   assert.match(COWORK_RULES, /urgent、high、normal 或 low/);
   assert.match(COWORK_RULES, /同一状态且条件具备/);
   assert.match(COWORK_RULES, /高优先级不解除阻塞/);
+  assert.match(COWORK_RULES, /不逐单索取“批准继续”/);
+  assert.match(COWORK_RULES, /不能引用 Agent 自建的审批任务充当依据/);
+  assert.match(COWORK_RULES, /其余任务引用依赖，不逐层重复索批/);
+  assert.match(COWORK_RUNTIME_RULES, /无需用户再说“继续”/);
+  assert.match(COWORK_RUNTIME_RULES, /不能把升级复核本身交给用户批准/);
+  assert.doesNotMatch(COWORK_RUNTIME_RULES, /需由用户启动复查/);
   assert.match(COWORK_RULES, /userRequest/);
   assert.match(COWORK_RULES, /承接侧必须立即调用一次/);
   assert.match(COWORK_RULES, /notify_user/);

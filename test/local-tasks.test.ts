@@ -44,7 +44,7 @@ test('omitting to or explicitly assigning self creates a private local task, not
 test('a single owner can implement, revise, verify and close; self-verification is not peer review', () => {
   const f = fixture(); try {
     const t = f.create();
-    f.store.block(t.id, 'a', 'external input missing', 'user');
+    f.store.block(t.id, 'a', 'external input missing', 'user', [], 'Supply the source document through the private channel', { kind: 'input', limitation: 'Only the user has the original document; project sources have been checked' });
     assert.deepEqual(f.drain('a'), [], 'a local blocker is not a report to another side');
     f.store.unblock(t.id, 'a', 'input verified'); f.store.check(t.id, 'a', 1, true);
     f.store.complete(t.id, 'a', commit, 'implemented');

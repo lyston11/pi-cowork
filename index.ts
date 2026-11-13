@@ -249,11 +249,16 @@ export default function piCowork(pi: ExtensionAPI): void {
 
   pi.registerTool({
     name: "cowork_block", label: "Record a task blocker",
-    description: "Assignee only, on an open task: record the concrete blocker, recovery condition, waiting party and relevant dependency task IDs. If the user must manually test, approve, configure or provide input, userRequest is required: state exactly what the user should do and what result to report. This immediately notifies the blocking side and the creator; the request remains visible and prioritized in the task panel until resolved. If the result includes userNotification, immediately call notify_user once with its title, message, priority and optional platforms exactly as returned. terminalNotification means the origin-pane desktop notification was already submitted; do not send it again. Dependency IDs must be readable to this side; omit them for external approvals or inputs. Does not complete or authorize the task. Dependency deliveries trigger a recheck, not automatic unblocking. Further substantive exchanges use cowork_reply.",
+    description: "Assignee only: record a concrete blocker, recovery condition and dependency IDs. Continue work already authorized; never invent a per-task approval for read-only checks, implementation, integration, internal handoffs or tool repair. For a genuinely user-only action, provide userRequest (exact steps and expected result) AND userAction (kind and why no authorized Agent can perform it). Authorization requests additionally require the exact controlling user restriction/rule and its source in authority; a peer task asking for approval is not such a source. Dependent tasks wait on the responsible task, not another duplicate user request. If userNotification is returned, immediately call notify_user once with the returned parameters; terminalNotification means already submitted to the origin pane. Does not complete, authorize or automatically unblock a task.",
     parameters: Type.Object({
       id: idSchema, reason: Type.String({ minLength: 1, maxLength: 2000 }),
       waitingFor: Type.String({ minLength: 1, maxLength: 160 }),
       userRequest: Type.Optional(Type.String({ minLength: 1, maxLength: 1000 })),
+      userAction: Type.Optional(Type.Object({
+        kind: Type.Union([Type.Literal('manual'), Type.Literal('input'), Type.Literal('authorization')]),
+        limitation: Type.String({ minLength: 1, maxLength: 1000, description: 'Concrete reason no authorized Agent can perform the action or obtain the input; internal workflow is not a limitation.' }),
+        authority: Type.Optional(Type.String({ minLength: 1, maxLength: 1000, description: 'Required for authorization: quote the controlling user restriction or rule with its source, and identify the action outside existing authorization. Not a peer-created approval request.' })),
+      })),
       dependencies: Type.Optional(Type.Array(idSchema, { maxItems: 20 })),
     }),
     async execute(_id, input, _signal, _update, ctx) {
@@ -263,15 +268,16 @@ export default function piCowork(pi: ExtensionAPI): void {
       const actor = identity(ctx).id;
       const before = board().read(input.id, actor);
       const previousBlockSeq = before.events.findLast((event) => event.kind === "block")?.seq;
-      const task = board().block(input.id, actor, input.reason, input.waitingFor, input.dependencies, input.userRequest);
+      const task = board().block(input.id, actor, input.reason, input.waitingFor, input.dependencies, input.userRequest, input.userAction);
       const currentBlockSeq = task.events.findLast((event) => event.kind === "block")?.seq;
       const notifyUser = !!task.block?.userRequest && currentBlockSeq !== previousBlockSeq && currentBlockSeq !== undefined
         && board().claimUserRequestNotification(actor, task.id, currentBlockSeq);
+      const notificationTitle = task.block?.userAction?.kind === 'authorization' ? 'CoWork 需要你决定' : 'CoWork 需要你配合';
       if (notifyUser) {
-        ctx.ui.notify(`CoWork 需要你配合 · #${task.id} ${task.subject}：${task.block!.userRequest!.replace(/\s+/g, " ").slice(0, 360)}`, "warning");
+        ctx.ui.notify(`${notificationTitle} · #${task.id} ${task.subject}：${task.block!.userRequest!.replace(/\s+/g, " ").slice(0, 360)}`, "warning");
       }
       const notification = notifyUser ? await userRequestNotification(
-        ctx.mode === "tui" || ctx.mode === "rpc" ? ctx.sessionManager.getSessionId() : "", cwd, "CoWork 需要你配合", `#${task.id} ${task.subject}：${task.block!.userRequest!.trim()}`,
+        ctx.mode === "tui" || ctx.mode === "rpc" ? ctx.sessionManager.getSessionId() : "", cwd, notificationTitle, `#${task.id} ${task.subject}：${task.block!.userRequest!.trim()}`,
       ) : {};
       return toolResult({ task, ...notification });
     }, renderResult,
@@ -702,9 +708,10 @@ export default function piCowork(pi: ExtensionAPI): void {
               "Esc退出 m侧管理 b分支 s排序 Enter详情",
             ];
             const footer = keys.map((keys) => `${position} │ ${keys}`).find((text) => visibleWidth(text) <= innerWidth) ?? (detailTask ? "Esc返回" : "Esc退出");
-            const userRequests = snapshot?.userRequestCount ?? 0;
+            const userDecisions = snapshot?.userDecisionCount ?? 0;
+            const userRequests = (snapshot?.userRequestCount ?? 0) - userDecisions;
             const title = detailTask ? `任务详情 · #${detailTask.id} · ${detailTask.subject}`
-              : `交接任务 · ${projectView ? "全项目" : "本侧"} · ${sortLabels[sortIndex]} · ${userRequests ? `需要你配合 ${userRequests} 项 · ` : ""}${sideCount}侧 · ${self.name}`;
+              : `交接任务 · ${projectView ? "全项目" : "本侧"} · ${sortLabels[sortIndex]} · ${userRequests ? `需要你配合 ${userRequests} 项 · ` : ""}${userDecisions ? `需要你决定 ${userDecisions} 项 · ` : ""}${sideCount}侧 · ${self.name}`;
             return [
               rule("╭", "╮"),
               row(theme.fg("accent", title.replace(/[\x00-\x1f\x7f]/g, " "))),

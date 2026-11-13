@@ -7,6 +7,9 @@ import test from "node:test";
 import { HandoffStore } from "../store.ts";
 import { EventResume } from "../resume.ts";
 
+const manualAction = { kind: 'manual' as const, limitation: 'Only the user can operate the physical Windows test device; no remote interface exists' };
+const approvalAction = { kind: 'authorization' as const, limitation: 'Production restart is outside the authorized read-only work', authority: 'User instruction: do not restart any service without my explicit approval' };
+
 function fixture() {
   const root = mkdtempSync(join(tmpdir(), "pi-cowork-resume-"));
   const store = new HandoffStore(root);
@@ -195,7 +198,7 @@ test("user test blockers notify the creator with the actionable request", () => 
   const d = dispatcher(f, [], f.a);
   try {
     const task = f.create();
-    f.peer.block(task.id, f.b.id, "Need real manual verification", "user", [], "Run the installer on Windows and report the exact error text");
+    f.peer.block(task.id, f.b.id, "Need real manual verification", "user", [], "Run the installer on Windows and report the exact error text", manualAction);
     d.resume.tick();
     assert.equal(d.notices.length, 1);
     assert.match(d.notices[0], /需要你配合/);
@@ -210,7 +213,7 @@ test("user requests notify once even when resume is paused and are backfilled fo
   const f = fixture();
   const task = f.create();
   const request = "Open the saved build on Windows and report the exact startup error";
-  f.peer.block(task.id, f.b.id, "Need a real user test", "user", [], request);
+  f.peer.block(task.id, f.b.id, "Need a real user test", "user", [], request, manualAction);
   (f.store as any).db.exec("DROP TABLE handoff_user_request_notifications");
   const upgraded = new HandoffStore(f.root);
   try {
@@ -234,7 +237,7 @@ test('blocked and dependency signals retain their specific safety reminders', ()
   const f = fixture(), d = dispatcher(f);
   try {
     const dependency = f.create(f.b.id, f.a.id);
-    f.peer.block(dependency.id, f.a.id, 'needs user approval', 'user');
+    f.peer.block(dependency.id, f.a.id, 'needs user approval', 'user', [], 'Decide whether to restart the production service', approvalAction);
     d.resume.tick();
     assert.match(d.sent[0].content, /blocked：发起方复核/);
     assert.match(d.sent[0].content, /其余只读新增、变化或仍可执行项/);
@@ -275,11 +278,11 @@ test('blocked report targets only that report, not stable blocked or waiting tas
   const f = fixture(), d = dispatcher(f);
   try {
     const stable = f.create();
-    f.peer.block(stable.id, f.b.id, 'approval unchanged', 'user');
+    f.peer.block(stable.id, f.b.id, 'approval unchanged', 'user', [], 'Decide whether to restart the production service', approvalAction);
     const waiting = f.create(); f.complete(waiting.id);
     f.create(f.b.id, f.a.id); // Sent work is not this side's implementation duty.
     const target = f.create(f.b.id, f.a.id);
-    f.peer.block(target.id, f.a.id, 'missing external input', 'user');
+    f.peer.block(target.id, f.a.id, 'missing external input', 'user', [], 'Run the local hardware test and report the result', manualAction);
     d.resume.tick();
     assert.deepEqual(d.sent[0].details.events, [{ taskId: target.id, kind: 'blocked' }]);
     assert.doesNotMatch(d.sent[0].content, new RegExp(`#${stable.id}(?:[^0-9]|$)`));
@@ -299,7 +302,7 @@ test('dependency plan names the affected blocked task and keeps unrelated blocke
     f.store.acknowledgeResume(f.b.id, 'baseline', f.store.pendingResume(f.b.id, 'baseline')!.throughSeq);
     f.store.releaseResume(f.b.id, 'baseline');
     const target = f.create(); f.peer.block(target.id, f.b.id, 'reviewed input, waiting acceptance', 'a', [dependency.id]);
-    const stable = f.create(); f.peer.block(stable.id, f.b.id, 'external condition unchanged', 'user');
+    const stable = f.create(); f.peer.block(stable.id, f.b.id, 'external condition unchanged', 'user', [], 'Run the local hardware test and report the result', manualAction);
     f.peer.closeTask(dependency.id, f.b.id, 'a'.repeat(40), 'input verified');
     d = dispatcher(f); d.resume.tick();
     assert.deepEqual(d.sent[0].details.events, [{ taskId: target.id, kind: 'dependency' }]);
@@ -394,7 +397,7 @@ test("checkpoints leave recorded blockers alone and recheck changed dependencies
     assert.deepEqual(f.store.reconcileResume(f.b.id, "b"), { queued: [], stalled: [] });
     f.complete(dependency.id, f.a.id);
     assert(f.store.reconcileResume(f.b.id, "b").queued.includes(task.id));
-    f.store.block(task.id, f.b.id, "Delivered input still lacks approval", "user", []);
+    f.store.block(task.id, f.b.id, "Delivered input still lacks approval", "user", [], 'Decide whether to restart the production service', approvalAction);
     assert(!f.store.pendingResume(f.b.id, "b")!.events.some(e => e.taskId === task.id));
     assert(!f.store.reconcileResume(f.b.id, "b").stalled.includes(task.id));
   } finally { f.cleanup(); }
@@ -425,7 +428,7 @@ test("startup and settled checkpoints resume once, warn without looping, and sur
       restored.resume.runStarted(); restored.resume.settled(false);
       assert.equal(restored.sent.length, 1, "real progress permits a new completion checkpoint");
       restored.persist(restored.sent[0]); restored.resume.tick();
-      f.peer.block(task.id, f.b.id, "Need explicit approval", "user", []);
+      f.peer.block(task.id, f.b.id, "Need explicit approval", "user", [], 'Decide whether to restart the production service', approvalAction);
       restored.resume.runStarted(); restored.resume.settled(false);
       assert.equal(restored.sent.length, 1, "a genuine recorded blocker stops cleanly");
     } finally { restored.resume.stop(); }
