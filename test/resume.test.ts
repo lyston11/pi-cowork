@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -356,6 +356,95 @@ test("abort and model failure persistently pause event runs without discarding p
     f.store.setResumeEnabled(f.b.id, true);
     d.resume.tick(); assert.equal(d.sent.length, 2);
   } finally { d.resume.stop(); f.cleanup(); }
+});
+
+test("explicit recovery while already enabled rechecks current work once, not stale blockers", () => {
+  const f = fixture();
+  const d = dispatcher(f);
+  try {
+    const task = f.create();
+    const blocked = f.create();
+    f.store.block(blocked.id, f.b.id, "Missing required input", "peer");
+    const self = f.create(f.b.id, f.b.id);
+    f.complete(self.id);
+    d.resume.tick(); d.persist(d.sent[0]); d.resume.tick();
+    assert.equal(f.store.resumeStatus(f.b.id).pendingEvents, 0);
+    f.store.setResumeEnabled(f.b.id, true, null, true);
+    const pending = f.store.resumeStatus(f.b.id).pendingEvents;
+    f.store.setResumeEnabled(f.b.id, true, null, true);
+    assert.equal(f.store.resumeStatus(f.b.id).pendingEvents, pending);
+    d.resume.tick();
+    assert.deepEqual(d.sent[1].details.events, [{ taskId: task.id, kind: "created" }, { taskId: self.id, kind: "complete" }]);
+  } finally { d.resume.stop(); f.cleanup(); }
+});
+
+test("background result survives reload and pause and wakes only its assignee once, even for a failed result", () => {
+  const f = fixture();
+  const task = f.create(f.b.id, f.b.id);
+  const output = join(f.root, "result.json");
+  const entries: unknown[] = [];
+  const d = dispatcher(f, entries);
+  try {
+    assert.throws(() => f.store.watchBackgroundResult(task.id, f.c.id, output, 30), /not visible/);
+    assert.throws(() => f.store.watchBackgroundResult(task.id, f.b.id, "relative", 30), /absolute/);
+    const waiting = f.store.watchBackgroundResult(task.id, f.b.id, output, 30);
+    assert.deepEqual(f.peer.watchBackgroundResult(task.id, f.b.id, output, 40), waiting);
+    assert.throws(() => f.store.watchBackgroundResult(task.id, f.b.id, output + ".other", 30), /already watching/);
+    assert.equal(f.peer.list(f.b.id).tasks[0].backgroundResult?.state, "waiting");
+    d.resume.tick(); assert.equal(d.sent.length, 0, "no checkpoint while the registered job is pending");
+    d.resume.stop();
+    f.store.setResumeEnabled(f.b.id, false);
+    writeFileSync(output + ".tmp", '{"status":"failed"}');
+    renameSync(output + ".tmp", output);
+    const restored = dispatcher(f, entries);
+    const unrelated = dispatcher(f, [], f.a);
+    try {
+      restored.resume.tick(); unrelated.resume.tick();
+      assert.equal(restored.sent.length, 0);
+      assert.equal(unrelated.sent.length, 0);
+      assert.equal(f.store.read(task.id, f.b.id).backgroundResult?.state, "waiting");
+      f.store.setResumeEnabled(f.b.id, true, null, true);
+      restored.idle(false); restored.resume.tick(); assert.equal(restored.sent.length, 0);
+      restored.idle(true); restored.resume.tick();
+      assert.equal(restored.sent.length, 1);
+      assert.match(restored.sent[0].content, /background：.*不代表通过/);
+      assert.doesNotMatch(restored.sent[0].content, /failed|result\.json/);
+      const after = f.peer.read(task.id, f.b.id);
+      assert.deepEqual(after.backgroundResult, { ...waiting, state: "ready" });
+      assert.equal(after.state, "open");
+      assert.equal(after.block, null);
+      restored.persist(restored.sent[0]); restored.resume.tick(); restored.resume.settled(false); restored.resume.tick();
+      assert.equal(restored.sent.length, 1, "an unchanged result must not generate a second turn");
+      assert.match(restored.notices.at(-1)!, /仍未收口/);
+    } finally { unrelated.resume.stop(); restored.resume.stop(); }
+  } finally { d.resume.stop(); f.cleanup(); }
+});
+
+test("background timeout is durable and cancelled or reopened work cannot receive a stale result", () => {
+  const f = fixture();
+  try {
+    const task = f.create();
+    assert.throws(() => f.store.watchBackgroundResult(task.id, f.a.id, join(f.root, "wrong"), 1), /Only the assignee/);
+    assert(f.store.acquireResume(f.b.id, f.b.sessionId, "consumer"));
+    f.store.acknowledgeResume(f.b.id, "consumer", f.store.pendingResume(f.b.id, "consumer")!.throughSeq);
+    const file = join(f.root, "late.json"), cancelledFile = join(f.root, "cancelled.json");
+    const watch = f.store.watchBackgroundResult(task.id, f.b.id, file, 1);
+    const cancelled = f.create();
+    f.store.watchBackgroundResult(cancelled.id, f.b.id, cancelledFile, 1);
+    f.store.cancel(cancelled.id, f.a.id, "no longer required");
+    writeFileSync(cancelledFile, "obsolete");
+    f.store.discoverBackgroundResults(f.b.id, "wrong-consumer", Date.parse(watch.deadline));
+    assert.equal(f.peer.read(task.id, f.b.id).backgroundResult?.state, "waiting");
+    f.store.discoverBackgroundResults(f.b.id, "consumer", Date.parse(watch.deadline));
+    const beforeReturn = f.store.pendingResume(f.b.id, "consumer")!;
+    assert.deepEqual(beforeReturn.events.filter(e => e.kind === 'background').map(e => e.taskId), [task.id]);
+    assert.equal(f.peer.read(task.id, f.b.id).backgroundResult?.state, "timedOut");
+    assert.equal(f.peer.read(task.id, f.a.id).backgroundResult, undefined);
+    f.complete(task.id);
+    f.store.reopen(task.id, f.a.id, "revision");
+    assert.throws(() => f.store.watchBackgroundResult(task.id, f.b.id, file, 1), /fresh result path/);
+    assert.equal(f.store.pendingResume(f.b.id, "consumer")!.events.some(e => e.kind === 'background'), false);
+  } finally { f.cleanup(); }
 });
 
 test("checkpoints persist once per task revision and only target this side's work", () => {

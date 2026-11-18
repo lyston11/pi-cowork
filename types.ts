@@ -1,4 +1,4 @@
-export const HANDOFF_EXTENSION_VERSION = "5.4.6";
+export const HANDOFF_EXTENSION_VERSION = "5.4.7";
 
 export interface Side {
   id: string;
@@ -27,6 +27,12 @@ export interface TaskBlock {
   needsReview: boolean;
 }
 
+export interface BackgroundResult {
+  path: string;
+  deadline: string;
+  state: "waiting" | "ready" | "timedOut" | "unavailable";
+}
+
 export interface TaskEvent {
   seq: number;
   actor: string;
@@ -48,6 +54,7 @@ export interface HandoffTask {
   items: { text: string; checked: boolean }[];
   state: TaskState;
   block: TaskBlock | null;
+  backgroundResult?: BackgroundResult;
   lastReply?: { seq: number; actor: string; at: string; inReplyTo?: number };
   deliveryId?: string;
   delivery?: { id: string; workspaceId: string; base: string; tip: string; tree: string; commits: string[]; files: string[]; digest: string };

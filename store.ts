@@ -1,10 +1,10 @@
 import { initializeIntegration } from "./integration-store.ts";
 import { initializeWorkspaces } from "./workspaces.ts";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdirSync } from "node:fs";
-import { join } from "node:path";
+import { lstatSync, mkdirSync } from "node:fs";
+import { isAbsolute, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { HANDOFF_EXTENSION_VERSION, type CreateInput, type HandoffTask, type Side, type TaskEvent, type TaskPriority, type TaskSummary, type UserAction } from "./types.ts";
+import { HANDOFF_EXTENSION_VERSION, type CreateInput, type HandoffTask, type Side, type TaskEvent, type TaskPriority, type TaskSummary, type BackgroundResult, type UserAction } from "./types.ts";
 
 function text(value: unknown, name: string, max: number): string {
   if (typeof value !== "string" || !value.trim() || value.length > max) {
@@ -74,7 +74,7 @@ export interface HumanTaskSnapshot {
 export interface ResumeEvent {
   seq: number;
   taskId: number;
-  kind: "created" | "complete" | "reopen" | "close" | "cancel" | "dependency" | "checkpoint" | "integration" | "blocked" | "reply" | "priority";
+  kind: "created" | "complete" | "reopen" | "close" | "cancel" | "dependency" | "checkpoint" | "integration" | "blocked" | "reply" | "priority" | "background";
 }
 
 export interface ResumeBatch {
@@ -258,6 +258,17 @@ export class HandoffStore {
           consumer TEXT,
           lease_until INTEGER NOT NULL DEFAULT 0
         );
+        CREATE TABLE IF NOT EXISTS handoff_background_results (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          task_id INTEGER NOT NULL REFERENCES handoff_tasks(id),
+          actor TEXT NOT NULL REFERENCES handoff_sides(id),
+          generation INTEGER NOT NULL,
+          path TEXT NOT NULL,
+          deadline INTEGER NOT NULL,
+          state TEXT NOT NULL DEFAULT 'waiting',
+          UNIQUE(task_id,path)
+        );
+        CREATE INDEX IF NOT EXISTS handoff_background_waiting ON handoff_background_results(actor,state);
         CREATE TABLE IF NOT EXISTS handoff_user_request_notifications (
           task_id INTEGER NOT NULL REFERENCES handoff_tasks(id),
           block_seq INTEGER NOT NULL REFERENCES handoff_task_events(seq),
@@ -408,6 +419,73 @@ export class HandoffStore {
           AND (response.kind<>'reply' OR json_extract(response.data_json,'$.inReplyTo')>=incoming.seq)) LIMIT 1`).get(id, actor, fromSeq, actor);
   }
 
+  private backgroundGeneration(id: number): number {
+    return Number(this.db.prepare(`SELECT COALESCE(MAX(seq),0) AS seq FROM handoff_task_events
+      WHERE task_id=? AND kind IN ('complete','reopen','close','cancel')`).get(id)!.seq);
+  }
+
+  watchBackgroundResult(id: number, actor: string, path: string, timeoutSeconds: number) {
+    text(path, 'Background result path', 512);
+    if (!isAbsolute(path) || /[\x00-\x1f\x7f]/.test(path)) throw new Error('Provide an absolute, local result file path without control characters');
+    const output = resolve(path);
+    integer(timeoutSeconds, 'background result timeout', 1);
+    if (timeoutSeconds > 86400) throw new Error('Background result timeout must be at most 86400 seconds');
+    return this.transaction(() => {
+      const task = this.read(id, actor);
+      if (task.assignee.id !== actor || task.state !== 'open') throw new Error('Only the assignee of an open task can watch its own background result');
+      const generation = this.backgroundGeneration(id);
+      const previous = this.db.prepare('SELECT generation FROM handoff_background_results WHERE task_id=? AND path=?').get(id, output);
+      if (previous && previous.generation !== generation) throw new Error('Use a fresh result path for the reopened task');
+      if (previous) return this.backgroundResult(id, actor, output)!;
+      if (this.db.prepare(`SELECT 1 FROM handoff_background_results WHERE task_id=? AND generation=? AND state='waiting'`).get(id, generation)) {
+        throw new Error('This task is already watching a background result; inspect it with cowork_read before starting another');
+      }
+      this.db.prepare('INSERT INTO handoff_background_results(task_id,actor,generation,path,deadline) VALUES(?,?,?,?,?)')
+        .run(id, actor, generation, output, Date.now() + timeoutSeconds * 1000);
+      return this.backgroundResult(id, actor, output)!;
+    });
+  }
+
+  private backgroundResult(id: number, actor: string, path?: string): BackgroundResult | undefined {
+    const row = this.db.prepare(`SELECT path,deadline,state FROM handoff_background_results
+      WHERE task_id=? AND actor=? AND generation=? AND state<>'cancelled' ${path === undefined ? '' : 'AND path=?'} ORDER BY id DESC LIMIT 1`)
+      .get(id, actor, this.backgroundGeneration(id), ...(path === undefined ? [] : [path]));
+    return row ? { path: String(row.path), deadline: new Date(Number(row.deadline)).toISOString(), state: row.state as BackgroundResult["state"] } : undefined;
+  }
+
+  discoverBackgroundResults(actor: string, consumer: string, now = Date.now()): void {
+    const watches = this.db.prepare(`SELECT w.id,w.task_id,w.generation,w.path,w.deadline FROM handoff_background_results w
+      JOIN handoff_resume_state s ON s.side_id=w.actor AND s.consumer=? AND s.enabled=1
+      WHERE w.actor=? AND w.state='waiting' ORDER BY w.id`).all(consumer, actor);
+    for (const watch of watches) {
+      const taskId = Number(watch.task_id), generation = Number(watch.generation);
+      let state: BackgroundResult['state'] | 'cancelled' = 'waiting';
+      if (generation !== this.backgroundGeneration(taskId)) state = 'cancelled';
+      else try {
+        const file = lstatSync(String(watch.path), { throwIfNoEntry: false });
+        if (file) state = file.isFile() ? 'ready' : 'unavailable';
+        else if (Number(watch.deadline) <= now) state = 'timedOut';
+      } catch { state = 'unavailable'; }
+      if (state === 'waiting') continue;
+      this.transaction(() => {
+        if (generation !== this.backgroundGeneration(taskId)) state = 'cancelled';
+        const changed = this.db.prepare(`UPDATE handoff_background_results SET state=? WHERE id=? AND state='waiting'
+          AND EXISTS(SELECT 1 FROM handoff_resume_state WHERE side_id=? AND consumer=? AND enabled=1)`).run(state, watch.id, actor, consumer).changes;
+        if (changed && state !== 'cancelled') {
+          this.db.prepare(`INSERT INTO handoff_resume_events(recipient,task_id,kind,source) VALUES(?,?,'background',?)`)
+            .run(actor, taskId, `background:${watch.id}:${this.resumeRevision(this.read(taskId, actor))}`);
+        }
+      });
+    }
+  }
+
+  private resumeRevision(task: Pick<TaskSummary, "id" | "block">): number {
+    const ids = [task.id, ...(task.block?.dependencies ?? [])];
+    return Number(this.db.prepare(
+      "SELECT COALESCE(MAX(seq),0) AS seq FROM handoff_task_events WHERE task_id IN (" + ids.map(() => "?").join(",") + ")",
+    ).get(...ids)!.seq);
+  }
+
   reconcileResume(actor: string, consumer: string): { queued: number[]; stalled: number[] } {
     return this.transaction(() => {
       const queued: number[] = [], stalled: number[] = [];
@@ -416,15 +494,20 @@ export class HandoffStore {
       do {
         const page = this.list(actor, { activeOnly: true, limit: 100, before });
         for (const task of page.tasks) {
-          const needsWork = task.assignee.id === actor && task.state === "open" && (!task.block || task.block.needsReview)
+          const needsWork = task.assignee.id === actor && task.state === "open" && ((!task.block && task.backgroundResult?.state !== 'waiting') || task.block?.needsReview)
             || task.creator.id === actor && task.state === "completed" && task.integration?.state !== "queued" && task.integration?.state !== "running"
             || task.creator.id === actor && task.state === 'open' && !!task.block?.userRequestNeedsReview
             || !!task.lastReply && this.replyNeedsAction(task.id, actor);
           if (!needsWork) continue;
-          const ids = [task.id, ...(task.block?.dependencies ?? [])];
-          const version = Number(this.db.prepare(
-            "SELECT COALESCE(MAX(seq),0) AS seq FROM handoff_task_events WHERE task_id IN (" + ids.map(() => "?").join(",") + ")",
-          ).get(...ids)!.seq);
+          const version = this.resumeRevision(task);
+          if (task.backgroundResult && !task.block?.userRequestNeedsReview && this.db.prepare(`
+            SELECT 1 FROM handoff_background_results w JOIN handoff_resume_events r
+              ON r.source='background:'||w.id||':'||CAST(? AS INTEGER) WHERE w.task_id=? AND w.actor=?
+              AND w.id=(SELECT MAX(id) FROM handoff_background_results WHERE task_id=w.task_id AND actor=w.actor)`
+          ).get(version, task.id, actor)) {
+            stalled.push(task.id);
+            continue;
+          }
           // Queue only from the upgraded side's own consumer. An older peer
           // must not consume/discard this review before it has loaded the rule.
           const source = task.block?.userRequestNeedsReview
@@ -450,12 +533,17 @@ export class HandoffStore {
       FROM handoff_resume_events r WHERE recipient=? AND seq>? ORDER BY seq LIMIT 100`).all(actor, Number(state.ack_seq));
     if (!rows.length) return null;
     let hasWork: boolean | undefined;
-    const events = new Map<number, ResumeEvent>();
+    const events = new Map<number | string, ResumeEvent>();
     for (const row of rows) {
       const kind = row.kind as ResumeEvent["kind"];
       let relevant = kind === "complete" || kind === "integration" ? row.current_kind === "complete"
         : kind === "close" || kind === "cancel" ? row.current_kind === kind : row.current_kind === null || row.current_kind === "reopen";
       if (kind === "priority") relevant = row.source === `priority:${row.current_priority_seq}`;
+      if (kind === 'background') {
+        const watch = this.db.prepare(`SELECT id,generation,state FROM handoff_background_results WHERE task_id=? AND actor=? ORDER BY id DESC LIMIT 1`).get(row.task_id, actor);
+        relevant = relevant && !!watch && String(row.source).startsWith(`background:${watch.id}:`) && watch.generation === (row.current_seq ?? 0)
+          && ['ready', 'timedOut', 'unavailable'].includes(String(watch.state));
+      }
       if (String(row.source).startsWith("task:") && row.current_seq !== null) relevant = false;
       if (String(row.source).startsWith("event:") && row.source !== `event:${row.current_seq}`) relevant = false;
       if (relevant && kind === "close") {
@@ -482,7 +570,7 @@ export class HandoffStore {
         relevant = String(row.source).startsWith('user-action-review:')
           ? task.state === 'open' && !!task.block?.userRequestNeedsReview
             && row.source === `user-action-review:${task.events.findLast(e => e.kind === 'block')?.seq}:${actor}`
-          : task.assignee.id === actor && task.state === "open" && (!task.block || task.block.needsReview)
+          : task.assignee.id === actor && task.state === "open" && ((!task.block && task.backgroundResult?.state !== "waiting") || task.block?.needsReview)
           || task.creator.id === actor && task.state === "completed" && task.integration?.state !== "queued" && task.integration?.state !== "running"
           || (task.state !== "closed" && task.state !== "cancelled") && !!task.lastReply && this.replyNeedsAction(task.id, actor);
       }
@@ -499,10 +587,10 @@ export class HandoffStore {
       }
       if (relevant && (kind === "created" || kind === "reopen")) {
         const task = this.read(Number(row.task_id), actor);
-        if (task.block && !task.block.needsReview) relevant = false;
+        if (task.block && !task.block.needsReview || String(row.source).startsWith("retry:") && task.backgroundResult?.state === "waiting" && !task.block?.needsReview) relevant = false;
       }
       if (row.current_kind === "cancel" && kind !== "cancel") relevant = false;
-      if (relevant) events.set(Number(row.task_id), { seq: Number(row.seq), taskId: Number(row.task_id), kind });
+      if (relevant) events.set(kind === 'background' ? String(row.source) : Number(row.task_id), { seq: Number(row.seq), taskId: Number(row.task_id), kind });
     }
     return { throughSeq: Number(rows.at(-1)!.seq), events: [...events.values()] };
   }
@@ -519,21 +607,24 @@ export class HandoffStore {
     this.db.prepare("UPDATE handoff_resume_state SET consumer=NULL,lease_until=0 WHERE side_id=? AND consumer=?").run(actor, consumer);
   }
 
-  setResumeEnabled(actor: string, enabled: boolean, reason: string | null = null): void {
+  setResumeEnabled(actor: string, enabled: boolean, reason: string | null = null, requestedByUser = false): void {
     this.transaction(() => {
       if (enabled && this.db.prepare('SELECT 1 FROM handoff_side_removals WHERE side_id=?').get(actor)) throw new Error('Side was removed; start a new Pi session to join again');
       const previous = this.db.prepare("SELECT enabled FROM handoff_resume_state WHERE side_id=?").get(actor);
       this.db.prepare(`INSERT INTO handoff_resume_state(side_id,enabled,reason) VALUES(?,?,?)
         ON CONFLICT(side_id) DO UPDATE SET enabled=excluded.enabled,reason=excluded.reason`).run(actor, Number(enabled), reason);
-      if (enabled && previous?.enabled === 0) {
-        // Explicit user recovery should also retry delivered-but-failed work.
-        // Repeated 'on' while enabled creates no new events or model loop.
+      if (enabled && (previous?.enabled === 0 || requestedByUser)) {
+        // A human recovery command checks current work, never replays the old cursor.
+        // Keep at most one outstanding retry for a task until it is consumed.
         const source = `retry:${randomUUID()}:`;
         this.db.prepare(`INSERT INTO handoff_resume_events(recipient,task_id,kind,source)
-          SELECT ?,t.id,CASE WHEN t.assignee=? THEN 'created' ELSE 'complete' END,?||t.id FROM handoff_tasks t
-          WHERE (t.assignee=? AND COALESCE((SELECT kind FROM handoff_task_events WHERE task_id=t.id AND kind IN ('complete','close','reopen','cancel') ORDER BY seq DESC LIMIT 1),'reopen')='reopen')
-            OR (t.creator=? AND (SELECT kind FROM handoff_task_events WHERE task_id=t.id AND kind IN ('complete','close','reopen','cancel') ORDER BY seq DESC LIMIT 1)='complete')`)
-          .run(actor, actor, source, actor, actor);
+          SELECT ?,t.id,CASE WHEN t.assignee=? AND lifecycle IS NOT 'complete' THEN 'created' ELSE 'complete' END,?||t.id
+          FROM (SELECT t.*, (SELECT kind FROM handoff_task_events WHERE task_id=t.id AND kind IN ('complete','close','reopen','cancel') ORDER BY seq DESC LIMIT 1) AS lifecycle
+            FROM handoff_tasks t WHERE t.assignee=? OR t.creator=?) t
+          WHERE ((t.assignee=? AND COALESCE(lifecycle,'reopen')='reopen') OR (t.creator=? AND lifecycle='complete'))
+            AND NOT EXISTS(SELECT 1 FROM handoff_resume_events r JOIN handoff_resume_state s ON s.side_id=r.recipient
+              WHERE r.recipient=? AND r.task_id=t.id AND r.seq>s.ack_seq AND r.source LIKE 'retry:%')`)
+          .run(actor, actor, source, actor, actor, actor, actor, actor);
       }
     });
   }
@@ -770,7 +861,12 @@ export class HandoffStore {
     integer(id, "task id", 1);
     const row = this.db.prepare("SELECT * FROM handoff_tasks WHERE id=? AND (creator=? OR assignee=?)").get(id, actor, actor);
     if (!row) throw new Error("Task not found or not visible to this side");
-    return this.taskFromRow(row);
+    const task = this.taskFromRow(row);
+    if (task.state === 'open' && task.assignee.id === actor) {
+      const result = this.backgroundResult(id, actor);
+      if (result) task.backgroundResult = result;
+    }
+    return task;
   }
 
   private taskFromRow(row: Record<string, unknown>, sides = this.allSides(true), eventSeq = Number.MAX_SAFE_INTEGER): HandoffTask {

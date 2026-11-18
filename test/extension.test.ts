@@ -79,6 +79,7 @@ test("tool boundary binds identity to session, never accepts an actor from argum
     assert.equal(commands.has('cowork'), true);
     assert.equal(tools.has('cowork_branch'), true);
     assert.equal(tools.has('cowork_cleanup'), true);
+    assert.equal(tools.has('cowork_wait_result'), true);
     assert.match(commands.get('cowork').description, /branches/);
     assert.equal(commands.has('handoff'), false);
     assert.match(tools.get('cowork_create').description, /Items must reflect the original requirements/);
@@ -101,6 +102,12 @@ test("tool boundary binds identity to session, never accepts an actor from argum
     await assert.rejects(execute("one", "cowork_create", { to: "missing-side", subject: "secret", body: "PRIVATE-TEXT", items: ["done"], requiresIntegration: false }), /use an id from cowork_sides/);
     const created = await execute("one", "cowork_create", { to: b.id, subject: "secret", body: "PRIVATE-TEXT", items: ["done"], priority: "high", requiresIntegration: false });
     const id = created.details.task.id;
+    const resultPath = join(root, 'final.json');
+    await assert.rejects(execute('one', 'cowork_wait_result', { id, path: resultPath, timeoutSeconds: 60 }), /Only the assignee/);
+    const watch = (await execute('two', 'cowork_wait_result', { id, path: resultPath, timeoutSeconds: 60 })).details.backgroundResult;
+    assert.equal(watch.state, 'waiting');
+    assert.deepEqual(JSON.parse((await execute('two', 'cowork_list', { activeOnly: true })).content[0].text).tasks[0].backgroundResult, watch);
+    assert.equal((await execute('one', 'cowork_read', { id })).details.task.backgroundResult, undefined);
     const compactCreated = JSON.parse(created.content[0].text).task;
     assert.equal(compactCreated.priority, 'high');
     assert.equal(compactCreated.body, undefined);

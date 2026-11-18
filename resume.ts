@@ -11,6 +11,7 @@ const actions: Record<ResumeEvent["kind"], string> = {
   dependency: "重读待复核任务；依赖变化先验证材料和授权（包括新增回应），再解除或更新阻塞，不能自动放行。",
   reply: "读取对侧新增材料或澄清及必要依赖，核对下一步责任；需要实质回应时用 cowork_reply 并引用 inReplyTo，不复述等待，不用回复代替交付或批准。",
   priority: "读取优先级变更并按原授权重新安排任务顺序。",
+  background: "承接方读取任务的 backgroundResult。结果文件出现不代表通过；检查实际结果或处理超时/不可读原因，按原授权继续，不盲目重跑。",
   complete: "任务负责人读取交付，核对精确提交及完整范围，再集成或验收。本侧任务由自己完成闭环，不为过流程转派实施；本侧核查不等于独立审查。",
   integration: "发起方读取集成结果和检查；已推送则核对并关闭，受阻则处理原因，排队或运行中等待事件。",
   close: "读取验收结果，继续因此可推进的相关待办，不重做已关闭交付。",
@@ -139,6 +140,7 @@ export class EventResume {
       }
       if (!this.ctx.isIdle() || this.ctx.hasPendingMessages() || this.waitingForUi > 0) return;
       if (this.ctx.mode === "tui" && this.ctx.ui.getEditorText().trim()) return;
+      this.store.discoverBackgroundResults(this.self.id, this.consumer);
       let batch = this.store.pendingResume(this.self.id, this.consumer);
       if (!batch && this.reconcile) {
         this.reconcile = false;
