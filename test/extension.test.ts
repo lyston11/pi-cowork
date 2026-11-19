@@ -132,8 +132,9 @@ test("tool boundary binds identity to session, never accepts an actor from argum
     assert.equal(allSides.currentTotal, 3);
     assert.equal(allSides.historyTotal, 0);
     assert.equal(allSides.total, 3);
-    await assert.rejects(execute("one", "cowork_block", { id, reason: "approval", waitingFor: "reviewer" }), /Only the assignee/);
-    await execute("two", "cowork_block", { id, reason: "approval then continue", waitingFor: "reviewer", dependencies: [] });
+    await assert.rejects(execute("one", "cowork_block", { id, reason: "missing external evidence", waitingFor: "reviewer", external: true }), /Only the assignee/);
+    await assert.rejects(execute("two", "cowork_block", { id, reason: "peer check", waitingFor: "reviewer" }), /dependency task IDs or assign an internalAction/);
+    await execute("two", "cowork_block", { id, reason: "missing external evidence", waitingFor: "reviewer", external: true });
     const fullRead = await execute('one', 'cowork_read', { id });
     assert.equal(fullRead.details.task.block.waitingFor, 'reviewer');
     const fullTask = JSON.parse(fullRead.content[0].text).task;
@@ -144,7 +145,7 @@ test("tool boundary binds identity to session, never accepts an actor from argum
     const blocked = JSON.parse((await execute('one', 'cowork_list', {})).content[0].text).tasks[0];
     assert.notEqual(blocked.revision, compactCreated.revision);
     assert.equal(blocked.block.waitingFor, 'reviewer');
-    assert.equal(blocked.block.reason, 'approval then continue');
+    assert.equal(blocked.block.reason, 'missing external evidence');
     const reply = await execute('one', 'cowork_reply', { id, message: 'INPUT_ONLY_IN_FULL_READ', idempotencyKey: 'input-1' });
     const replySummary = JSON.parse(reply.content[0].text).task;
     assert.equal(replySummary.lastReply.actor, a.id);
@@ -334,6 +335,31 @@ test("tool boundary binds identity to session, never accepts an actor from argum
     } });
     assert.deepEqual((await execute("three", "cowork_list", {})).details.tasks, []);
     await assert.rejects(execute("three", "cowork_read", { id }), /not found or not visible/);
+    const owner = allSides.sides.find((side: any) => side.name === 'frontend');
+    const blockedAction = (await execute('two', 'cowork_block', { id, reason: 'Need the observed occupancy', waitingFor: owner.id,
+      internalAction: { owner: owner.id, action: 'Read occupancy receipt', expectedResult: 'Return the actual window' } })).details.task.block.action;
+    const actionList = (await execute('three', 'cowork_list', { activeOnly: true })).details;
+    assert.deepEqual(actionList.tasks, []);
+    assert.equal(actionList.actions[0].id, blockedAction.id);
+    assert.equal((await execute('three', 'cowork_list', { activeOnly: true, before: Number.MAX_SAFE_INTEGER })).details.actions[0].id, blockedAction.id);
+    await commands.get('cowork').handler('', { ...context('three'), mode: 'tui', ui: {
+      custom: async (factory: Function) => {
+        const panel = factory({ terminal: { rows: 24 }, requestRender() {} }, uiTheme, {}, () => {});
+        assert.match(panel.render(180).join('\n'), /前置 1 项/);
+        assert.match(panel.render(180).join('\n'), /Read occupancy receipt/);
+        assert.doesNotMatch(panel.render(180).join('\n'), /PRIVATE-TEXT/);
+        panel.handleInput('\r');
+        assert.match(panel.render(180).join('\n'), /前置动作 · A/);
+        assert.match(panel.render(180).join('\n'), /Return the actual window/);
+        panel.handleInput('\x1b');
+        assert.match(panel.render(180).join('\n'), /交接任务/);
+      },
+    } });
+    const untouchedAction = (await execute('three', 'cowork_action', { id: blockedAction.id, operation: 'read', revision: 0, evidence: 'Ignored on read', dependencyId: id })).details.action;
+    assert.equal(untouchedAction.revision, 0);
+    assert.equal(untouchedAction.status, 'pending');
+    const readyAction = (await execute('three', 'cowork_action', { id: blockedAction.id, operation: 'ready', revision: 0, evidence: 'Window receipt 23 verified', dependencyId: null })).details.action;
+    await execute('two', 'cowork_unblock', { id, note: 'Verified current receipt', actionRevision: readyAction.revision });
     await execute("two", "cowork_check", { id, item: 1, checked: true });
     await assert.rejects(execute("two", "cowork_complete", { id, commit: "f".repeat(40), summary: "fake" }), /not available/);
     const commit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" }).trim();

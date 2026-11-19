@@ -44,10 +44,12 @@ test('explicitly unnecessary user actions cannot create a blocker or notificatio
  const f=fixture();try{
   const t=f.create(),before=f.store.read(t.id,'b');
   const action:UserAction={kind:'input',limitation:'Missing an input not available to any Agent'};
-  for(const request of ['无用户操作；等待3侧沿#16/#189交修后证据。','无需用户配合。','不需要你协作；等待交付。','No user action is required. Waiting for another Agent.']) {
+  for(const request of ['无用户操作；等待3侧沿#16/#189交修后证据。','无需用户配合。','不需要你协作；等待交付。','No user action is required. Waiting for another Agent.','不需要','“不适用。”','这不是用户待办','不要用','N/A','None.']) {
    assert.throws(()=>f.store.block(t.id,'b','Internal dependency','side 3',[],request,action),/No user action/);
   }
   assert.throws(()=>f.store.block(t.id,'b','Internal dependency','side 3',[],'Provide input',{kind:'input',limitation:'本阻塞为3侧工程依赖，无需用户输入。'}),/No user action/);
+  assert.throws(()=>f.store.block(t.id,'b','Internal dependency','user',[],'不需要',{kind:'input',limitation:'内部依赖'}),/No user action/);
+  assert.throws(()=>f.store.block(t.id,'b','Internal dependency','第5侧 #755',[],'Provide the receipt',action),/No user action/);
   assert.deepEqual(f.store.read(t.id,'b').events,before.events);
   assert.deepEqual(f.store.pendingUserRequestNotifications('a'),[]);
   assert.deepEqual(f.store.pendingUserRequestNotifications('b'),[]);
@@ -82,7 +84,7 @@ test('old writers cannot surface contradictory requests or starve valid notifica
  const f=fixture();try{
   let first=0,seq=0;
   for(let i=0;i<51;i++) {
-   const t=f.create(); const inserted=f.legacy(t.id,'b','无用户操作；等待3侧交证。',{kind:'input',limitation:'本阻塞为工程依赖，无需用户输入。'});
+   const t=f.create(); const inserted=f.legacy(t.id,'b','不需要',{kind:'input',limitation:'内部依赖'});
    if(!i){first=t.id;seq=inserted;}
   }
   const original=f.store.read(first,'b');
@@ -98,6 +100,28 @@ test('old writers cannot surface contradictory requests or starve valid notifica
   assert(f.store.reconcileResume('b','reviewer').queued.includes(first));
   assert.equal(f.store.read(first,'b').block?.userRequest,original.block?.userRequest,'history is not rewritten');
  }finally{f.close();}
+});
+
+test('upgrade consumes queued placeholders silently and the persisted guard blocks old writers without a local SQL function', () => {
+ const f=fixture(); const db=new DatabaseSync(f.store.dbPath);
+ try {
+  db.exec('DROP TRIGGER handoff_suppress_user_request_placeholders');
+  const wrong=f.create(), valid=f.create();
+  const wrongSeq=f.legacy(wrong.id,'b','不需要',{kind:'input',limitation:'内部依赖'});
+  const action:UserAction={kind:'manual',limitation:'Only the user has the physical device'};
+  f.store.block(valid.id,'b','Need physical test','user',[],'Operate the device and return the screen',action);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM handoff_user_request_notifications WHERE task_id=? AND delivered_at IS NULL').get(wrong.id)!.n,2);
+  const upgraded=new HandoffStore(f.root);
+  try {
+   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM handoff_user_request_notifications WHERE task_id=? AND delivered_at IS NULL').get(wrong.id)!.n,0);
+   assert.equal(upgraded.read(wrong.id,'b').events.at(-1)!.seq,wrongSeq);
+   assert.deepEqual(upgraded.pendingUserRequestNotifications('b').map(n=>n.taskId),[valid.id]);
+   const newer=f.create();
+   f.legacy(newer.id,'b','不需要',{kind:'input',limitation:'Only the user can provide it'});
+   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM handoff_user_request_notifications WHERE task_id=?').get(newer.id)!.n,0);
+   assert(upgraded.read(newer.id,'b').block);
+  } finally {upgraded.close();}
+ } finally {db.close();f.close();}
 });
 
 test('approval work is rejected even with an authority quote or disguised as manual/input; actual user operations remain', () => {

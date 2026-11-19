@@ -4,7 +4,7 @@
 
 在用户明确启用的仓库中，每个 Pi 会话自动成为一“侧”，用户或 Agent 可以给它命名为“前端”“数据”“工具”等角色。侧的数量和名称没有固定限制；同一侧既可以发起任务，也可以承接任务。通信不要求特定分支、worktree 或项目配置文件。
 
-当前版本：**V5.4.7**。项目、GitHub 仓库与扩展统一命名为 **pi-cowork**，唯一命令入口为 `/cowork`，Agent 工具统一为 `cowork_*`。旧命令和工具不提供别名。
+当前版本：**V5.4.8**。项目、GitHub 仓库与扩展统一命名为 **pi-cowork**，唯一命令入口为 `/cowork`，Agent 工具统一为 `cowork_*`。旧命令和工具不提供别名。
 
 ## 设计目标
 
@@ -319,12 +319,14 @@ cowork_branch({ branch: "refs/heads/task/example", expectedTip: "精确完整提
 `open` 只表示尚未交付；其中可以是待执行，也可以已被明确阻塞。承接方确认无法继续时，用 `cowork_block` 记录：
 
 - `reason`：具体缺口和恢复条件，不能只写“等上游”。
-- `waitingFor`：下一步应提供条件的侧或外部负责人。
-- `dependencies`：已实际创建、且承接方有权限读取的依赖任务编号；外部操作或材料可以留空。
+- `waitingFor`：等待方。真正需要本人操作时填 `user`（或 `用户`）。
+- `dependencies`：已创建、且承接方有权读取的依赖任务；没有现成交付时用 `internalAction: { owner, action, expectedResult }` 登记独立前置动作。`owner` 是 `cowork_sides` 返回的准确侧 ID。真正不在 CoWork 内的外部条件使用 `external: true`。
 - `userRequest`：仅需用户本人操作或提供 Agent 无法取得的输入时填写，写明操作与回报结果；审批和实施决策由 Agent 在委托范围内自行解决，不交给用户。
 - `userAction`：与 `userRequest` 一起提供。`kind=manual/input` 标明本人操作或缺失输入，`limitation` 说明所有获授权 Agent 无法完成的具体原因。工具不提供用户审批入口，拒绝 `authorization` 及要求回复批准的请求；不得改填 manual/input 绕过，也不得改成聊天或通知索批。用户明确禁止的动作仍不得执行。
 
-只等其他侧或内部依赖时，省略 `userRequest` 和 `userAction`，不能填“无用户操作”等占位说明。请求或能力说明明确否定用户操作时，工具拒绝登记和通知；已有同类记录保留原文并交 Agent 复核，不计入用户待办。原用户请求已结束、内部阻塞仍在时，重新 `cowork_block` 写实际责任方和依赖、不带这两个字段，即撤下旧请求，不会解除内部阻塞或重发旧通知。
+只等其他侧或内部依赖时，省略 `userRequest` 和 `userAction`，不能填“不需要”“不适用”“内部依赖”或其他占位说明。请求或能力说明明确否定用户操作时，工具拒绝登记和通知；已有同类记录保留原文并交 Agent 复核，不计入用户待办。原用户请求已结束、内部阻塞仍在时，重新 `cowork_block` 写实际责任方和依赖、不带这两个字段，即撤下旧请求，不会解除内部阻塞或重发旧通知。
+
+前置动作直接出现在责任侧 `/cowork` 和 `cowork_list`，无需 Git 或审批。它继承阻塞链最高优先级，不改变任务本身优先级。用 `cowork_action(operation=read)` 读取动作。责任侧带当前 `revision`，用 `operation=ready` 上报结果，或 `operation=waiting` 上报具体障碍。没有真实依赖时 `dependencyId` 留空或填 `null`，不编造编号。若在等现有任务，可附 `dependencyId`；任务发生变化后会唤醒责任侧复核，循环依赖会被拒绝。返回结果后，等待侧收到一次定向复核事件；验证条件后以 `actionRevision` 调 `cowork_unblock`。撤下动作需明确 `withdrawAction: true`；改派后旧动作不再派送。离线或续跑暂停不启动其他进程，动作仍在待办。不自动认领旧版文字等待。
 
 实施、只读核查、测试、集成、内部交接和登记修复沿用已有授权。其他侧自行写的“待批准”不能成为新权限限制。同一缺口只由直接责任任务向用户提出，其余任务引用依赖，不能逐层重复索批。
 
@@ -548,8 +550,9 @@ Agent 的 `cowork_list` 与面板排序不同：工具按编号倒序返回，�
 | `cowork_list` | 查询本侧参与的任务，支持 `activeOnly`、`before`、`limit` 和返回的 `nextBefore` |
 | `cowork_read` | 读取本侧任务正文及历史，不改变状态 |
 | `cowork_reply` | 双方追加实质补充，按 inReplyTo 对应上一轮；定向通知对侧及相关依赖，不改变交付或批准状态 |
-| `cowork_block` | 承接方为 open 任务登记 `reason`、`waitingFor`、可选 `dependencies`；需用户亲自配合时附 `userRequest` 与 `userAction`，校验依据后通知并置顶 |
-| `cowork_unblock` | 承接方核对条件后附证据 `note` 解除阻塞 |
+| `cowork_block` | 承接方登记真实缺口及依赖、责任动作、外部条件或真实本人操作 |
+| `cowork_action` | 查询内部前置动作；责任侧交回结果或登记具体障碍 |
+| `cowork_unblock` | 核对条件后附证据 `note` 解除；有前置动作时还需提交已核实的 `actionRevision` |
 | `cowork_check` | 承接方勾选或取消勾选清单，`item` 从 1 开始 |
 | `cowork_complete` | 承接方附 `commit`、`summary` 提交待验收；Pi 启动目录与实施工作树不同时指定 `workspaceId` |
 | `cowork_workspace` | 登记任务工作区、安全同步本地 main，或显式退休所属工作区；`path` 可指定实际实施 worktree |

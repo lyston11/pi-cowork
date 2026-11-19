@@ -1,4 +1,4 @@
-export const HANDOFF_EXTENSION_VERSION = "5.4.7";
+export const HANDOFF_EXTENSION_VERSION = "5.4.8";
 
 export interface Side {
   id: string;
@@ -17,9 +17,33 @@ export interface UserAction {
   kind: "manual" | "input";
   limitation: string;
 }
+export interface BlockerActionInput {
+  owner: string;
+  action: string;
+  expectedResult: string;
+}
+
+export interface BlockerAction {
+  id: number;
+  taskId: number;
+  owner: Pick<Side, "id" | "name">;
+  requester: Pick<Side, "id" | "name">;
+  action: string;
+  expectedResult: string;
+  status: "pending" | "waiting" | "ready";
+  revision: number;
+  evidence?: string;
+  dependencyId?: number;
+  priority: TaskPriority;
+  ownerAvailability: "available" | "paused" | "offline";
+}
+
 export interface TaskBlock {
   reason: string;
   waitingFor: string;
+  action?: BlockerAction;
+  external?: boolean;
+  untracked?: boolean;
   userRequest?: string;
   userAction?: UserAction;
   userRequestNeedsReview?: boolean;
@@ -36,7 +60,7 @@ export interface BackgroundResult {
 export interface TaskEvent {
   seq: number;
   actor: string;
-  kind: "check" | "complete" | "close" | "reopen" | "block" | "unblock" | "integration" | "reply" | "priority" | "cancel";
+  kind: "check" | "complete" | "close" | "reopen" | "block" | "unblock" | "integration" | "reply" | "priority" | "cancel" | "action_result";
   data: Record<string, unknown>;
   at: string;
 }

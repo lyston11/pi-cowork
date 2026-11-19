@@ -4,7 +4,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { lstatSync, mkdirSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { HANDOFF_EXTENSION_VERSION, type CreateInput, type HandoffTask, type Side, type TaskEvent, type TaskPriority, type TaskSummary, type BackgroundResult, type UserAction } from "./types.ts";
+import { HANDOFF_EXTENSION_VERSION, type CreateInput, type HandoffTask, type Side, type TaskEvent, type TaskPriority, type TaskSummary, type BackgroundResult, type UserAction, type BlockerAction, type BlockerActionInput } from "./types.ts";
 
 function text(value: unknown, name: string, max: number): string {
   if (typeof value !== "string" || !value.trim() || value.length > max) {
@@ -13,13 +13,20 @@ function text(value: unknown, name: string, max: number): string {
   return value;
 }
 
-function isUserWaiting(value: string): boolean {
-  return /user|用户|manual test|人工测试|手工测试/i.test(value);
+export function isUserWaiting(value: string): boolean {
+  const party = value.trim();
+  return /^(?:user\b|用户|本人|manual test\b|人工测试|手工测试)/i.test(party)
+    && !/^(?:(?:用户|本人)(?:已|不|无|没有)|user\s+(?:already|does not|doesn't|not)\b)/i.test(party);
 }
 
 // Read queries use the same validator as writes. Never persist this connection-
 // local function in triggers: older Pi processes must still be able to write.
 const userActionEvidenceSql = 'cowork_valid_user_request(e.data_json)=1';
+// Shared by the validator and the persisted guard for already loaded old Pi processes.
+const noRequest = ['不需要', '无需', '无须', '不适用', '不涉及', '没有', '无', '不用', '不要用', '否', '这不是用户待办', '内部依赖',
+  'none', 'no', 'not needed', 'not required', 'not applicable', 'n/a', 'nil', 'null', '-'];
+const userRequestPlaceholderSql = ['$.userRequest', '$.userAction.limitation'].map(path =>
+  `lower(trim(json_extract(e.data_json,'${path}'), ' 。.!！?？;；“”「」『』"')) IN (${noRequest.map(value => `'${value}'`).join(',')})`).join(' OR ');
 
 function validateUserAction(action: UserAction | undefined): asserts action is UserAction {
   if (!action || !['manual', 'input'].includes(action.kind)) {
@@ -28,7 +35,7 @@ function validateUserAction(action: UserAction | undefined): asserts action is U
   text(action.limitation, 'userAction.limitation: why no authorized Agent can do this', 1000);
 }
 
-function validateUserRequest(value: unknown, action: UserAction | undefined): void {
+function validateUserRequest(value: unknown, action: UserAction | undefined, waitingFor: string): void {
   const request = text(value, 'User action request', 1000);
   validateUserAction(action);
   const approval = /^\s*(?:(?:请|麻烦)(?:你|您)?\s*)?(?:(?:回复|答复)\s*)?[“"'「]?(?:批准|授权|同意)(?:仅|本次|继续|执行|实施|更新|发布|部署|重启|合并|推进)/;
@@ -36,13 +43,18 @@ function validateUserRequest(value: unknown, action: UserAction | undefined): vo
   if (approval.test(request) || approvalEnglish.test(request)) {
     throw new Error('Approvals belong to Agents, not the user. Continue the delegated work; userRequest is only for an actual user-only operation or unavailable input.');
   }
+  const notUserWork = /(?:这(?:个|项)?不是(?:用户|本人)(?:待办|操作|输入|配合)|^(?:本)?(?:内部|工程|跨侧)依赖(?:[，。；,.!;:]|$)|^(?:internal|engineering|cross-side) dependency(?:\b|$))/iu;
   const content = `${request.trim()}\n${action.limitation.trim()}`;
   // Reject explicit denials, not incidental words such as “无需重装” or
   // “没有用户操作权限”. This is a contradiction guard, not an authorization judge.
   const denied = /(?:(?:无需|无须|不需(?:要)?|不用)(?:用户|你|您)(?:进行)?(?:操作|输入|配合|协作|批准|授权)|(?:用户|你|您)(?:无需|无须|不需(?:要)?|不用)(?:操作|输入|配合|协作)|无(?:新增)?用户(?:操作(?:条件)?|输入|配合(?:项)?|协作(?:项)?))(?=$|[，。；、,.!?！？;:\n])/m;
   const deniedEnglish = /\b(?:no (?:user|human) (?:action|input|assistance|approval)(?: (?:is )?(?:needed|required|necessary))?|(?:user|human) (?:action|input|assistance|approval) (?:is )?not (?:needed|required|necessary))\s*(?=$|[.;,!?\n])/im;
-  if (denied.test(content) || deniedEnglish.test(content)) {
-    throw new Error('No user action is requested. For internal dependencies omit userRequest and userAction; re-register the actual waitingFor and dependencies to withdraw a previous request without unblocking the task.');
+  if ([request, action.limitation].some(value => {
+    const clean = value.normalize('NFKC').trim().replace(/^[\s“”「」『』"']+|[\s。.!！?？;；“”「」『』"']+$/gu, '').toLowerCase();
+    return !clean || noRequest.includes(clean) || notUserWork.test(clean);
+  })
+      || denied.test(content) || deniedEnglish.test(content) || !isUserWaiting(waitingFor)) {
+    throw new Error('No user action is requested, or the task does not explicitly wait for the user. For internal dependencies omit userRequest and userAction; re-register the actual waitingFor and dependencies to withdraw a previous request without unblocking the task.');
   }
 }
 
@@ -74,7 +86,8 @@ export interface HumanTaskSnapshot {
 export interface ResumeEvent {
   seq: number;
   taskId: number;
-  kind: "created" | "complete" | "reopen" | "close" | "cancel" | "dependency" | "checkpoint" | "integration" | "blocked" | "reply" | "priority" | "background";
+  kind: "created" | "complete" | "reopen" | "close" | "cancel" | "dependency" | "checkpoint" | "integration" | "blocked" | "reply" | "priority" | "background" | "action-request" | "action-result";
+  actionId?: number;
 }
 
 export interface ResumeBatch {
@@ -113,7 +126,7 @@ export class HandoffStore {
       this.db.function('cowork_valid_user_request', (value) => {
         try {
           const data = JSON.parse(String(value));
-          validateUserRequest(data.userRequest, data.userAction);
+          validateUserRequest(data.userRequest, data.userAction, String(data.waitingFor ?? ''));
           return 1;
         } catch { return 0; }
       });
@@ -269,6 +282,32 @@ export class HandoffStore {
           UNIQUE(task_id,path)
         );
         CREATE INDEX IF NOT EXISTS handoff_background_waiting ON handoff_background_results(actor,state);
+        CREATE TABLE IF NOT EXISTS handoff_blocker_actions (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          task_id INTEGER NOT NULL REFERENCES handoff_tasks(id),
+          owner TEXT NOT NULL REFERENCES handoff_sides(id),
+          action TEXT NOT NULL,
+          expected_result TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS handoff_blocker_actions_owner ON handoff_blocker_actions(owner,id);
+        CREATE INDEX IF NOT EXISTS handoff_blocker_actions_task ON handoff_blocker_actions(task_id,id);
+        CREATE INDEX IF NOT EXISTS handoff_blocker_action_result ON handoff_task_events(task_id,json_extract(data_json,'$.actionId'),seq)
+          WHERE kind='action_result';
+        ${immutable('handoff_blocker_actions')}
+        CREATE TRIGGER IF NOT EXISTS handoff_active_action_guard BEFORE INSERT ON handoff_task_events
+          WHEN NEW.kind IN ('block','unblock')
+          BEGIN
+            SELECT CASE WHEN NEW.kind='block' AND json_type(NEW.data_json,'$.actionId') IS NULL THEN
+              RAISE(ABORT,'This task has a tracked action; reload CoWork before replacing it')
+              WHEN NEW.kind='unblock' AND NOT EXISTS(
+                SELECT 1 FROM handoff_task_events r WHERE r.seq=(SELECT MAX(seq) FROM handoff_task_events
+                  WHERE task_id=NEW.task_id AND kind='action_result' AND json_extract(data_json,'$.actionId')=json_extract(b.data_json,'$.actionId'))
+                  AND r.seq=json_extract(NEW.data_json,'$.actionRevision') AND json_extract(r.data_json,'$.status')='ready') THEN
+              RAISE(ABORT,'Verify the current ready action result and supply its revision before unblocking') END
+            FROM handoff_task_events b WHERE b.seq=(SELECT MAX(seq) FROM handoff_task_events
+              WHERE task_id=NEW.task_id AND kind IN ('block','unblock','complete','close','reopen','cancel'))
+              AND b.kind='block' AND json_type(b.data_json,'$.actionId')='integer';
+          END;
         CREATE TABLE IF NOT EXISTS handoff_user_request_notifications (
           task_id INTEGER NOT NULL REFERENCES handoff_tasks(id),
           block_seq INTEGER NOT NULL REFERENCES handoff_task_events(seq),
@@ -277,6 +316,12 @@ export class HandoffStore {
           PRIMARY KEY(task_id,block_seq,side_id)
         );
         CREATE INDEX IF NOT EXISTS handoff_user_request_pending ON handoff_user_request_notifications(side_id,delivered_at,block_seq);
+        CREATE TRIGGER IF NOT EXISTS handoff_suppress_user_request_placeholders BEFORE INSERT ON handoff_user_request_notifications
+          WHEN EXISTS (SELECT 1 FROM handoff_task_events e WHERE e.seq=NEW.block_seq AND (${userRequestPlaceholderSql}))
+          BEGIN SELECT RAISE(IGNORE); END;
+        UPDATE handoff_user_request_notifications SET delivered_at=CAST(strftime('%s','now') AS INTEGER)*1000
+          WHERE delivered_at IS NULL AND EXISTS (SELECT 1 FROM handoff_task_events e
+            WHERE e.seq=block_seq AND (${userRequestPlaceholderSql}));
         DROP TRIGGER IF EXISTS handoff_resume_created;
         CREATE TRIGGER handoff_resume_created AFTER INSERT ON handoff_tasks
           WHEN NEW.creator<>NEW.assignee
@@ -416,6 +461,7 @@ export class HandoffStore {
       WHERE incoming.task_id=? AND incoming.kind='reply' AND incoming.actor<>? AND incoming.seq>=?
         AND NOT EXISTS(SELECT 1 FROM handoff_task_events response WHERE response.task_id=incoming.task_id
           AND response.actor=? AND response.seq>incoming.seq
+          AND response.kind<>'action_result'
           AND (response.kind<>'reply' OR json_extract(response.data_json,'$.inReplyTo')>=incoming.seq)) LIMIT 1`).get(id, actor, fromSeq, actor);
   }
 
@@ -494,7 +540,8 @@ export class HandoffStore {
       do {
         const page = this.list(actor, { activeOnly: true, limit: 100, before });
         for (const task of page.tasks) {
-          const needsWork = task.assignee.id === actor && task.state === "open" && ((!task.block && task.backgroundResult?.state !== 'waiting') || task.block?.needsReview)
+          const needsWork = task.assignee.id === actor && task.state === "open" && ((!task.block && task.backgroundResult?.state !== 'waiting')
+            || task.block?.needsReview && task.block.action?.status !== 'ready')
             || task.creator.id === actor && task.state === "completed" && task.integration?.state !== "queued" && task.integration?.state !== "running"
             || task.creator.id === actor && task.state === 'open' && !!task.block?.userRequestNeedsReview
             || !!task.lastReply && this.replyNeedsAction(task.id, actor);
@@ -523,9 +570,42 @@ export class HandoffStore {
     });
   }
 
+  // Materialize action messages only for the consuming upgraded Pi. A peer on
+  // an older version must not acknowledge an event it does not know how to use.
+  private enqueueActionResume(actor: string, ackSeq: number, retry = false): void {
+    const insert = this.db.prepare('INSERT OR IGNORE INTO handoff_resume_events(recipient,task_id,kind,source) VALUES(?,?,?,?)');
+    for (const row of this.actionRows('active', 'a.owner=? OR t.assignee=?', actor, actor)) {
+      const event = this.actionEvent(row, actor);
+      if (!event) continue;
+      const { kind, source } = event;
+      if (!this.db.prepare('SELECT 1 FROM handoff_resume_events WHERE source=?').get(source)) {
+        insert.run(actor, row.task_id, kind, source);
+        continue;
+      }
+      if (retry && !this.db.prepare(`SELECT 1 FROM handoff_resume_events WHERE recipient=? AND seq>?
+        AND (source=? OR source LIKE ? || ':%') LIMIT 1`).get(actor, ackSeq, source, source)) {
+        insert.run(actor, row.task_id, kind, `${source}:retry:${randomUUID()}`);
+      }
+    }
+  }
+
+  private actionEvent(row: ReturnType<HandoffStore['actionRows']>[number], actor: string) {
+    if (row.owner === actor) {
+      if (row.result_seq === null) return { kind: 'action-request', source: `action-request:${row.id}:0` };
+      const result = JSON.parse(String(row.result)) as { dependencyId?: number; observedSeq?: number };
+      if (result.dependencyId !== undefined) {
+        const seq = this.dependencyRevision(result.dependencyId);
+        if (seq > (result.observedSeq ?? 0)) return { kind: 'action-request', source: `action-request:${row.id}:${row.result_seq}:${seq}` };
+      }
+    } else if (row.assignee === actor && row.result_seq !== null) {
+      return { kind: 'action-result', source: `action-result:${row.id}:${row.result_seq}` };
+    }
+  }
+
   pendingResume(actor: string, consumer: string): ResumeBatch | null {
     const state = this.db.prepare("SELECT ack_seq FROM handoff_resume_state WHERE side_id=? AND consumer=? AND enabled=1").get(actor, consumer);
     if (!state) return null;
+    this.enqueueActionResume(actor, Number(state.ack_seq));
     const rows = this.db.prepare(`SELECT r.seq,r.task_id,r.kind,r.source,
       (SELECT kind FROM handoff_task_events WHERE task_id=r.task_id AND kind IN ('complete','reopen','close','cancel') ORDER BY seq DESC LIMIT 1) AS current_kind,
       (SELECT seq FROM handoff_task_events WHERE task_id=r.task_id AND kind IN ('complete','reopen','close','cancel') ORDER BY seq DESC LIMIT 1) AS current_seq,
@@ -578,7 +658,8 @@ export class HandoffStore {
         const task = this.read(Number(row.task_id), actor);
         const after = task.events.findLast((event) => ["unblock", "complete", "close", "reopen"].includes(event.kind))?.seq ?? 0;
         const episode = task.events.find((event) => event.kind === "block" && event.seq > after);
-        relevant = task.creator.id === actor && task.state === "open" && task.block !== null && row.source === `blocked:${episode?.seq}`;
+        relevant = task.creator.id === actor && task.state === "open" && task.block !== null && task.block.action?.owner.id !== actor
+          && row.source === `blocked:${episode?.seq}`;
       }
       if (relevant && (kind === "complete" || kind === "integration")) {
         const task = this.read(Number(row.task_id), actor);
@@ -588,6 +669,14 @@ export class HandoffStore {
       if (relevant && (kind === "created" || kind === "reopen")) {
         const task = this.read(Number(row.task_id), actor);
         if (task.block && !task.block.needsReview || String(row.source).startsWith("retry:") && task.backgroundResult?.state === "waiting" && !task.block?.needsReview) relevant = false;
+      }
+      if (kind === 'action-request' || kind === 'action-result') {
+        const [, id] = String(row.source).split(':');
+        const active = this.actionRows('active', 'a.id=?', Number(id))[0];
+        const event = active && this.actionEvent(active, actor);
+        if (!event || event.kind !== kind || (row.source !== event.source && !String(row.source).startsWith(`${event.source}:retry:`))) continue;
+        events.set(`${kind}:${id}`, { seq: Number(row.seq), taskId: Number(row.task_id), kind, actionId: Number(id) });
+        continue;
       }
       if (row.current_kind === "cancel" && kind !== "cancel") relevant = false;
       if (relevant) events.set(kind === 'background' ? String(row.source) : Number(row.task_id), { seq: Number(row.seq), taskId: Number(row.task_id), kind });
@@ -610,7 +699,7 @@ export class HandoffStore {
   setResumeEnabled(actor: string, enabled: boolean, reason: string | null = null, requestedByUser = false): void {
     this.transaction(() => {
       if (enabled && this.db.prepare('SELECT 1 FROM handoff_side_removals WHERE side_id=?').get(actor)) throw new Error('Side was removed; start a new Pi session to join again');
-      const previous = this.db.prepare("SELECT enabled FROM handoff_resume_state WHERE side_id=?").get(actor);
+      const previous = this.db.prepare("SELECT enabled,ack_seq FROM handoff_resume_state WHERE side_id=?").get(actor);
       this.db.prepare(`INSERT INTO handoff_resume_state(side_id,enabled,reason) VALUES(?,?,?)
         ON CONFLICT(side_id) DO UPDATE SET enabled=excluded.enabled,reason=excluded.reason`).run(actor, Number(enabled), reason);
       if (enabled && (previous?.enabled === 0 || requestedByUser)) {
@@ -625,6 +714,7 @@ export class HandoffStore {
             AND NOT EXISTS(SELECT 1 FROM handoff_resume_events r JOIN handoff_resume_state s ON s.side_id=r.recipient
               WHERE r.recipient=? AND r.task_id=t.id AND r.seq>s.ack_seq AND r.source LIKE 'retry:%')`)
           .run(actor, actor, source, actor, actor, actor, actor, actor);
+        this.enqueueActionResume(actor, Number(previous?.ack_seq ?? 0), true);
       }
     });
   }
@@ -712,7 +802,8 @@ export class HandoffStore {
       if (!target) throw new Error("Target side not found; use an id from cowork_sides");
       if (target.id === actor.id) return current;
       if (target.sessionId !== expectedSessionId) throw new Error("Target ownership changed; read cowork_sides again before taking over");
-      if (this.db.prepare("SELECT 1 FROM handoff_tasks WHERE creator=? OR assignee=? LIMIT 1").get(actor.id, actor.id)) {
+      if (this.db.prepare("SELECT 1 FROM handoff_tasks WHERE creator=? OR assignee=? LIMIT 1").get(actor.id, actor.id)
+        || this.actionRows('active', 'a.owner=?', actor.id).length) {
         throw new Error("Current side already owns tasks. Start a fresh Pi session to take over without losing its access.");
       }
       try {
@@ -743,6 +834,7 @@ export class HandoffStore {
       if (!target) throw new Error('Side not found; read cowork_sides again');
       if (target.sessionId !== expectedSessionId) throw new Error('Side ownership changed; read cowork_sides again');
       if (this.list(target.id, { activeOnly: true, limit: 1 }).tasks.length) throw new Error('Side still has unclosed sent or received tasks; finish their review first');
+      if (this.actionRows('active', 'a.owner=?', target.id).length) throw new Error('Side still owns tracked prerequisite actions; finish or reassign them before removing the side');
       if (this.db.prepare("SELECT 1 FROM handoff_workspaces WHERE owner=? AND state='active' LIMIT 1").get(target.id)) throw new Error('Side still owns an active workspace; reconcile and safely retire it before removing the side');
       const state = this.db.prepare('SELECT enabled,consumer,lease_until FROM handoff_resume_state WHERE side_id=?').get(target.id);
       if (target.id === actor.id) {
@@ -869,6 +961,80 @@ export class HandoffStore {
     return task;
   }
 
+  private actionRows(scope: 'active' | number, where: 'a.owner=? OR t.assignee=?' | 'a.id=?' | 'a.owner=?' | '1', ...params: (string | number)[]) {
+    const eventSeq = scope === 'active' ? Number.MAX_SAFE_INTEGER : scope;
+    return this.db.prepare(`SELECT a.*,t.assignee, owner.name AS owner_name, owner.pid, requester.name AS requester_name,
+      binding.session_id AS bound_session,s.enabled,r.seq AS result_seq,r.data_json AS result
+      FROM handoff_blocker_actions a JOIN handoff_tasks t ON t.id=a.task_id
+      JOIN handoff_sides owner ON owner.id=a.owner JOIN handoff_sides requester ON requester.id=t.assignee
+      LEFT JOIN handoff_side_bindings binding ON binding.side_id=a.owner
+      LEFT JOIN handoff_resume_state s ON s.side_id=a.owner
+      LEFT JOIN handoff_task_events r ON r.seq=(SELECT MAX(e.seq) FROM handoff_task_events e
+        WHERE e.task_id=a.task_id AND e.kind='action_result' AND json_extract(e.data_json,'$.actionId')=a.id AND e.seq<=?)
+      WHERE (${where}) ${scope !== 'active' ? '' : `AND a.id=(SELECT CASE WHEN e.kind='block' THEN json_extract(e.data_json,'$.actionId') END
+        FROM handoff_task_events e WHERE e.task_id=a.task_id AND e.kind IN ('block','unblock','complete','close','reopen','cancel') ORDER BY e.seq DESC LIMIT 1)`}`)
+      .all(eventSeq, ...params);
+  }
+
+  private actionFromRow(row: ReturnType<HandoffStore['actionRows']>[number], through = Number.MAX_SAFE_INTEGER): BlockerAction {
+    const inherited = this.db.prepare(`WITH RECURSIVE downstream(id) AS (
+      SELECT ? UNION SELECT d.task_id FROM handoff_task_dependencies d JOIN downstream ON downstream.id=d.dependency_id
+      WHERE d.block_seq=(SELECT CASE WHEN e.kind='block' THEN e.seq END FROM handoff_task_events e WHERE e.task_id=d.task_id
+        AND e.seq<=? AND e.kind IN ('block','unblock','complete','close','reopen','cancel') ORDER BY e.seq DESC LIMIT 1)
+    ) SELECT COALESCE((SELECT json_extract(p.data_json,'$.priority') FROM handoff_task_events p WHERE p.task_id=t.id
+      AND p.kind='priority' AND p.seq<=? ORDER BY p.seq DESC LIMIT 1),t.priority) AS priority
+      FROM downstream JOIN handoff_tasks t ON t.id=downstream.id`).all(row.task_id, through, through);
+    const effective = inherited.map(r => priority(r.priority)).reduce<TaskPriority>((max, value) => priorityRank[value] > priorityRank[max] ? value : max, 'low');
+    const result = row.result === null ? undefined : JSON.parse(String(row.result)) as { status: 'ready' | 'waiting'; evidence: string; dependencyId?: number; observedSeq?: number };
+    const dependencyChanged = result?.dependencyId !== undefined && this.dependencyRevision(result.dependencyId, through) > (result.observedSeq ?? 0);
+    let ownerAvailability: BlockerAction['ownerAvailability'] = 'offline';
+    if (row.bound_session) {
+      try { process.kill(Number(row.pid), 0); ownerAvailability = row.enabled === 0 ? 'paused' : 'available'; }
+      catch (error) { if ((error as NodeJS.ErrnoException).code === 'EPERM') ownerAvailability = row.enabled === 0 ? 'paused' : 'available'; }
+    }
+    return { id: Number(row.id), taskId: Number(row.task_id), owner: { id: String(row.owner), name: String(row.owner_name) },
+      requester: { id: String(row.assignee), name: String(row.requester_name) }, action: String(row.action), expectedResult: String(row.expected_result),
+      status: dependencyChanged ? 'pending' : result?.status ?? 'pending', revision: Number(row.result_seq ?? 0), evidence: result?.evidence,
+      ...(result?.dependencyId === undefined ? {} : { dependencyId: result.dependencyId }), priority: effective, ownerAvailability };
+  }
+
+  // With an actor only their assigned actions are listed. Project-wide is for the human TUI only.
+  blockerActions(actor?: string): BlockerAction[] {
+    const rows = actor === undefined ? this.actionRows('active', '1') : this.actionRows('active', 'a.owner=?', actor);
+    return rows.map(row => this.actionFromRow(row)).sort((a, b) => Number(b.status === 'pending') - Number(a.status === 'pending')
+      || priorityRank[b.priority] - priorityRank[a.priority] || a.id - b.id);
+  }
+
+  blockerAction(id: number, actor: string): BlockerAction {
+    integer(id, 'action id', 1);
+    const row = this.actionRows('active', 'a.id=?', id)[0];
+    if (!row || (row.owner !== actor && row.assignee !== actor)) throw new Error('No active prerequisite action for this side');
+    const action = this.actionFromRow(row);
+    if (row.owner !== actor) delete action.dependencyId;
+    return action;
+  }
+
+  reportBlockerAction(id: number, actor: string, revision: number, status: 'waiting' | 'ready', evidence: string, dependencyId?: number): BlockerAction {
+    text(evidence, 'Concrete result evidence or actual obstacle and release condition', 2000);
+    integer(revision, 'action revision', 0);
+    if (status !== 'ready' && status !== 'waiting') throw new Error('Action result must be ready or waiting');
+    if (dependencyId !== undefined) {
+      integer(dependencyId, 'action dependency task id', 1);
+      if (status !== 'waiting') throw new Error('Only waiting results may name a dependency task');
+    }
+    return this.transaction(() => {
+      const action = this.blockerAction(id, actor);
+      if (action.owner.id !== actor) throw new Error('Only the prerequisite action owner can report it');
+      if (action.status === status && action.evidence === evidence.trim() && action.dependencyId === dependencyId) return action;
+      if (action.revision !== revision) throw new Error('Action result has changed; read the current revision before reporting');
+      if (dependencyId !== undefined) this.validateDependency(action.taskId, dependencyId, actor);
+      this.db.prepare("INSERT INTO handoff_task_events(task_id,actor,kind,data_json,at) VALUES(?,?,'action_result',?,?)")
+        .run(action.taskId, actor, JSON.stringify({ actionId: id, status, evidence: evidence.trim(),
+          ...(dependencyId === undefined ? {} : { dependencyId, observedSeq: this.dependencyRevision(dependencyId) }) }), new Date().toISOString());
+      return this.blockerAction(id, actor);
+    });
+  }
+
   private taskFromRow(row: Record<string, unknown>, sides = this.allSides(true), eventSeq = Number.MAX_SAFE_INTEGER): HandoffTask {
     const task: HandoffTask = {
       id: Number(row.id), kind: row.creator === row.assignee ? "local" : "handoff", creator: sides.find((side) => side.id === row.creator)!,
@@ -889,7 +1055,7 @@ export class HandoffStore {
           ? event.data.userRequest : isUserWaiting(waitingFor) ? String(event.data.reason) : undefined;
         let userAction: UserAction | undefined;
         if (userRequest) {
-          try { validateUserRequest(event.data.userRequest, event.data.userAction as UserAction | undefined); userAction = event.data.userAction as UserAction; }
+          try { validateUserRequest(event.data.userRequest, event.data.userAction as UserAction | undefined, waitingFor); userAction = event.data.userAction as UserAction; }
           catch { /* Keep legacy evidence, send it back to Agents for review. */ }
         }
         task.block = {
@@ -920,7 +1086,19 @@ export class HandoffStore {
       if (!d) throw new Error('Delivery snapshot is missing; preserve the task for reconciliation');
       task.delivery = { id: String(d.id), workspaceId: String(d.workspace_id), base: String(d.base), tip: String(d.tip), tree: String(d.tree), commits: JSON.parse(String(d.commits_json)), files: JSON.parse(String(d.files_json)), digest: String(d.digest) };
     }
-    if (task.block) task.block.needsReview = !!task.block.userRequestNeedsReview || !!this.db.prepare(`SELECT 1 FROM handoff_task_dependencies d
+    if (task.block) {
+      const current = task.events.findLast(event => event.kind === 'block')!;
+      if (typeof current.data.actionId === 'number') {
+        const action = this.actionRows(eventSeq, 'a.id=?', current.data.actionId)[0];
+        if (action) {
+          task.block.action = this.actionFromRow(action, eventSeq);
+          delete task.block.action.dependencyId;
+        }
+      }
+      if (current.data.external) task.block.external = true;
+      else if (!task.block.action && !task.block.userRequest && !task.block.dependencies.length) task.block.untracked = true;
+    }
+    if (task.block) task.block.needsReview = task.block.action?.status === 'ready' || !!task.block.userRequestNeedsReview || !!this.db.prepare(`SELECT 1 FROM handoff_task_dependencies d
       JOIN handoff_task_events e ON e.task_id=d.dependency_id
       WHERE d.block_seq=? AND e.seq>d.observed_seq AND e.seq<=?
         AND e.kind IN ('complete','close','reopen','cancel','reply') LIMIT 1`).get(blockSeq, eventSeq)
@@ -1022,34 +1200,69 @@ export class HandoffStore {
       return task.priority !== next;
     });
   }
-  block(id: number, actor: string, reason: string, waitingFor: string, dependencyIds: number[] = [], userRequest?: string, userAction?: UserAction): HandoffTask {
+  private dependencyRevision(id: number, through = Number.MAX_SAFE_INTEGER): number {
+    return Number(this.db.prepare(`SELECT COALESCE(MAX(seq),0) AS seq FROM handoff_task_events
+      WHERE task_id=? AND seq<=? AND kind IN ('complete','close','reopen','cancel','reply')`).get(id, through)!.seq);
+  }
+
+  private validateDependency(from: number, to: number, actor: string): void {
+    if (from === to) throw new Error('A task cannot depend on itself or on the task requesting its action');
+    this.read(to, actor); // A dependency never grants access to someone else's task.
+    const cycle = this.db.prepare(`WITH RECURSIVE reachable(id) AS (
+      SELECT ? UNION SELECT d.dependency_id FROM reachable x JOIN handoff_task_dependencies d ON d.task_id=x.id
+      WHERE d.block_seq=(SELECT seq FROM handoff_task_events WHERE task_id=d.task_id
+        AND kind IN ('block','unblock','complete','close','reopen','cancel') ORDER BY seq DESC LIMIT 1)
+      UNION SELECT json_extract(r.data_json,'$.dependencyId') FROM reachable x
+      JOIN handoff_blocker_actions a ON a.task_id=x.id AND a.id=(SELECT CASE WHEN e.kind='block' THEN json_extract(e.data_json,'$.actionId') END
+        FROM handoff_task_events e WHERE e.task_id=x.id AND e.kind IN ('block','unblock','complete','close','reopen','cancel') ORDER BY e.seq DESC LIMIT 1)
+      JOIN handoff_task_events r ON r.seq=(SELECT MAX(e.seq) FROM handoff_task_events e WHERE e.task_id=x.id
+        AND e.kind='action_result' AND json_extract(e.data_json,'$.actionId')=a.id)
+      WHERE json_type(r.data_json,'$.dependencyId')='integer'
+    ) SELECT 1 FROM reachable WHERE id=? LIMIT 1`).get(to, from);
+    if (cycle) throw new Error('Dependency would create a cycle; record the independently executable first step instead');
+  }
+
+  block(id: number, actor: string, reason: string, waitingFor: string, dependencyIds: number[] = [], userRequest?: string, userAction?: UserAction, action?: BlockerActionInput, external = false, withdrawAction = false): HandoffTask {
     text(reason, "Block reason and recovery condition", 2000);
     text(waitingFor, "Waiting for", 160);
     if (userRequest !== undefined) { text(userRequest, "User action request", 1000); userRequest = userRequest.trim(); }
     if (isUserWaiting(waitingFor) && !userRequest) throw new Error('userRequest is required when waiting for user action; do not turn routine work into approval requests');
-    if (userRequest) validateUserRequest(userRequest, userAction);
+    if (userRequest) validateUserRequest(userRequest, userAction, waitingFor);
     else if (userAction) throw new Error('userAction requires an explicit userRequest');
     const effectiveUserRequest = userRequest;
+    if (action && (userRequest || external)) throw new Error('An internal action cannot be a user or external request');
+    if (action) {
+      text(action.owner, 'Exact action owner side ID', 256);
+      text(action.action, 'Concrete prerequisite action', 1000);
+      text(action.expectedResult, 'Expected prerequisite result', 1000);
+      if (action.owner === actor) throw new Error('Do your own executable prerequisite instead of waiting for yourself');
+    }
     if (!Array.isArray(dependencyIds) || dependencyIds.length > 20) throw new Error("At most 20 dependencies are allowed");
+    if (external && (userRequest || dependencyIds.length)) throw new Error('Use external only for an untracked condition outside CoWork, not for user requests or task dependencies');
     dependencyIds.forEach((dependency) => integer(dependency, "dependency id", 1));
     if (new Set(dependencyIds).size !== dependencyIds.length) throw new Error("Dependency ids must be unique");
     return this.transaction(() => {
       const task = this.read(id, actor);
       if (task.assignee.id !== actor || task.state !== "open") throw new Error("Only the assignee can block an open task");
       const dependencies = dependencyIds.map((dependency) => {
-        if (dependency === id) throw new Error("A task cannot depend on itself");
-        this.read(dependency, actor); // Never allow linking another side's private task.
-        const cycle = this.db.prepare(`WITH RECURSIVE reachable(id) AS (
-          SELECT ? UNION SELECT d.dependency_id FROM handoff_task_dependencies d JOIN reachable r ON d.task_id=r.id
-          WHERE d.block_seq=(SELECT seq FROM handoff_task_events WHERE task_id=d.task_id
-            AND kind IN ('block','unblock','complete','close','reopen','cancel') ORDER BY seq DESC LIMIT 1)
-        ) SELECT 1 FROM reachable WHERE id=? LIMIT 1`).get(dependency, id);
-        if (cycle) throw new Error("Dependency would create a cycle");
-        const latest = this.db.prepare(`SELECT COALESCE(MAX(seq),0) AS seq FROM handoff_task_events
-          WHERE task_id=? AND kind IN ('complete','close','reopen','cancel','reply')`).get(dependency)!;
-        return { id: dependency, seq: Number(latest.seq) };
+        this.validateDependency(id, dependency, actor);
+        return { id: dependency, seq: this.dependencyRevision(dependency) };
       }).sort((a, b) => a.id - b.id);
-      const data = { reason, waitingFor, dependencies, ...(effectiveUserRequest ? { userRequest: effectiveUserRequest, userAction: { kind: userAction!.kind, limitation: userAction!.limitation } } : {}) };
+      if (external && this.sides().some(side => [side.id, side.name, side.name.split(' · ', 1)[0]].includes(waitingFor.trim()))) {
+        throw new Error('A registered side is not an external dependency; use a task dependency or internalAction');
+      }
+      const existing = task.block?.action;
+      if (existing && !action && !withdrawAction) throw new Error('Keep the existing internalAction or explicitly withdraw it with withdrawAction=true');
+      if (withdrawAction && action) throw new Error('Cannot withdraw and set an internalAction together');
+      let actionId: number | null | undefined = existing ? null : undefined;
+      if (action) {
+        if (!this.sideById(action.owner)) throw new Error('Unknown or removed action owner; use an exact ID from cowork_sides');
+        if (existing?.owner.id === action.owner && existing.action === action.action.trim() && existing.expectedResult === action.expectedResult.trim()) actionId = existing.id;
+        else actionId = Number(this.db.prepare('INSERT INTO handoff_blocker_actions(task_id,owner,action,expected_result) VALUES(?,?,?,?)')
+          .run(id, action.owner, action.action.trim(), action.expectedResult.trim()).lastInsertRowid);
+      }
+      const data = { reason, waitingFor, dependencies, ...(actionId === undefined ? {} : { actionId }), ...(external ? { external } : {}),
+        ...(effectiveUserRequest ? { userRequest: effectiveUserRequest, userAction: { kind: userAction!.kind, limitation: userAction!.limitation } } : {}) };
       const previous = task.events.findLast((event) => event.kind === "block");
       if (task.block && JSON.stringify(previous?.data) === JSON.stringify(data)) return task;
       const event = this.db.prepare("INSERT INTO handoff_task_events(task_id,actor,kind,data_json,at) VALUES(?,?,'block',?,?)")
@@ -1081,10 +1294,15 @@ export class HandoffStore {
     });
   }
 
-  unblock(id: number, actor: string, note: string): HandoffTask {
+  unblock(id: number, actor: string, note: string, actionRevision?: number): HandoffTask {
     text(note, "Unblock evidence", 2000);
-    return this.update(id, actor, "unblock", { note }, (task) => {
+    if (actionRevision !== undefined) integer(actionRevision, 'action revision', 1);
+    return this.update(id, actor, "unblock", { note, actionRevision }, (task) => {
       if (task.assignee.id !== actor || task.state !== "open") throw new Error("Only the assignee can unblock an open task");
+      const action = task.block?.action;
+      if (action && (action.status !== 'ready' || action.revision !== actionRevision) || !action && actionRevision !== undefined) {
+        throw new Error('Verify the current ready action result and supply its revision before unblocking');
+      }
       return task.block !== null;
     });
   }

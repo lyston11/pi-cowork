@@ -12,6 +12,8 @@ const actions: Record<ResumeEvent["kind"], string> = {
   reply: "读取对侧新增材料或澄清及必要依赖，核对下一步责任；需要实质回应时用 cowork_reply 并引用 inReplyTo，不复述等待，不用回复代替交付或批准。",
   priority: "读取优先级变更并按原授权重新安排任务顺序。",
   background: "承接方读取任务的 backgroundResult。结果文件出现不代表通过；检查实际结果或处理超时/不可读原因，按原授权继续，不盲目重跑。",
+  'action-request': '用 cowork_action 读指定动作，按既有授权完成独立前置并交回证据；条件没到，登记具体障碍和恢复条件。无需 Git 或审批。',
+  'action-result': '用 cowork_action 读指定动作结果，再读自己的原任务。有阻碍则处理本侧可解决部分；核实 ready 结果和其余依赖后，用 actionRevision 解除阻塞并继续。',
   complete: "任务负责人读取交付，核对精确提交及完整范围，再集成或验收。本侧任务由自己完成闭环，不为过流程转派实施；本侧核查不等于独立审查。",
   integration: "发起方读取集成结果和检查；已推送则核对并关闭，受阻则处理原因，排队或运行中等待事件。",
   close: "读取验收结果，继续因此可推进的相关待办，不重做已关闭交付。",
@@ -157,21 +159,21 @@ export class EventResume {
         return;
       }
       this.reconcile = false;
-      const groups = new Map<ResumeEvent["kind"], number[]>();
+      const groups = new Map<ResumeEvent['kind'], string[]>();
       for (const event of batch.events) {
         const ids = groups.get(event.kind) ?? [];
-        ids.push(event.taskId);
+        ids.push(event.actionId === undefined ? `#${event.taskId}` : `A${event.actionId}（#${event.taskId}）`);
         groups.set(event.kind, ids);
       }
-      const plan = [...groups].map(([kind, ids]) => `${ids.map(id => `#${id}`).join('、')} ${kind}：${actions[kind]}`).join('\n');
-      const guidance = '前后用 cowork_list(activeOnly=true) 摘要查完分页；先 cowork_read 上列事件对象和必要依赖，其余只读新增、变化或仍可执行项。未变等待项不重读全文；未知基线补查。不扩权、不轮询、不自行制造续跑。';
+      const plan = [...groups].map(([kind, ids]) => `${ids.join('、')} ${kind}：${actions[kind]}`).join('\n');
+      const guidance = '前后用 cowork_list(activeOnly=true) 查完分页；动作先用 cowork_action 读取，任务事件先用 cowork_read 核对原任务及必要依赖。按优先级处理已具备条件的动作和任务；其余只读新增、变化或仍可执行项。未变等待项不重读全文；未知基线补查。不扩权、不轮询、不自行制造续跑。';
       this.pending = { throughSeq: batch.throughSeq, at: Date.now() };
       this.pi.sendMessage({
         customType: messageType,
         content: `CoWork 事件定向续跑：\n${plan}\n${guidance}`,
         display: true,
         details: { sideId: this.self.id, dbPath: this.store.dbPath, consumer: this.consumer, throughSeq: batch.throughSeq,
-          scope: "targeted", events: batch.events.map(({ taskId, kind }) => ({ taskId, kind })) },
+          scope: 'targeted', events: batch.events.map(({ taskId, kind, actionId }) => ({ taskId, kind, ...(actionId === undefined ? {} : { actionId }) })) },
       }, { triggerTurn: true, deliverAs: "followUp" });
     } catch (error) {
       this.pause(`续跑调度失败：${error instanceof Error ? error.message : String(error)}`);

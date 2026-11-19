@@ -1,9 +1,20 @@
 import type { ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
-import type { HandoffTask, TaskSummary } from "./types.ts";
+import type { BlockerAction, HandoffTask, TaskSummary } from "./types.ts";
 
 // Task text is data: remove terminal controls before applying our own styles.
 const plain = (value: string) => value.replace(/[\x00-\x1f\x7f]/g, " ");
+const priorityLabels = { urgent: 'P0 紧急', high: 'P1 高', normal: 'P2 普通', low: 'P3 低' } as const;
+const actionStatus = { pending: '待责任侧处理', waiting: '条件未具备', ready: '结果待复核' } as const;
+const availability = { available: '', paused: ' · 责任侧续跑已暂停', offline: ' · 责任侧离线' } as const;
+
+export function actionLines(action: BlockerAction, expanded: boolean, theme: Theme, width: number): string[] {
+  const lines = [`${expanded ? '▾' : '▸'} [${priorityLabels[action.priority]}] 动作 A${action.id} · #${action.taskId} · ${actionStatus[action.status]} · ${plain(action.owner.name)}${availability[action.ownerAvailability]}`,
+    `  执行：${plain(action.action)}`];
+  if (expanded) lines.push(`  交回给：${plain(action.requester.name)}`, `  完成条件：${plain(action.expectedResult)}`);
+  if (action.evidence) lines.push(`  ${action.status === 'ready' ? '结果' : '实际阻碍与恢复条件'}：${plain(action.evidence)}`);
+  return lines.flatMap(line => expanded ? wrapTextWithAnsi(line, Math.max(1, width)) : [truncateToWidth(line, width)]).map(line => theme.fg('warning', line));
+}
 
 // Show feedback before the first network wait; always clear it on failure too.
 export async function loadWithStatus<T>(ctx: ExtensionContext, label: string, load: () => Promise<T>): Promise<T> {
@@ -19,9 +30,11 @@ export function taskLines(task: HandoffTask | TaskSummary, expanded: boolean, th
     ? task.block?.userRequestNeedsReview ? "[!] 用户请求待 Agent 复核" : task.block?.userRequest ? `[! ${userLabel}]` : task.block ? task.block.needsReview ? "[!] 依赖更新待复核" : "[⏸] 被阻塞" : "[ ] 待核对/处理"
     : task.state === "completed" ? task.integration ? `[✓] 集成${({ queued: "排队中", running: "执行中", blocked: "受阻", pushed: "已推送待关闭" })[task.integration.state]}` : task.kind === "local" ? "[✓] 待本侧核查/收口" : "[✓] 待发起方验收" : task.state === "cancelled" ? "[×] 已取消" : "[✓] 已验收关闭";
   const fold = expanded ? "▾" : "▸";
-  const priorityLabel = ({ urgent: "P0 紧急", high: "P1 高", normal: "P2 普通", low: "P3 低" } as const)[task.priority];
+  const priorityLabel = priorityLabels[task.priority];
   const responsible = task.block?.userRequestNeedsReview ? `${plain(task.assignee.name)}复核原授权与实际缺口` : task.block?.userRequest ? '等待用户操作或输入' : task.state === "completed" ? task.integration?.state === "queued" || task.integration?.state === "running" ? "集成队列执行"
     : `${plain(task.creator.name)}${task.integration?.state === "blocked" ? "处理集成阻塞" : task.integration?.state === "pushed" ? "核对集成并关闭" : task.kind === "local" ? "核查并收口" : "验收"}`
+    : task.block?.action ? task.block.action.status === 'ready' ? `${plain(task.assignee.name)}复核动作 A${task.block.action.id}`
+      : `${plain(task.block.action.owner.name)}处理动作 A${task.block.action.id}${availability[task.block.action.ownerAvailability]}`
     : task.block && !task.block.needsReview ? `${plain(task.block.waitingFor)}提供条件`
     : `${plain(task.assignee.name)}${task.block ? "复核依赖" : "核对并处理"}`;
   const heading = `${fold} [${priorityLabel}] #${task.id} ${status} ${task.kind === "local" ? `${plain(task.creator.name)} · 本侧任务` : `${plain(task.creator.name)} → ${plain(task.assignee.name)}`} · ${plain(task.subject)} · ${checked}/${task.items.length}${task.state === "closed" || task.state === "cancelled" ? "" : ` · 下一步：${responsible}`}`;
@@ -37,6 +50,8 @@ export function taskLines(task: HandoffTask | TaskSummary, expanded: boolean, th
     }
     const reason = `  阻塞：${plain(task.block.reason)}`;
     lines.push(expanded ? reason : truncateToWidth(reason, width));
+    if (task.block.action && expanded) lines.push(...actionLines(task.block.action, true, theme, width));
+    if (task.block.untracked) lines.push('  旧版未登记依赖或责任动作 · 由承接侧复核，不会自动派单');
     if (task.block.dependencies.length) {
       const dependencies = `  依赖：${task.block.dependencies.map((id) => `#${id}`).join("、")}`;
       lines.push(expanded ? dependencies : truncateToWidth(dependencies, width));
