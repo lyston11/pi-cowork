@@ -13,11 +13,11 @@ function fixture() {
   const store = new HandoffStore(root);
   for (const id of ['a','b','c']) store.register({ id, name: id, sessionId: id, pid: process.pid, worktree: root, branch: 'main' });
   const create = (to = 'b') => store.create({ to, subject: 'existing authorized work', body: 'read local input and validate it', items: ['validated'], requiresIntegration: false }, 'a');
-  const legacy = (id: number, actor: string, request = 'Please approve continuing read-only validation', userAction?: UserAction) => {
+  const legacy = (id: number, actor: string, request = 'Please approve continuing read-only validation', userAction?: UserAction, waitingFor = 'user') => {
     const db = new DatabaseSync(store.dbPath);
     try {
       const seq = Number(db.prepare("INSERT INTO handoff_task_events(task_id,actor,kind,data_json,at) VALUES(?,?,'block',?,?)")
-        .run(id, actor, JSON.stringify({ reason:'Waiting for approval', waitingFor:'user', userRequest:request, userAction, dependencies:[] }), new Date().toISOString()).lastInsertRowid);
+        .run(id, actor, JSON.stringify({ reason:'Legacy waiting record', waitingFor, userRequest:request, userAction, dependencies:[] }), new Date().toISOString()).lastInsertRowid);
       for (const side of new Set(['a',actor])) db.prepare('INSERT INTO handoff_user_request_notifications(task_id,block_seq,side_id) VALUES(?,?,?)').run(id,seq,side);
       return seq;
     } finally { db.close(); }
@@ -102,12 +102,39 @@ test('old writers cannot surface contradictory requests or starve valid notifica
  }finally{f.close();}
 });
 
-test('upgrade consumes queued placeholders silently and the persisted guard blocks old writers without a local SQL function', () => {
+test('persisted notification boundary rejects old writers waiting on peers regardless of request wording', () => {
+ const f=fixture(), db=new DatabaseSync(f.store.dbPath);try{
+  for(const [request,limitation,waitingFor] of [
+   ['内部依赖，调用时应省略字段','内部依赖，调用时应省略字段','第5侧 #755'],
+   ['Please provide the receipt','Only the user has the input','第5侧 #755'],
+   ['内部依赖，调用时应省略字段','Only the user has the input','user'],
+   ['Please provide the receipt','工程依赖：等待回执','用户'],
+   ['Internal dependency: waiting for owner','Only the user has the input','user'],
+   ['Please provide the receipt','Only the user has the input','用户已回报']
+  ]) {
+   const task=f.create(),seq=f.legacy(task.id,'b',request,{kind:'input',limitation},waitingFor);
+   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM handoff_user_request_notifications WHERE task_id=?').get(task.id)!.n,0,request+' / '+waitingFor);
+   assert.equal(f.store.claimUserRequestNotification('b',task.id,seq),undefined);
+   assert.equal(f.store.read(task.id,'b').events.at(-1)!.data.userRequest,request);
+   assert(f.store.read(task.id,'b').block);
+  }
+  for(const waitingFor of ['user','用户扫码','本人在设备操作','manual test on physical device','人工测试','手工测试']) {
+   const task=f.create();f.store.block(task.id,'b','Device has no remote interface',waitingFor,[],'无需重装；请在设备上扫码并回传结果',{kind:'manual',limitation:'No remote interface is available; only the user has the device'});
+   assert.equal(f.store.pendingUserRequestNotifications('b').filter(n=>n.taskId===task.id).length,1,waitingFor);
+  }
+ }finally{db.close();f.close();}
+});
+
+test('upgrade replaces the old exact-word guard and consumes queued explanatory placeholders', () => {
  const f=fixture(); const db=new DatabaseSync(f.store.dbPath);
  try {
-  db.exec('DROP TRIGGER handoff_suppress_user_request_placeholders');
+  db.exec(`DROP TRIGGER handoff_suppress_user_request_placeholders;
+    CREATE TRIGGER handoff_suppress_user_request_placeholders BEFORE INSERT ON handoff_user_request_notifications
+      WHEN EXISTS (SELECT 1 FROM handoff_task_events e WHERE e.seq=NEW.block_seq AND json_extract(e.data_json,'$.userRequest')='内部依赖')
+      BEGIN SELECT RAISE(IGNORE); END;`);
   const wrong=f.create(), valid=f.create();
-  const wrongSeq=f.legacy(wrong.id,'b','不需要',{kind:'input',limitation:'内部依赖'});
+  const placeholder='内部依赖，调用时应省略字段';
+  const wrongSeq=f.legacy(wrong.id,'b',placeholder,{kind:'input',limitation:placeholder},'第5侧 #755');
   const action:UserAction={kind:'manual',limitation:'Only the user has the physical device'};
   f.store.block(valid.id,'b','Need physical test','user',[],'Operate the device and return the screen',action);
   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM handoff_user_request_notifications WHERE task_id=? AND delivered_at IS NULL').get(wrong.id)!.n,2);
@@ -117,7 +144,7 @@ test('upgrade consumes queued placeholders silently and the persisted guard bloc
    assert.equal(upgraded.read(wrong.id,'b').events.at(-1)!.seq,wrongSeq);
    assert.deepEqual(upgraded.pendingUserRequestNotifications('b').map(n=>n.taskId),[valid.id]);
    const newer=f.create();
-   f.legacy(newer.id,'b','不需要',{kind:'input',limitation:'Only the user can provide it'});
+   f.legacy(newer.id,'b','Provide the receipt',{kind:'input',limitation:'Only the user can provide it'},'第5侧 #755');
    assert.equal(db.prepare('SELECT COUNT(*) AS n FROM handoff_user_request_notifications WHERE task_id=?').get(newer.id)!.n,0);
    assert(upgraded.read(newer.id,'b').block);
   } finally {upgraded.close();}

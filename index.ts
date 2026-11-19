@@ -282,14 +282,14 @@ export default function piCowork(pi: ExtensionAPI): void {
     parameters: Type.Object({
       id: idSchema, reason: Type.String({ minLength: 1, maxLength: 2000 }),
       waitingFor: Type.Optional(Type.String({ minLength: 1, maxLength: 160 })),
-      internalAction: Type.Optional(Type.Object({ owner: Type.String({ minLength: 1, maxLength: 256 }), action: Type.String({ minLength: 1, maxLength: 1000 }), expectedResult: Type.String({ minLength: 1, maxLength: 1000 }) })),
+      internalAction: Type.Optional(Type.Union([Type.Object({ owner: Type.String({ minLength: 1, maxLength: 256 }), action: Type.String({ minLength: 1, maxLength: 1000 }), expectedResult: Type.String({ minLength: 1, maxLength: 1000 }) }), Type.Null()], { description: 'Use null or omit when waiting on existing dependency tasks rather than assigning a new prerequisite action.' })),
       external: Type.Optional(Type.Boolean()),
       withdrawAction: Type.Optional(Type.Boolean()),
-      userRequest: Type.Optional(Type.String({ minLength: 1, maxLength: 1000, description: 'An actual user-only action and expected result. Omit for internal dependencies or when no user action is needed; do not use a negative status as a placeholder.' })),
-      userAction: Type.Optional(Type.Object({
+      userRequest: Type.Optional(Type.Union([Type.String({ minLength: 1, maxLength: 1000 }), Type.Null()], { description: 'An actual user-only action and expected result. Use null or omit for internal dependencies; never fill a placeholder.' })),
+      userAction: Type.Optional(Type.Union([Type.Object({
         kind: Type.Union([Type.Literal('manual'), Type.Literal('input')]),
         limitation: Type.String({ minLength: 1, maxLength: 1000, description: 'Concrete reason no authorized Agent can perform the action or obtain the input; internal workflow is not a limitation.' }),
-      })),
+      }), Type.Null()], { description: 'Capability gap for an actual user request. Use null or omit together with userRequest for internal dependencies.' })),
       dependencies: Type.Optional(Type.Array(idSchema, { maxItems: 20 })),
     }),
     async execute(_id, input, _signal, _update, ctx) {
@@ -304,7 +304,7 @@ export default function piCowork(pi: ExtensionAPI): void {
       const actor = identity(ctx).id;
       const before = board().read(input.id, actor);
       const previousBlockSeq = before.events.findLast((event) => event.kind === "block")?.seq;
-      const task = board().block(input.id, actor, input.reason, waitingFor, input.dependencies, input.userRequest, input.userAction, input.internalAction, input.external, input.withdrawAction);
+      const task = board().block(input.id, actor, input.reason, waitingFor, input.dependencies, input.userRequest ?? undefined, input.userAction ?? undefined, input.internalAction ?? undefined, input.external, input.withdrawAction);
       const currentBlockSeq = task.events.findLast((event) => event.kind === "block")?.seq;
       const notifyUser = !!task.block?.userRequest && currentBlockSeq !== previousBlockSeq && currentBlockSeq !== undefined
         && board().claimUserRequestNotification(actor, task.id, currentBlockSeq);

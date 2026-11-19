@@ -324,7 +324,7 @@ cowork_branch({ branch: "refs/heads/task/example", expectedTip: "精确完整提
 - `userRequest`：仅需用户本人操作或提供 Agent 无法取得的输入时填写，写明操作与回报结果；审批和实施决策由 Agent 在委托范围内自行解决，不交给用户。
 - `userAction`：与 `userRequest` 一起提供。`kind=manual/input` 标明本人操作或缺失输入，`limitation` 说明所有获授权 Agent 无法完成的具体原因。工具不提供用户审批入口，拒绝 `authorization` 及要求回复批准的请求；不得改填 manual/input 绕过，也不得改成聊天或通知索批。用户明确禁止的动作仍不得执行。
 
-只等其他侧或内部依赖时，省略 `userRequest` 和 `userAction`，不能填“不需要”“不适用”“内部依赖”或其他占位说明。请求或能力说明明确否定用户操作时，工具拒绝登记和通知；已有同类记录保留原文并交 Agent 复核，不计入用户待办。原用户请求已结束、内部阻塞仍在时，重新 `cowork_block` 写实际责任方和依赖、不带这两个字段，即撤下旧请求，不会解除内部阻塞或重发旧通知。
+只等其他侧或内部依赖时，省略 `userRequest` 和 `userAction`，或同时填 `null`，不能填“不需要”“不适用”“内部依赖”或其他占位说明。通知入口同时核验 `waitingFor` 必须明确指向用户、能力说明有效；等待其他侧不会成为用户通知，运行中的旧会话也不能绕过。请求或能力说明明确否定用户操作时，工具拒绝登记和通知；已有同类记录保留原文并交 Agent 复核，不计入用户待办。原用户请求已结束、内部阻塞仍在时，重新 `cowork_block` 写实际责任方和依赖、不带这两个字段，即撤下旧请求，不会解除内部阻塞或重发旧通知。
 
 前置动作直接出现在责任侧 `/cowork` 和 `cowork_list`，无需 Git 或审批。它继承阻塞链最高优先级，不改变任务本身优先级。用 `cowork_action(operation=read)` 读取动作。责任侧带当前 `revision`，用 `operation=ready` 上报结果，或 `operation=waiting` 上报具体障碍。没有真实依赖时 `dependencyId` 留空或填 `null`，不编造编号。若在等现有任务，可附 `dependencyId`；任务发生变化后会唤醒责任侧复核，循环依赖会被拒绝。返回结果后，等待侧收到一次定向复核事件；验证条件后以 `actionRevision` 调 `cowork_unblock`。撤下动作需明确 `withdrawAction: true`；改派后旧动作不再派送。离线或续跑暂停不启动其他进程，动作仍在待办。不自动认领旧版文字等待。
 

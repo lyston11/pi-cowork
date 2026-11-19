@@ -134,9 +134,11 @@ test("tool boundary binds identity to session, never accepts an actor from argum
     assert.equal(allSides.total, 3);
     await assert.rejects(execute("one", "cowork_block", { id, reason: "missing external evidence", waitingFor: "reviewer", external: true }), /Only the assignee/);
     await assert.rejects(execute("two", "cowork_block", { id, reason: "peer check", waitingFor: "reviewer" }), /dependency task IDs or assign an internalAction/);
-    await execute("two", "cowork_block", { id, reason: "missing external evidence", waitingFor: "reviewer", external: true });
+    await execute("two", "cowork_block", { id, reason: "missing external evidence", waitingFor: "reviewer", external: true, userRequest: null, userAction: null, internalAction: null });
     const fullRead = await execute('one', 'cowork_read', { id });
     assert.equal(fullRead.details.task.block.waitingFor, 'reviewer');
+    assert.equal(fullRead.details.task.block.userRequest, undefined);
+    assert.equal(fullRead.details.task.block.userAction, undefined);
     const fullTask = JSON.parse(fullRead.content[0].text).task;
     assert.equal(fullTask.body, 'PRIVATE-TEXT');
     assert.equal(fullTask.items[0].text, 'done');

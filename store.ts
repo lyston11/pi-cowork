@@ -25,8 +25,26 @@ const userActionEvidenceSql = 'cowork_valid_user_request(e.data_json)=1';
 // Shared by the validator and the persisted guard for already loaded old Pi processes.
 const noRequest = ['不需要', '无需', '无须', '不适用', '不涉及', '没有', '无', '不用', '不要用', '否', '这不是用户待办', '内部依赖',
   'none', 'no', 'not needed', 'not required', 'not applicable', 'n/a', 'nil', 'null', '-'];
-const userRequestPlaceholderSql = ['$.userRequest', '$.userAction.limitation'].map(path =>
-  `lower(trim(json_extract(e.data_json,'${path}'), ' 。.!！?？;；“”「」『』"')) IN (${noRequest.map(value => `'${value}'`).join(',')})`).join(' OR ');
+const dependencyPlaceholders = ['内部依赖', '工程依赖', '跨侧依赖', '本内部依赖', '本工程依赖', '本跨侧依赖',
+  'internal dependency', 'engineering dependency', 'cross-side dependency'];
+const placeholderBoundary = '，。；,.!;:：！？? \t\r\n';
+const userRequestPlaceholderSql = ['$.userRequest', '$.userAction.limitation'].map(path => {
+  const value = `lower(trim(json_extract(e.data_json,'${path}'), ' 。.!！?？;；“”「」『』"'))`;
+  return `(${value} IN (${noRequest.map(word => `'${word}'`).join(',')}) OR ${dependencyPlaceholders.map(prefix =>
+    `(${value}='${prefix}' OR ${value} GLOB '${prefix}[${placeholderBoundary}]*')`).join(' OR ')})`;
+}).join(' OR ');
+// Native SQLite only: old, already loaded processes must not need our local
+// validator to enforce who the request actually waits for.
+const notificationPartySql = "lower(trim(coalesce(json_extract(e.data_json,'$.waitingFor'),'')))";
+const userNotificationBoundarySql = `NOT coalesce((
+  (${['用户', '本人', '人工测试', '手工测试'].map(prefix => `${notificationPartySql} GLOB '${prefix}*'`).join(' OR ')}
+    OR ${['user', 'manual test'].map(word => `(${notificationPartySql}='${word}' OR ${notificationPartySql} GLOB '${word}[^a-z0-9_]*')`).join(' OR ')})
+  AND NOT (${['用户已', '用户不', '用户无', '用户没有', '本人已', '本人不', '本人无', '本人没有',
+    'user already', 'user does not', "user doesn't", 'user not'].map(prefix => `${notificationPartySql} GLOB '${prefix.replaceAll("'", "''")}*'`).join(' OR ')})
+  AND json_extract(e.data_json,'$.userAction.kind') IN ('manual','input')
+  AND length(trim(json_extract(e.data_json,'$.userRequest')))>0
+  AND length(trim(json_extract(e.data_json,'$.userAction.limitation')))>0
+),0) OR (${userRequestPlaceholderSql})`;
 
 function validateUserAction(action: UserAction | undefined): asserts action is UserAction {
   if (!action || !['manual', 'input'].includes(action.kind)) {
@@ -51,7 +69,8 @@ function validateUserRequest(value: unknown, action: UserAction | undefined, wai
   const deniedEnglish = /\b(?:no (?:user|human) (?:action|input|assistance|approval)(?: (?:is )?(?:needed|required|necessary))?|(?:user|human) (?:action|input|assistance|approval) (?:is )?not (?:needed|required|necessary))\s*(?=$|[.;,!?\n])/im;
   if ([request, action.limitation].some(value => {
     const clean = value.normalize('NFKC').trim().replace(/^[\s“”「」『』"']+|[\s。.!！?？;；“”「」『』"']+$/gu, '').toLowerCase();
-    return !clean || noRequest.includes(clean) || notUserWork.test(clean);
+    return !clean || noRequest.includes(clean) || notUserWork.test(clean) || dependencyPlaceholders.some(prefix =>
+      clean === prefix || (clean.startsWith(prefix) && placeholderBoundary.includes(clean.charAt(prefix.length))));
   })
       || denied.test(content) || deniedEnglish.test(content) || !isUserWaiting(waitingFor)) {
     throw new Error('No user action is requested, or the task does not explicitly wait for the user. For internal dependencies omit userRequest and userAction; re-register the actual waitingFor and dependencies to withdraw a previous request without unblocking the task.');
@@ -316,12 +335,13 @@ export class HandoffStore {
           PRIMARY KEY(task_id,block_seq,side_id)
         );
         CREATE INDEX IF NOT EXISTS handoff_user_request_pending ON handoff_user_request_notifications(side_id,delivered_at,block_seq);
-        CREATE TRIGGER IF NOT EXISTS handoff_suppress_user_request_placeholders BEFORE INSERT ON handoff_user_request_notifications
-          WHEN EXISTS (SELECT 1 FROM handoff_task_events e WHERE e.seq=NEW.block_seq AND (${userRequestPlaceholderSql}))
+        DROP TRIGGER IF EXISTS handoff_suppress_user_request_placeholders;
+        CREATE TRIGGER handoff_suppress_user_request_placeholders BEFORE INSERT ON handoff_user_request_notifications
+          WHEN EXISTS (SELECT 1 FROM handoff_task_events e WHERE e.seq=NEW.block_seq AND (${userNotificationBoundarySql}))
           BEGIN SELECT RAISE(IGNORE); END;
         UPDATE handoff_user_request_notifications SET delivered_at=CAST(strftime('%s','now') AS INTEGER)*1000
           WHERE delivered_at IS NULL AND EXISTS (SELECT 1 FROM handoff_task_events e
-            WHERE e.seq=block_seq AND (${userRequestPlaceholderSql}));
+            WHERE e.seq=block_seq AND (${userNotificationBoundarySql}));
         DROP TRIGGER IF EXISTS handoff_resume_created;
         CREATE TRIGGER handoff_resume_created AFTER INSERT ON handoff_tasks
           WHEN NEW.creator<>NEW.assignee
